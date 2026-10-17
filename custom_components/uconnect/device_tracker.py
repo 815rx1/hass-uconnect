@@ -14,14 +14,15 @@ from .coordinator import UconnectDataUpdateCoordinator
 from .entity import UconnectEntity
 
 
+PARALLEL_UPDATES = 0
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     config_entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    coordinator: UconnectDataUpdateCoordinator = hass.data[DOMAIN][
-        config_entry.unique_id
-    ]
+    coordinator: UconnectDataUpdateCoordinator = config_entry.runtime_data
     entities = []
     for vehicle in coordinator.client.vehicles.values():
         if vehicle.location is not None:

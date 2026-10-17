@@ -1,9 +1,15 @@
+"""Actions for the Uconnect integration."""
+
+from __future__ import annotations
+
+import voluptuous as vol
+
+from homeassistant.config_entries import ConfigEntryState
 from homeassistant.const import ATTR_DEVICE_ID
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import ServiceCall, callback, HomeAssistant
-from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers import device_registry
-from homeassistant.util import dt as dt_util
+from homeassistant.core import HomeAssistant, ServiceCall, callback
+from homeassistant.exceptions import ServiceValidationError
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers import device_registry as dr
 
 from .pyuconnect.command import (
     COMMAND_CABIN_VENTILATION,
@@ -28,7 +34,6 @@ from .pyuconnect.command import (
     COMMAND_REFRESH_LOCATION,
     COMMAND_TRUNK_LOCK,
     COMMAND_TRUNK_UNLOCK,
-    COMMANDS_BY_NAME,
     Command,
 )
 
@@ -115,174 +120,148 @@ SERVICES_COMMANDS: dict[str, Command] = {
 }
 
 
+DEVICE_SCHEMA = vol.Schema({vol.Optional(ATTR_DEVICE_ID): cv.string})
+
+COMMAND_SCHEMA = DEVICE_SCHEMA
+
+SET_CHARGE_SCHEDULE_SCHEMA = DEVICE_SCHEMA.extend(
+    {vol.Required("schedule"): dict}
+)
+
+SET_CHARGE_SCHEDULE_SLOT_SCHEMA = DEVICE_SCHEMA.extend(
+    {
+        vol.Required("slot"): vol.All(vol.Coerce(int), vol.Range(min=1, max=3)),
+        vol.Optional("enabled"): cv.boolean,
+        vol.Optional("start_time"): cv.time,
+        vol.Optional("end_time"): cv.time,
+        vol.Optional("days"): vol.All(cv.ensure_list, [vol.In(WEEKDAYS)]),
+        vol.Optional("charge_to_full"): cv.boolean,
+        vol.Optional("cabin_priority"): cv.boolean,
+    }
+)
+
+
 @callback
-def async_setup_services(hass: HomeAssistant, config_entry: ConfigEntry) -> bool:
-    """Set up services for Uconnect"""
+def async_setup_services(hass: HomeAssistant) -> None:
+    """Register the actions once for the integration.
 
-    async def async_call_service(call: ServiceCall):
-        coordinator: UconnectDataUpdateCoordinator = _get_coordinator_from_device(
-            hass, call
-        )
-        vin = _get_vin_from_device(hass, call)
+    They exist whether or not an entry is loaded, so automations that use
+    them validate even while the cloud is unreachable at startup. Whether
+    the targeted vehicle supports an action is checked when it is called.
+    """
 
-        if call.service != SERVICE_UPDATE:
-            cmd = SERVICES_COMMANDS[call.service]
-            vehicle = coordinator.client.vehicles.get(vin)
-            if vehicle is None:
-                raise HomeAssistantError(f"Vehicle {vin} not found")
-            if cmd.name not in vehicle.supported_commands:
-                raise HomeAssistantError(
-                    f"Service {call.service} is not supported by this vehicle"
-                )
+    async def async_call_command(call: ServiceCall) -> None:
+        coordinator, vin = _resolve_target(hass, call)
 
-            await coordinator.async_command(vin, cmd)
-        else:
+        if call.service == SERVICE_UPDATE:
             await coordinator.async_refresh()
+            return
 
-    coordinator: UconnectDataUpdateCoordinator = hass.data[DOMAIN][
-        config_entry.unique_id
-    ]
+        cmd = SERVICES_COMMANDS[call.service]
+        if cmd.name not in coordinator.client.vehicles[vin].supported_commands:
+            raise ServiceValidationError(
+                f"Action {call.service} is not supported by vehicle {vin}"
+            )
+        await coordinator.async_command(vin, cmd)
 
-    # Get a set of all supported commands from all cars
-    supported_commands = set()
-    for v in coordinator.client.vehicles.values():
-        for cmd in v.supported_commands:
-            if cmd in COMMANDS_BY_NAME:
-                supported_commands.add(cmd)
+    async def async_set_charge_schedule(call: ServiceCall) -> None:
+        coordinator, vin = _resolve_target(hass, call)
+        await coordinator.async_set_charge_schedule(vin, call.data["schedule"])
+
+    async def async_set_charge_schedule_slot(call: ServiceCall) -> None:
+        coordinator, vin = _resolve_target(hass, call)
+        if not supports_emea_schedules(
+            coordinator.client, coordinator.client.vehicles[vin]
+        ):
+            raise ServiceValidationError(
+                f"Vehicle {vin} does not report charge schedule slots"
+            )
+
+        changes = {}
+        if "enabled" in call.data:
+            changes["enable"] = call.data["enabled"]
+        for field in ("start_time", "end_time"):
+            if field in call.data:
+                changes[field] = format_time(call.data[field])
+        if "days" in call.data:
+            changes["days"] = list(call.data["days"])
+        for field in ("charge_to_full", "cabin_priority"):
+            if field in call.data:
+                changes[field] = call.data[field]
+
+        if not changes:
+            raise ServiceValidationError("Nothing to change in the charge schedule")
+
+        await coordinator.async_set_emea_charge_schedule(
+            vin, call.data["slot"] - 1, **changes
+        )
 
     for service in SUPPORTED_SERVICES:
-        # Create the service only if it's supported by at least one car
-        if (
-            service == SERVICE_UPDATE
-            or SERVICES_COMMANDS[service].name in supported_commands
-        ):
-            hass.services.async_register(DOMAIN, service, async_call_service)
-
-    # Register charge schedule service if any vehicle has schedule data
-    if coordinator.charge_schedule_data:
-
-        async def async_set_charge_schedule(call: ServiceCall):
-            coord = _get_coordinator_from_device(hass, call)
-            vin = _get_vin_from_device(hass, call)
-            schedule = call.data.get("schedule")
-            if not isinstance(schedule, dict):
-                raise HomeAssistantError("schedule must be a JSON object")
-            await coord.async_set_charge_schedule(vin, schedule)
-
         hass.services.async_register(
-            DOMAIN, SERVICE_SET_CHARGE_SCHEDULE, async_set_charge_schedule
+            DOMAIN, service, async_call_command, schema=COMMAND_SCHEMA
         )
-
-    # Register the slot service if any vehicle reports inline EMEA schedules
-    if any(
-        supports_emea_schedules(coordinator.client, v)
-        for v in coordinator.client.vehicles.values()
-    ):
-
-        async def async_set_charge_schedule_slot(call: ServiceCall):
-            coord = _get_coordinator_from_device(hass, call)
-            vin = _get_vin_from_device(hass, call)
-            changes = {}
-
-            if "enabled" in call.data:
-                changes["enable"] = bool(call.data["enabled"])
-
-            for field in ("start_time", "end_time"):
-                if field in call.data:
-                    value = dt_util.parse_time(str(call.data[field]))
-                    if value is None:
-                        raise HomeAssistantError(f"Invalid {field}: {call.data[field]}")
-                    changes[field] = format_time(value)
-
-            if "days" in call.data:
-                days = call.data["days"]
-                if isinstance(days, str):
-                    days = [days]
-                invalid = [d for d in days if d not in WEEKDAYS]
-                if invalid:
-                    raise HomeAssistantError(f"Invalid days: {invalid}")
-                changes["days"] = list(days)
-
-            for field in ("charge_to_full", "cabin_priority"):
-                if field in call.data:
-                    changes[field] = bool(call.data[field])
-
-            if not changes:
-                raise HomeAssistantError("Nothing to change")
-
-            try:
-                slot = int(call.data.get("slot", 1)) - 1
-            except (TypeError, ValueError) as err:
-                raise HomeAssistantError("slot must be a number") from err
-
-            await coord.async_set_emea_charge_schedule(vin, slot, **changes)
-
-        hass.services.async_register(
-            DOMAIN, SERVICE_SET_CHARGE_SCHEDULE_SLOT, async_set_charge_schedule_slot
-        )
-
-    return True
-
-
-@callback
-def async_unload_services(hass) -> None:
-    # Only the services some vehicle supported were registered
-    for service in (
-        *SUPPORTED_SERVICES,
+    hass.services.async_register(
+        DOMAIN,
         SERVICE_SET_CHARGE_SCHEDULE,
-        SERVICE_SET_CHARGE_SCHEDULE_SLOT,
-    ):
-        if hass.services.has_service(DOMAIN, service):
-            hass.services.async_remove(DOMAIN, service)
-
-
-def _get_vin_from_device(hass: HomeAssistant, call: ServiceCall) -> str:
-    coordinators = [k for k in hass.data[DOMAIN] if not k.startswith("_")]
-
-    if len(coordinators) == 1:
-        coordinator: UconnectDataUpdateCoordinator = hass.data[DOMAIN][coordinators[0]]
-        vehicles = coordinator.client.get_vehicles()
-        if len(vehicles) == 1:
-            return list(vehicles.keys())[0]
-
-    device_entry = device_registry.async_get(hass).async_get(call.data[ATTR_DEVICE_ID])
-    if device_entry is None:
-        raise ValueError(f"Device not found: {call.data.get(ATTR_DEVICE_ID)}")
-
-    for entry in device_entry.identifiers:
-        if entry[0] == DOMAIN:
-            return entry[1]
-
-    raise ValueError(f"No VIN found for device: {call.data.get(ATTR_DEVICE_ID)}")
-
-
-def _get_coordinator_from_device(
-    hass: HomeAssistant, call: ServiceCall
-) -> UconnectDataUpdateCoordinator:
-    coordinators = [k for k in hass.data[DOMAIN] if not k.startswith("_")]
-
-    if len(coordinators) == 1:
-        return hass.data[DOMAIN][coordinators[0]]
-
-    device_entry = device_registry.async_get(hass).async_get(call.data[ATTR_DEVICE_ID])
-    if device_entry is None:
-        raise ValueError(f"Device not found: {call.data.get(ATTR_DEVICE_ID)}")
-
-    config_entry_id = next(
-        (
-            entry_id
-            for entry_id in device_entry.config_entries
-            if (entry := hass.config_entries.async_get_entry(entry_id))
-            and entry.domain == DOMAIN
-        ),
-        None,
+        async_set_charge_schedule,
+        schema=SET_CHARGE_SCHEDULE_SCHEMA,
     )
-    if config_entry_id is None:
-        raise ValueError(
-            f"No config entry found for device: {call.data.get(ATTR_DEVICE_ID)}"
-        )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_SET_CHARGE_SCHEDULE_SLOT,
+        async_set_charge_schedule_slot,
+        schema=SET_CHARGE_SCHEDULE_SLOT_SCHEMA,
+    )
 
-    config_entry = hass.config_entries.async_get_entry(config_entry_id)
-    if config_entry is None:
-        raise ValueError(f"Config entry not found: {config_entry_id}")
-    return hass.data[DOMAIN][config_entry.unique_id]
+
+def _resolve_target(
+    hass: HomeAssistant, call: ServiceCall
+) -> tuple[UconnectDataUpdateCoordinator, str]:
+    """Return the coordinator and VIN an action call is meant for.
+
+    Without a device the call is only unambiguous for a single vehicle.
+    """
+
+    loaded = [
+        entry
+        for entry in hass.config_entries.async_entries(DOMAIN)
+        if entry.state is ConfigEntryState.LOADED
+    ]
+    if not loaded:
+        raise ServiceValidationError("Uconnect is not loaded")
+
+    device_id = call.data.get(ATTR_DEVICE_ID)
+    if device_id is None:
+        vehicles = [
+            (entry.runtime_data, vin)
+            for entry in loaded
+            for vin in entry.runtime_data.client.vehicles
+        ]
+        if len(vehicles) != 1:
+            raise ServiceValidationError(
+                "Select the vehicle, the account has more than one"
+            )
+        return vehicles[0]
+
+    device = dr.async_get(hass).async_get(device_id)
+    if device is None:
+        raise ServiceValidationError(f"Device {device_id} not found")
+
+    vin = next(
+        (ident for domain, ident in device.identifiers if domain == DOMAIN), None
+    )
+    # Newer Home Assistant versions tie a device to a single entry and
+    # deprecate the set, older ones only have the set
+    if entry_id := getattr(device, "config_entry_id", None):
+        entry_ids = {entry_id}
+    else:
+        entry_ids = set(device.config_entries)
+    entry = next((e for e in loaded if e.entry_id in entry_ids), None)
+    if vin is None or entry is None:
+        raise ServiceValidationError(f"Device {device_id} is not a loaded Uconnect vehicle")
+
+    coordinator: UconnectDataUpdateCoordinator = entry.runtime_data
+    if vin not in coordinator.client.vehicles:
+        raise ServiceValidationError(f"Vehicle {vin} is currently not available")
+
+    return coordinator, vin

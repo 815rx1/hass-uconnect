@@ -27,6 +27,9 @@ TIME_FIELDS: tuple[tuple[str, str, str], ...] = (
 )
 
 
+PARALLEL_UPDATES = 1
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     config_entry: ConfigEntry,
@@ -36,9 +39,7 @@ async def async_setup_entry(
     if not config_entry.options.get(CONF_ADD_COMMAND_ENTITIES):
         return
 
-    coordinator: UconnectDataUpdateCoordinator = hass.data[DOMAIN][
-        config_entry.unique_id
-    ]
+    coordinator: UconnectDataUpdateCoordinator = config_entry.runtime_data
     entities: list[UconnectChargeScheduleTime] = []
     for vehicle in coordinator.client.vehicles.values():
         if not supports_emea_schedules(coordinator.client, vehicle):

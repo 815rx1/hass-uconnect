@@ -56,23 +56,26 @@ BUTTON_DESCRIPTIONS: Final[tuple[UconnectButtonEntityDescription, ...]] = (
         name="Charge Now",
         icon="mdi:ev-station",
         command=COMMAND_CHARGE,
-        device_class=ButtonDeviceClass.UPDATE,
     ),
     UconnectButtonEntityDescription(
         key="button_lights",
         name="Lights",
         icon="mdi:car-light-dimmed",
         command=COMMAND_LIGHTS,
-        device_class=ButtonDeviceClass.UPDATE,
+        device_class=ButtonDeviceClass.IDENTIFY,
     ),
     UconnectButtonEntityDescription(
         key="button_lights_horn",
         name="Lights & Horn",
         icon="mdi:bugle",
         command=COMMAND_LIGHTS_HORN,
-        device_class=ButtonDeviceClass.UPDATE,
+        device_class=ButtonDeviceClass.IDENTIFY,
     ),
 )
+
+
+# Commands go to one vehicle at a time
+PARALLEL_UPDATES = 1
 
 
 async def async_setup_entry(
@@ -80,9 +83,7 @@ async def async_setup_entry(
     config_entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    coordinator: UconnectDataUpdateCoordinator = hass.data[DOMAIN][
-        config_entry.unique_id
-    ]
+    coordinator: UconnectDataUpdateCoordinator = config_entry.runtime_data
     entities: list[ButtonEntity] = []
 
     # EV-specific buttons (always available)

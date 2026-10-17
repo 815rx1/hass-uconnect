@@ -18,6 +18,8 @@ from homeassistant.const import (
     EntityCategory,
     PERCENTAGE,
     UnitOfElectricPotential,
+    UnitOfLength,
+    UnitOfPressure,
     UnitOfTime,
 )
 
@@ -32,6 +34,21 @@ from .extrapolated_soc import (
     UconnectExtrapolatedSocSensor,
     UconnectChargingRateSensor,
 )
+
+
+# Unit spellings of the API mapped to Home Assistant units
+API_UNITS: Final[dict[str, str]] = {
+    "km": UnitOfLength.KILOMETERS,
+    "kilometers": UnitOfLength.KILOMETERS,
+    "mi": UnitOfLength.MILES,
+    "mile": UnitOfLength.MILES,
+    "miles": UnitOfLength.MILES,
+    "kpa": UnitOfPressure.KPA,
+    "psi": UnitOfPressure.PSI,
+    "bar": UnitOfPressure.BAR,
+}
+
+PARALLEL_UPDATES = 0
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -56,7 +73,7 @@ SENSOR_DESCRIPTIONS: Final[tuple[UconnectSensorEntityDescription, ...]] = (
         name="Driving Range",
         icon="mdi:road-variant",
         device_class=SensorDeviceClass.DISTANCE,
-        state_class=SensorStateClass.TOTAL,
+        state_class=SensorStateClass.MEASUREMENT,
         native_unit_of_measurement=UNIT_DYNAMIC,
         suggested_display_precision=0,
     ),
@@ -65,7 +82,7 @@ SENSOR_DESCRIPTIONS: Final[tuple[UconnectSensorEntityDescription, ...]] = (
         name="Driving Range (Gas)",
         icon="mdi:road-variant",
         device_class=SensorDeviceClass.DISTANCE,
-        state_class=SensorStateClass.TOTAL,
+        state_class=SensorStateClass.MEASUREMENT,
         native_unit_of_measurement=UNIT_DYNAMIC,
         suggested_display_precision=0,
     ),
@@ -74,7 +91,7 @@ SENSOR_DESCRIPTIONS: Final[tuple[UconnectSensorEntityDescription, ...]] = (
         name="Driving Range (Total)",
         icon="mdi:road-variant",
         device_class=SensorDeviceClass.DISTANCE,
-        state_class=SensorStateClass.TOTAL,
+        state_class=SensorStateClass.MEASUREMENT,
         native_unit_of_measurement=UNIT_DYNAMIC,
         suggested_display_precision=0,
     ),
@@ -105,7 +122,7 @@ SENSOR_DESCRIPTIONS: Final[tuple[UconnectSensorEntityDescription, ...]] = (
         name="Time to Charge L2",
         icon="mdi:battery-clock",
         native_unit_of_measurement=UnitOfTime.MINUTES,
-        state_class=SensorStateClass.TOTAL,
+        state_class=SensorStateClass.MEASUREMENT,
         device_class=SensorDeviceClass.DURATION,
         suggested_display_precision=0,
     ),
@@ -114,7 +131,7 @@ SENSOR_DESCRIPTIONS: Final[tuple[UconnectSensorEntityDescription, ...]] = (
         name="Time to Charge L3",
         icon="mdi:battery-clock",
         native_unit_of_measurement=UnitOfTime.MINUTES,
-        state_class=SensorStateClass.TOTAL,
+        state_class=SensorStateClass.MEASUREMENT,
         device_class=SensorDeviceClass.DURATION,
         suggested_display_precision=0,
     ),
@@ -123,7 +140,7 @@ SENSOR_DESCRIPTIONS: Final[tuple[UconnectSensorEntityDescription, ...]] = (
         name="Distance to Service",
         icon="mdi:car-wrench",
         device_class=SensorDeviceClass.DISTANCE,
-        state_class=SensorStateClass.TOTAL,
+        state_class=SensorStateClass.MEASUREMENT,
         native_unit_of_measurement=UNIT_DYNAMIC,
         suggested_display_precision=0,
     ),
@@ -132,7 +149,7 @@ SENSOR_DESCRIPTIONS: Final[tuple[UconnectSensorEntityDescription, ...]] = (
         name="Days till service needed",
         icon="mdi:car-wrench",
         device_class=SensorDeviceClass.DURATION,
-        state_class=SensorStateClass.TOTAL,
+        state_class=SensorStateClass.MEASUREMENT,
         native_unit_of_measurement=UnitOfTime.DAYS,
         suggested_display_precision=0,
     ),
@@ -190,18 +207,21 @@ SENSOR_DESCRIPTIONS: Final[tuple[UconnectSensorEntityDescription, ...]] = (
     ),
     UconnectSensorEntityDescription(
         key="timestamp_info",
+        entity_category=EntityCategory.DIAGNOSTIC,
         name="Last Info Update At",
         icon="mdi:update",
         device_class=SensorDeviceClass.TIMESTAMP,
     ),
     UconnectSensorEntityDescription(
         key="timestamp_status",
+        entity_category=EntityCategory.DIAGNOSTIC,
         name="Last Status Update At",
         icon="mdi:update",
         device_class=SensorDeviceClass.TIMESTAMP,
     ),
     UconnectSensorEntityDescription(
         key="last_location_update",
+        entity_category=EntityCategory.DIAGNOSTIC,
         name="Last Location Update At",
         icon="mdi:update",
         get=lambda x: x.location.updated if x.location else None,
@@ -250,6 +270,7 @@ SENSOR_DESCRIPTIONS: Final[tuple[UconnectSensorEntityDescription, ...]] = (
     ),
     UconnectSensorEntityDescription(
         key="fuel_type",
+        entity_category=EntityCategory.DIAGNOSTIC,
         name="Fuel Type",
         icon="mdi:gas-station",
     ),
@@ -264,7 +285,7 @@ SENSOR_DESCRIPTIONS: Final[tuple[UconnectSensorEntityDescription, ...]] = (
         name="Time to Charge L1",
         icon="mdi:battery-clock",
         native_unit_of_measurement=UnitOfTime.MINUTES,
-        state_class=SensorStateClass.TOTAL,
+        state_class=SensorStateClass.MEASUREMENT,
         device_class=SensorDeviceClass.DURATION,
         suggested_display_precision=0,
     ),
@@ -278,9 +299,7 @@ async def async_setup_entry(
 ) -> None:
     """Set up sensor platform."""
 
-    coordinator: UconnectDataUpdateCoordinator = hass.data[DOMAIN][
-        config_entry.unique_id
-    ]
+    coordinator: UconnectDataUpdateCoordinator = config_entry.runtime_data
     entities: list[SensorEntity] = []
 
     for vehicle in coordinator.client.get_vehicles().values():
@@ -334,6 +353,7 @@ class UconnectSensor(SensorEntity, UconnectEntity):
         self._attr_state_class = self._description.state_class
         self._attr_device_class = self._description.device_class
         self._attr_entity_category = self._description.entity_category
+        self._last_unit: str | None = None
 
     @property
     def native_value(self):
@@ -346,12 +366,21 @@ class UconnectSensor(SensorEntity, UconnectEntity):
 
     @property
     def native_unit_of_measurement(self):
-        """Return the unit the value was reported in by the sensor"""
+        """Return the unit the value was reported in by the sensor.
 
-        if self._description.native_unit_of_measurement == UNIT_DYNAMIC:
-            return getattr(self.vehicle, f"{self._key}_unit")
+        The API spells units its own way and leaves them out when a block is
+        missing. Both would make Home Assistant see a unit change and flag
+        the long-term statistics, so units are mapped to Home Assistant's and
+        the last known one is kept.
+        """
 
-        return self._description.native_unit_of_measurement
+        if self._description.native_unit_of_measurement != UNIT_DYNAMIC:
+            return self._description.native_unit_of_measurement
+
+        raw = getattr(self.vehicle, f"{self._key}_unit", None)
+        if isinstance(raw, str) and raw:
+            self._last_unit = API_UNITS.get(raw.strip().lower(), raw)
+        return self._last_unit
 
 
 class UconnectVhrSensor(SensorEntity, UconnectEntity):
@@ -483,6 +512,9 @@ class UconnectMaintenanceSensor(SensorEntity, UconnectEntity):
 
 class UconnectChargeScheduleSensor(SensorEntity, UconnectEntity):
     """Uconnect Charge Schedule sensor."""
+
+    # The raw schedule JSON is shown, but not worth a recorder row per change
+    _unrecorded_attributes = frozenset({"schedules"})
 
     def __init__(
         self,

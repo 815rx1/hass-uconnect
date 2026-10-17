@@ -5,9 +5,10 @@ from __future__ import annotations
 from datetime import timedelta
 
 import pytest
+import voluptuous as vol
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.const import STATE_UNAVAILABLE
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers import entity_registry as er
 from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import async_fire_time_changed
@@ -67,7 +68,12 @@ async def test_unload_and_reload(hass, setup_integration, mock_client):
     assert await hass.config_entries.async_unload(setup_integration.entry_id)
     await hass.async_block_till_done()
     assert setup_integration.state is ConfigEntryState.NOT_LOADED
-    assert not hass.services.has_service(DOMAIN, "update")
+
+    # Actions stay registered so automations keep validating, and explain
+    # themselves when nothing is loaded
+    assert hass.services.has_service(DOMAIN, "update")
+    with pytest.raises(ServiceValidationError, match="not loaded"):
+        await hass.services.async_call(DOMAIN, "update", {}, blocking=True)
 
 
 async def test_setup_retries_when_cloud_down(hass, config_entry, mock_client):
@@ -96,7 +102,7 @@ async def test_setup_starts_reauth_on_rejected_login(hass, config_entry, mock_cl
 async def test_entities_turn_unavailable_after_repeated_failures(
     hass, setup_integration, mock_client
 ):
-    coordinator = hass.data[DOMAIN][setup_integration.unique_id]
+    coordinator = setup_integration.runtime_data
     odometer_id = entity_id(hass, "sensor", "odometer")
     mock_client.refresh.side_effect = Exception("Read timed out")
     calls_before = mock_client.get_vehicle_health_report.call_count
@@ -134,7 +140,7 @@ async def test_scheduled_polling_runs(hass, setup_integration, mock_client):
 async def test_vehicle_dropping_out_makes_entities_unavailable(
     hass, setup_integration, mock_client, vehicle
 ):
-    coordinator = hass.data[DOMAIN][setup_integration.unique_id]
+    coordinator = setup_integration.runtime_data
     odometer_id = entity_id(hass, "sensor", "odometer")
     mock_client.vehicles.clear()
 
@@ -176,14 +182,14 @@ async def test_disabling_command_entities_removes_them(hass, setup_integration):
 
 
 async def test_interval_change_applies_without_reload(hass, setup_integration, mock_client):
-    coordinator = hass.data[DOMAIN][setup_integration.unique_id]
+    coordinator = setup_integration.runtime_data
     hass.config_entries.async_update_entry(
         setup_integration, options={**setup_integration.options, "scan_interval": 15}
     )
     await hass.async_block_till_done()
 
     # Same coordinator, new interval
-    assert hass.data[DOMAIN][setup_integration.unique_id] is coordinator
+    assert setup_integration.runtime_data is coordinator
     assert coordinator.update_interval == timedelta(minutes=15)
 
 
@@ -236,18 +242,23 @@ async def test_schedule_slot_service(hass, setup_integration, mock_client):
 
 async def test_schedule_slot_service_rejects_bad_input(hass, setup_integration):
     device_id = next(iter(er.async_get(hass).entities.values())).device_id
-    with pytest.raises(HomeAssistantError):
+    for data in (
+        {"slot": 1, "days": ["someday"]},
+        {"slot": 7, "enabled": True},
+        {"slot": 1, "start_time": "25:99"},
+    ):
+        with pytest.raises(vol.Invalid):
+            await hass.services.async_call(
+                DOMAIN,
+                "set_charge_schedule_slot",
+                {"device_id": device_id, **data},
+                blocking=True,
+            )
+    with pytest.raises(ServiceValidationError, match="Nothing to change"):
         await hass.services.async_call(
             DOMAIN,
             "set_charge_schedule_slot",
-            {"device_id": device_id, "slot": 1, "days": ["someday"]},
-            blocking=True,
-        )
-    with pytest.raises(HomeAssistantError):
-        await hass.services.async_call(
-            DOMAIN,
-            "set_charge_schedule_slot",
-            {"device_id": device_id, "slot": 7, "enabled": True},
+            {"device_id": device_id, "slot": 1},
             blocking=True,
         )
 
@@ -302,3 +313,73 @@ async def test_reset_battery_learning_without_sensor(hass, setup_integration):
         await hass.services.async_call(
             "button", "press", {"entity_id": button_id}, blocking=True
         )
+
+
+async def test_actions_exist_while_setup_retries(hass, config_entry, mock_client):
+    mock_client.vehicles.clear()
+    mock_client.refresh.side_effect = Exception("Read timed out")
+    config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert config_entry.state is ConfigEntryState.SETUP_RETRY
+    for service in ("update", "doors_lock", "set_charge_schedule_slot"):
+        assert hass.services.has_service(DOMAIN, service)
+
+
+async def test_update_action_without_device(hass, setup_integration, mock_client):
+    calls = mock_client.refresh.call_count
+    await hass.services.async_call(DOMAIN, "update", {}, blocking=True)
+    assert mock_client.refresh.call_count == calls + 1
+
+
+async def test_unsupported_command_is_rejected(hass, setup_integration, mock_client):
+    with pytest.raises(ServiceValidationError, match="not supported"):
+        await hass.services.async_call(DOMAIN, "engine_on", {}, blocking=True)
+    mock_client.command_verify.assert_not_called()
+
+
+async def test_supported_command_action(hass, setup_integration, mock_client):
+    await hass.services.async_call(DOMAIN, "doors_lock", {}, blocking=True)
+    assert mock_client.command_verify.call_args.args[1].name == "RDL"
+
+
+async def test_unknown_device_is_rejected(hass, setup_integration):
+    with pytest.raises(ServiceValidationError, match="not found"):
+        await hass.services.async_call(
+            DOMAIN, "update", {"device_id": "nope"}, blocking=True
+        )
+
+
+async def test_stale_vehicle_device_can_be_removed(hass, setup_integration, mock_client):
+    from homeassistant.helpers import device_registry as dr
+    from custom_components.uconnect import async_remove_config_entry_device
+
+    device = dr.async_entries_for_config_entry(dr.async_get(hass), setup_integration.entry_id)[0]
+    assert device is not None
+    assert not await async_remove_config_entry_device(hass, setup_integration, device)
+
+    mock_client.vehicles.clear()
+    assert await async_remove_config_entry_device(hass, setup_integration, device)
+
+
+async def test_image_follows_url_and_sniffs_type(hass, setup_integration, mock_client, vehicle):
+    from custom_components.uconnect.image import _sniff_content_type
+
+    assert _sniff_content_type(b"\x89PNG\r\n") == "image/png"
+    assert _sniff_content_type(b"\xff\xd8\xff") == "image/jpeg"
+    assert _sniff_content_type(b"RIFF\x00\x00\x00\x00WEBPVP8") == "image/webp"
+
+    image_id = entity_id(hass, "image", "image")
+    if image_id is None:
+        vehicle.image_url = "https://example.invalid/a.png"
+        assert await hass.config_entries.async_reload(setup_integration.entry_id)
+        await hass.async_block_till_done()
+        image_id = entity_id(hass, "image", "image")
+    assert image_id is not None
+    before = hass.states.get(image_id).state
+
+    vehicle.image_url = "https://example.invalid/b.png"
+    await setup_integration.runtime_data.async_refresh()
+    await hass.async_block_till_done()
+    assert hass.states.get(image_id).state != before

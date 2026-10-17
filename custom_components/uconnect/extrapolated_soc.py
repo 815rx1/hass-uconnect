@@ -270,6 +270,11 @@ def calculate_charging_rate(
 class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity):
     """Sensor that extrapolates battery SOC between updates."""
 
+    # The learning state is only an attribute so it survives restarts through
+    # the restore cache. It changes every minute while charging, and keeping
+    # it out of the recorder saves a row of JSON each time.
+    _unrecorded_attributes = frozenset({"estimation_state"})
+
     def __init__(
         self,
         coordinator: UconnectDataUpdateCoordinator,

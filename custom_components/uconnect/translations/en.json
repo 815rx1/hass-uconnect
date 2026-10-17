@@ -20,11 +20,21 @@
                     "password": "Password",
                     "pin": "PIN"
                 }
+            },
+            "reconfigure": {
+                "title": "Reconfigure Uconnect",
+                "description": "Update the login of {username}. Leave the PIN empty to keep the stored one.",
+                "data": {
+                    "password": "Password",
+                    "pin": "PIN",
+                    "disable_tls_verification": "Disable TLS certificate verification"
+                }
             }
         },
         "abort": {
             "already_configured": "Device is already configured",
-            "reauth_successful": "Re-authentication was successful"
+            "reauth_successful": "Re-authentication was successful",
+            "reconfigure_successful": "Reconfiguration was successful"
         },
         "error": {
             "invalid_auth": "The login failed to the Uconnect servers. Double check your vehicle doesn't use SiriusXM Guardian and your credentials are correct.",

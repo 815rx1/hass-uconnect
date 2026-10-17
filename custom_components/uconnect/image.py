@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
 import logging
 from pathlib import Path
 
@@ -23,6 +24,23 @@ from .entity import UconnectEntity
 _LOGGER = logging.getLogger(DOMAIN)
 
 CACHE_DIR = ".storage/uconnect"
+IMAGE_RETRY_AFTER = timedelta(hours=1)
+
+
+def _sniff_content_type(data: bytes) -> str:
+    """Return the image type from the first bytes of a file."""
+    if data.startswith(bytes.fromhex("89504e47")):  # PNG
+        return "image/png"
+    if data.startswith(bytes.fromhex("ffd8")):  # JPEG
+        return "image/jpeg"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data[4:12] in (b"ftypavif", b"ftypavis"):
+        return "image/avif"
+    return "image/png"
+
+
+PARALLEL_UPDATES = 0
 
 
 async def async_setup_entry(
@@ -31,9 +49,7 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up Uconnect image entities."""
-    coordinator: UconnectDataUpdateCoordinator = hass.data[DOMAIN][
-        config_entry.unique_id
-    ]
+    coordinator: UconnectDataUpdateCoordinator = config_entry.runtime_data
 
     entities = []
     for vehicle in coordinator.client.get_vehicles().values():
@@ -96,20 +112,28 @@ class UconnectVehicleImage(UconnectEntity, ImageEntity):
         self._cache_path = cache_dir / f"{vehicle.vin}.img"
         self._url_path = cache_dir / f"{vehicle.vin}.url"
         self._cached_url: str | None = None
+        self._failed_at = None
 
     async def async_added_to_hass(self) -> None:
         """Restore cached image state on startup."""
         await super().async_added_to_hass()
-        cached_url = await self.hass.async_add_executor_job(self._read_cached_url)
+        cached_url, mtime = await self.hass.async_add_executor_job(
+            self._read_cache_info
+        )
         if cached_url and cached_url == self._image_url:
             self._cached_url = cached_url
-        self._attr_image_last_updated = dt_util.utcnow()
+        # The cached file's age, so a restart is not recorded as a new image
+        self._attr_image_last_updated = (
+            dt_util.utc_from_timestamp(mtime) if mtime else dt_util.utcnow()
+        )
 
     @callback
     def _handle_coordinator_update(self) -> None:
-        """Invalidate cache when image URL changes."""
-        url = self._image_url
-        if url and self._cached_url and url != self._cached_url:
+        """Pick up a changed image URL from the vehicle list."""
+        url = getattr(self.vehicle, "image_url", None)
+        if url and url != self._image_url:
+            self._image_url = url
+            self._failed_at = None
             self._attr_image_last_updated = dt_util.utcnow()
         super()._handle_coordinator_update()
 
@@ -125,14 +149,20 @@ class UconnectVehicleImage(UconnectEntity, ImageEntity):
             if data is not None:
                 return data
 
+        # A refused download is not retried on every dashboard view
+        if self._failed_at and dt_util.utcnow() - self._failed_at < IMAGE_RETRY_AFTER:
+            return await self.hass.async_add_executor_job(self._read_cache)
+
         # Download and cache
         data = await self._fetch_image(url)
         if data is not None:
             await self.hass.async_add_executor_job(self._write_cache, data, url)
             self._cached_url = url
+            self._failed_at = None
             return data
 
         # Fall back to stale cache on download failure
+        self._failed_at = dt_util.utcnow()
         return await self.hass.async_add_executor_job(self._read_cache)
 
     async def _fetch_image(self, url: str) -> bytes | None:
@@ -166,8 +196,17 @@ class UconnectVehicleImage(UconnectEntity, ImageEntity):
     def _read_cache(self) -> bytes | None:
         """Read cached image from disk."""
         if self._cache_path.is_file():
-            return self._cache_path.read_bytes()
+            data = self._cache_path.read_bytes()
+            # The content type is only known from a download, so after a
+            # restart it is taken from the file itself
+            self._attr_content_type = _sniff_content_type(data)
+            return data
         return None
+
+    def _read_cache_info(self) -> tuple[str | None, float | None]:
+        """Read the URL and modification time of the cached image."""
+        mtime = self._cache_path.stat().st_mtime if self._cache_path.is_file() else None
+        return self._read_cached_url(), mtime
 
     def _read_cached_url(self) -> str | None:
         """Read the URL of the cached image."""

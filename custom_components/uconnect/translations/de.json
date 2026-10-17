@@ -20,11 +20,21 @@
                     "password": "Passwort",
                     "pin": "PIN"
                 }
+            },
+            "reconfigure": {
+                "title": "Uconnect neu konfigurieren",
+                "description": "Aktualisiere die Anmeldung von {username}. Lässt du die PIN leer, bleibt die gespeicherte erhalten.",
+                "data": {
+                    "password": "Passwort",
+                    "pin": "PIN",
+                    "disable_tls_verification": "TLS-Zertifikatsprüfung deaktivieren"
+                }
             }
         },
         "abort": {
             "already_configured": "Gerät ist bereits eingerichtet",
-            "reauth_successful": "Erneute Anmeldung erfolgreich"
+            "reauth_successful": "Erneute Anmeldung erfolgreich",
+            "reconfigure_successful": "Neukonfiguration erfolgreich"
         },
         "error": {
             "invalid_auth": "Die Anmeldung an den Uconnect-Servern ist fehlgeschlagen. Prüfe, dass dein Fahrzeug nicht SiriusXM Guardian nutzt und deine Zugangsdaten stimmen.",

@@ -36,6 +36,9 @@ ICONS = {
 }
 
 
+PARALLEL_UPDATES = 1
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     config_entry: ConfigEntry,
@@ -45,9 +48,7 @@ async def async_setup_entry(
     if not config_entry.options.get(CONF_ADD_COMMAND_ENTITIES):
         return
 
-    coordinator: UconnectDataUpdateCoordinator = hass.data[DOMAIN][
-        config_entry.unique_id
-    ]
+    coordinator: UconnectDataUpdateCoordinator = config_entry.runtime_data
     entities: list[UconnectSelectSetChargingLevel] = []
     for vehicle in coordinator.client.vehicles.values():
         if getattr(vehicle, "charging_level_preference", None) is not None:

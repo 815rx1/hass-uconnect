@@ -4,6 +4,7 @@ from homeassistant.const import (
 )
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.typing import ConfigType
 
@@ -13,7 +14,9 @@ from .frontend_cards import (
     async_remove_frontend_cards_if_last_entry,
     async_setup_frontend_cards,
 )
-from .services import async_setup_services, async_unload_services
+from .services import async_setup_services
+
+type UconnectConfigEntry = ConfigEntry[UconnectDataUpdateCoordinator]
 
 PLATFORMS: list[str] = [
     Platform.BINARY_SENSOR,
@@ -42,10 +45,15 @@ CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Register the actions, which exist independently of the entries."""
+
+    async_setup_services(hass)
     return True
 
 
-async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> bool:
+async def async_setup_entry(
+    hass: HomeAssistant, config_entry: UconnectConfigEntry
+) -> bool:
     """Set up Uconnect from a config entry."""
 
     coordinator = UconnectDataUpdateCoordinator(hass, config_entry)
@@ -54,11 +62,9 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> b
     # flow when the credentials were rejected
     await coordinator.async_config_entry_first_refresh()
 
-    hass.data.setdefault(DOMAIN, {})
+    config_entry.runtime_data = coordinator
     await async_setup_frontend_cards(hass)
-    hass.data[DOMAIN][config_entry.unique_id] = coordinator
     await hass.config_entries.async_forward_entry_setups(config_entry, PLATFORMS)
-    async_setup_services(hass, config_entry)
 
     command_entities = bool(config_entry.options.get(CONF_ADD_COMMAND_ENTITIES))
 
@@ -93,23 +99,31 @@ def _async_remove_command_entities(hass: HomeAssistant, entry: ConfigEntry) -> N
             registry.async_remove(entity.entity_id)
 
 
-async def async_unload_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> bool:
+async def async_unload_entry(
+    hass: HomeAssistant, config_entry: UconnectConfigEntry
+) -> bool:
     """Unload a config entry."""
 
-    domain_data = hass.data.get(DOMAIN, {})
-
-    if unload_ok := await hass.config_entries.async_unload_platforms(
-        config_entry, PLATFORMS
-    ):
-        domain_data.pop(config_entry.unique_id, None)
-
-    if not [k for k in domain_data if not k.startswith("_")]:
-        async_unload_services(hass)
-
-    return unload_ok
+    return await hass.config_entries.async_unload_platforms(config_entry, PLATFORMS)
 
 
 async def async_remove_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> None:
     """Clean up once a config entry has been deleted."""
 
     await async_remove_frontend_cards_if_last_entry(hass)
+
+
+async def async_remove_config_entry_device(
+    hass: HomeAssistant, config_entry: UconnectConfigEntry, device: dr.DeviceEntry
+) -> bool:
+    """Allow deleting a vehicle that is no longer on the account.
+
+    A vehicle the account still reports would be added again on the next
+    poll, so it cannot be deleted.
+    """
+
+    vehicles = config_entry.runtime_data.client.vehicles
+    return not any(
+        domain == DOMAIN and identifier in vehicles
+        for domain, identifier in device.identifiers
+    )

@@ -152,3 +152,38 @@ async def test_options_flow(hass, config_entry):
 
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert config_entry.options["scan_interval"] == 10
+
+
+async def test_reconfigure_updates_login(hass, config_entry):
+    config_entry.add_to_hass(hass)
+    result = await config_entry.start_reconfigure_flow(hass)
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "reconfigure"
+
+    with patch(LOGIN), patch(SETUP, return_value=True):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {"password": "changed", "disable_tls_verification": True},
+        )
+        await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+    assert config_entry.data["password"] == "changed"
+    assert config_entry.data["disable_tls_verification"] is True
+    assert config_entry.data["pin"] == "1234"
+    assert config_entry.data["username"] == "user@example.com"
+
+
+async def test_reconfigure_invalid_auth_keeps_data(hass, config_entry):
+    config_entry.add_to_hass(hass)
+    result = await config_entry.start_reconfigure_flow(hass)
+
+    with patch(LOGIN, side_effect=AuthenticationError("account login failed: x")):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {"password": "wrong", "disable_tls_verification": False},
+        )
+
+    assert result["errors"] == {"base": "invalid_auth"}
+    assert config_entry.data["password"] == "secret"

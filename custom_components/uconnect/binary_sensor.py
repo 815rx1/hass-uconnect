@@ -168,6 +168,9 @@ SENSOR_DESCRIPTIONS: Final[tuple[UconnectBinarySensorEntityDescription, ...]] = 
 )
 
 
+PARALLEL_UPDATES = 0
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     config_entry: ConfigEntry,
@@ -175,9 +178,7 @@ async def async_setup_entry(
 ) -> None:
     """Set up binary_sensor platform."""
 
-    coordinator: UconnectDataUpdateCoordinator = hass.data[DOMAIN][
-        config_entry.unique_id
-    ]
+    coordinator: UconnectDataUpdateCoordinator = config_entry.runtime_data
     entities: list[BinarySensorEntity] = []
 
     for vehicle in coordinator.client.vehicles.values():

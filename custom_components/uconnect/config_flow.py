@@ -20,6 +20,11 @@ from homeassistant.const import (
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.config_entries import ConfigFlowResult
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.selector import (
+    TextSelector,
+    TextSelectorConfig,
+    TextSelectorType,
+)
 
 from .pyuconnect.api import API
 from .pyuconnect.brands import BRANDS as BRANDS_BY_NAME
@@ -39,20 +44,31 @@ from .coordinator import is_auth_error
 
 _LOGGER = logging.getLogger(__name__)
 
+# Password and PIN are masked in the forms
+SECRET = TextSelector(TextSelectorConfig(type=TextSelectorType.PASSWORD))
+
 STEP_USER_DATA_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_USERNAME): str,
-        vol.Required(CONF_PASSWORD): str,
+        vol.Required(CONF_PASSWORD): SECRET,
         vol.Required(CONF_BRAND_REGION): vol.In(BRANDS),
-        vol.Optional(CONF_PIN, default=DEFAULT_PIN): str,
+        vol.Optional(CONF_PIN, default=DEFAULT_PIN): SECRET,
         vol.Required(CONF_DISABLE_TLS_VERIFICATION, default=False): bool,
     }
 )
 
 STEP_REAUTH_DATA_SCHEMA = vol.Schema(
     {
-        vol.Required(CONF_PASSWORD): str,
-        vol.Optional(CONF_PIN): str,
+        vol.Required(CONF_PASSWORD): SECRET,
+        vol.Optional(CONF_PIN): SECRET,
+    }
+)
+
+STEP_RECONFIGURE_DATA_SCHEMA = vol.Schema(
+    {
+        vol.Required(CONF_PASSWORD): SECRET,
+        vol.Optional(CONF_PIN): SECRET,
+        vol.Required(CONF_DISABLE_TLS_VERIFICATION): bool,
     }
 )
 
@@ -62,7 +78,7 @@ OPTIONS_SCHEMA = vol.Schema(
             CONF_SCAN_INTERVAL,
             default=DEFAULT_SCAN_INTERVAL,
         ): vol.All(vol.Coerce(int), vol.Range(min=1, max=999)),
-        vol.Optional(CONF_PIN, default=DEFAULT_PIN): str,
+        vol.Optional(CONF_PIN, default=DEFAULT_PIN): SECRET,
         vol.Required(
             CONF_CHARGING_REFRESH_INTERVAL,
             default=DEFAULT_CHARGING_REFRESH_INTERVAL,
@@ -199,6 +215,54 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return self.async_show_form(
             step_id="reauth_confirm",
             data_schema=STEP_REAUTH_DATA_SCHEMA,
+            description_placeholders={"username": entry.data.get(CONF_USERNAME, "")},
+            errors=errors,
+        )
+
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Change password, PIN or TLS verification of an existing entry.
+
+        Account and brand cannot change here, because the entry's unique id is
+        derived from them; a different account is a new entry.
+        """
+        entry = self._get_reconfigure_entry()
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            data = {
+                **entry.data,
+                CONF_PASSWORD: user_input[CONF_PASSWORD],
+                CONF_DISABLE_TLS_VERIFICATION: user_input[
+                    CONF_DISABLE_TLS_VERIFICATION
+                ],
+            }
+            if user_input.get(CONF_PIN):
+                data[CONF_PIN] = user_input[CONF_PIN]
+
+            try:
+                await validate_input(self.hass, data)
+            except InvalidAuth:
+                errors["base"] = "invalid_auth"
+            except CannotConnect:
+                errors["base"] = "cannot_connect"
+            except Exception:
+                _LOGGER.exception("Unexpected exception")
+                errors["base"] = "unknown"
+            else:
+                return self.async_update_reload_and_abort(entry, data=data)
+
+        return self.async_show_form(
+            step_id="reconfigure",
+            data_schema=self.add_suggested_values_to_schema(
+                STEP_RECONFIGURE_DATA_SCHEMA,
+                {
+                    CONF_DISABLE_TLS_VERIFICATION: entry.data.get(
+                        CONF_DISABLE_TLS_VERIFICATION, False
+                    )
+                },
+            ),
             description_placeholders={"username": entry.data.get(CONF_USERNAME, "")},
             errors=errors,
         )
