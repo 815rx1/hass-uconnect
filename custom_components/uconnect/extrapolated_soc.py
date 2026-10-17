@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
@@ -65,9 +65,14 @@ MAX_DEEP_REFRESH_FAILURES = 3
 # was scheduled, also across Home Assistant restarts, which used to fire a
 # new one each time while charging: no two closer together than this
 MIN_DEEP_REFRESH_SPACING = timedelta(minutes=15)
-# and no more than this many in one charging session, so a vehicle the cloud
-# keeps reporting as charging is not woken around the clock
-MAX_DEEP_REFRESHES_PER_SESSION = 12
+# and no more than this many within any 24 hours, which still covers twelve
+# hours of slow charging at the default interval
+MAX_DEEP_REFRESHES_PER_DAY = 24
+DEEP_REFRESH_WINDOW = timedelta(hours=24)
+# A charge that has finished, or stalled, while the cloud still reports it as
+# charging shows no gain in state of charge. After this many deep refreshes
+# in a row without one, the vehicle is not woken again until the next session
+MAX_DEEP_REFRESHES_WITHOUT_PROGRESS = 3
 
 
 @dataclass
@@ -91,6 +96,12 @@ class SocEstimationState:
     target_soc: float = 100.0
     last_deep_refresh: datetime | None = None  # When the vehicle was last woken
     deep_refreshes_this_session: int = 0
+    # Wake-ups within the last 24 hours, for the daily limit
+    deep_refresh_times: list[datetime] = field(default_factory=list)
+    # State of charge after the last deep refresh, and how many refreshes in
+    # a row it did not rise
+    soc_at_last_deep_refresh: float | None = None
+    deep_refreshes_without_progress: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         """Convert state to dictionary for storage."""
@@ -116,6 +127,9 @@ class SocEstimationState:
                 self.last_deep_refresh.isoformat() if self.last_deep_refresh else None
             ),
             "deep_refreshes_this_session": self.deep_refreshes_this_session,
+            "deep_refresh_times": [t.isoformat() for t in self.deep_refresh_times],
+            "soc_at_last_deep_refresh": self.soc_at_last_deep_refresh,
+            "deep_refreshes_without_progress": self.deep_refreshes_without_progress,
         }
 
     @classmethod
@@ -209,13 +223,28 @@ class SocEstimationState:
             learned_correction_factor=float(correction),
             target_soc=float(target_soc),
             last_deep_refresh=_parse_aware_datetime(data.get("last_deep_refresh")),
-            deep_refreshes_this_session=(
-                count
-                if isinstance(count := data.get("deep_refreshes_this_session"), int)
-                and count >= 0
-                else 0
+            deep_refreshes_this_session=_parse_count(
+                data.get("deep_refreshes_this_session")
+            ),
+            deep_refresh_times=[
+                t
+                for t in map(_parse_aware_datetime, data.get("deep_refresh_times") or [])
+                if t is not None
+            ][-MAX_DEEP_REFRESHES_PER_DAY:],
+            soc_at_last_deep_refresh=(
+                float(soc)
+                if isinstance(soc := data.get("soc_at_last_deep_refresh"), (int, float))
+                else None
+            ),
+            deep_refreshes_without_progress=_parse_count(
+                data.get("deep_refreshes_without_progress")
             ),
         )
+
+
+def _parse_count(value: Any) -> int:
+    """Parse a non-negative counter, ignoring anything unusable."""
+    return value if isinstance(value, int) and value >= 0 else 0
 
 
 def _parse_aware_datetime(value: Any) -> datetime | None:
@@ -364,7 +393,15 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
             self.coordinator.charging_refresh_interval
             or self._state.deep_refreshes_this_session == 0
         ):
-            self._schedule_deep_refresh(CHARGE_START_REFRESH_DELAY)
+            # Pick the schedule up where it left off, a restart must not move
+            # the next wake-up forward
+            delay = CHARGE_START_REFRESH_DELAY
+            last = self._state.last_deep_refresh
+            interval = self.coordinator.charging_refresh_interval
+            if last is not None and interval:
+                due = last + timedelta(minutes=interval)
+                delay = max(delay, due - datetime.now(timezone.utc))
+            self._schedule_deep_refresh(delay)
 
         # Set up periodic timer for extrapolation updates
         self._unsub_timer = async_track_time_interval(
@@ -416,6 +453,7 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
         try:
             await self.coordinator.async_command(self._vin, COMMAND_DEEP_REFRESH)
             self._deep_refresh_failures = 0
+            self._track_deep_refresh_progress()
         except Exception as err:
             self._deep_refresh_failures += 1
             _LOGGER.warning(
@@ -434,6 +472,20 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
                 err, UconnectRequestError
             ):
                 await self.coordinator.async_request_refresh()
+
+    @callback
+    def _track_deep_refresh_progress(self) -> None:
+        """Count deep refreshes in a row that brought no gain in charge."""
+        soc = getattr(self.vehicle, "state_of_charge", None)
+        if soc is None:
+            return
+        previous = self._state.soc_at_last_deep_refresh
+        if previous is not None and soc <= previous:
+            self._state.deep_refreshes_without_progress += 1
+        else:
+            self._state.deep_refreshes_without_progress = 0
+        self._state.soc_at_last_deep_refresh = soc
+        self.async_write_ha_state()
 
     def _can_deep_refresh(self) -> bool:
         """Check whether an automatic deep refresh can reach the vehicle.
@@ -480,23 +532,40 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
                     self._deep_refresh_failures,
                 )
                 return
-            if self._state.deep_refreshes_this_session >= MAX_DEEP_REFRESHES_PER_SESSION:
+            if (
+                self._state.deep_refreshes_without_progress
+                >= MAX_DEEP_REFRESHES_WITHOUT_PROGRESS
+            ):
                 _LOGGER.info(
-                    "Not waking %s again, %d deep refreshes already this charging "
-                    "session",
+                    "Not waking %s again this session, the state of charge did "
+                    "not rise over the last %d deep refreshes",
                     self._vin,
-                    self._state.deep_refreshes_this_session,
+                    self._state.deep_refreshes_without_progress,
                 )
                 return
             now = datetime.now(timezone.utc)
             last = self._state.last_deep_refresh
             if last is not None and now - last < MIN_DEEP_REFRESH_SPACING:
-                # Too soon after the last wake-up, typically right after a
-                # restart: wait until the spacing has passed instead
+                # Too soon after the last wake-up: wait until the spacing has
+                # passed instead
                 self._schedule_deep_refresh(MIN_DEEP_REFRESH_SPACING - (now - last))
+                return
+            times = [
+                t for t in self._state.deep_refresh_times if now - t < DEEP_REFRESH_WINDOW
+            ]
+            self._state.deep_refresh_times = times
+            if len(times) >= MAX_DEEP_REFRESHES_PER_DAY:
+                _LOGGER.info(
+                    "Not waking %s, %d deep refreshes in the last 24 hours already",
+                    self._vin,
+                    len(times),
+                )
+                # Try again once the oldest one has left the window
+                self._schedule_deep_refresh(times[0] + DEEP_REFRESH_WINDOW - now)
                 return
             self._state.last_deep_refresh = now
             self._state.deep_refreshes_this_session += 1
+            self._state.deep_refresh_times.append(now)
             # Persist the wake-up right away, a restart must not forget it
             self.async_write_ha_state()
             interval = self.coordinator.charging_refresh_interval
@@ -755,6 +824,8 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
         if self._state.is_charging and not was_charging:
             self._deep_refresh_failures = 0
             self._state.deep_refreshes_this_session = 0
+            self._state.deep_refreshes_without_progress = 0
+            self._state.soc_at_last_deep_refresh = None
             self._schedule_deep_refresh(CHARGE_START_REFRESH_DELAY)
         elif was_charging and not self._state.is_charging:
             self._cancel_deep_refresh()
@@ -998,6 +1069,11 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
                 else None
             ),
             "deep_refreshes_this_session": self._state.deep_refreshes_this_session,
+            "deep_refreshes_last_24h": sum(
+                1
+                for t in self._state.deep_refresh_times
+                if datetime.now(timezone.utc) - t < DEEP_REFRESH_WINDOW
+            ),
         }
         # Include estimation state for restore
         attrs["estimation_state"] = self._state.to_dict()

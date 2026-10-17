@@ -17,7 +17,8 @@ from pytest_homeassistant_custom_component.common import (
 
 from custom_components.uconnect.const import CONF_ADD_COMMAND_ENTITIES
 from custom_components.uconnect.extrapolated_soc import (
-    MAX_DEEP_REFRESHES_PER_SESSION,
+    MAX_DEEP_REFRESHES_PER_DAY,
+    MAX_DEEP_REFRESHES_WITHOUT_PROGRESS,
     SocEstimationState,
 )
 
@@ -53,7 +54,22 @@ async def test_plain_polling_never_wakes_the_vehicle(hass, freezer, config_entry
     assert mock_client.refresh.call_count > 200
 
 
-async def test_charging_day_stays_within_cap(hass, freezer, config_entry, mock_client):
+def charge_on_each_wake_up(mock_client, vehicle) -> None:
+    """Let every deep refresh report a little more charge, like a real charge."""
+
+    def command(vin, cmd):
+        if cmd.name == "DEEPREFRESH":
+            vehicle.state_of_charge += 1
+        return True
+
+    mock_client.command_verify.side_effect = command
+
+
+async def test_charging_day_stays_within_daily_limit(
+    hass, freezer, config_entry, mock_client, vehicle
+):
+    vehicle.state_of_charge = 10
+    charge_on_each_wake_up(mock_client, vehicle)
     config_entry.add_to_hass(hass)
     # The shortest interval the options allow
     hass.config_entries.async_update_entry(
@@ -66,8 +82,50 @@ async def test_charging_day_stays_within_cap(hass, freezer, config_entry, mock_c
     # 24 hours in one-minute steps with the cloud reporting "charging" all along
     for _ in range(24 * 60):
         await step(hass, freezer, 1)
+    assert deep_refreshes(mock_client) == MAX_DEEP_REFRESHES_PER_DAY
 
-    assert deep_refreshes(mock_client) == MAX_DEEP_REFRESHES_PER_SESSION
+    # The next day allows more again, as the old ones leave the window
+    for _ in range(4 * 60):
+        await step(hass, freezer, 1)
+    assert deep_refreshes(mock_client) > MAX_DEEP_REFRESHES_PER_DAY
+
+
+async def test_slow_charge_is_followed_for_twelve_hours(
+    hass, freezer, config_entry, mock_client, vehicle
+):
+    # Default interval of 30 minutes, charging slowly from a household socket
+    vehicle.state_of_charge = 10
+    charge_on_each_wake_up(mock_client, vehicle)
+    config_entry.add_to_hass(hass)
+    hass.config_entries.async_update_entry(
+        config_entry,
+        options={**config_entry.options, "charging_refresh_interval": 30},
+    )
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    for _ in range(12 * 60):
+        await step(hass, freezer, 1)
+    assert deep_refreshes(mock_client) == 24
+
+
+async def test_finished_charge_stops_waking(
+    hass, freezer, config_entry, mock_client, vehicle
+):
+    # The cloud keeps reporting "charging" but the charge does not move
+    config_entry.add_to_hass(hass)
+    hass.config_entries.async_update_entry(
+        config_entry,
+        options={**config_entry.options, "charging_refresh_interval": 15},
+    )
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    for _ in range(24 * 60):
+        await step(hass, freezer, 1)
+
+    # One to take the baseline, then the allowed refreshes without a gain
+    assert deep_refreshes(mock_client) == 1 + MAX_DEEP_REFRESHES_WITHOUT_PROGRESS
 
 
 def restore_recent_wake_up(hass) -> None:
@@ -112,7 +170,7 @@ async def test_restart_while_charging_does_not_wake_again(
     assert deep_refreshes(mock_client) == 0
 
 
-async def test_restart_with_recurring_refresh_waits_for_spacing(
+async def test_restart_keeps_the_regular_schedule(
     hass, freezer, config_entry, mock_client
 ):
     restore_recent_wake_up(hass)
@@ -124,11 +182,13 @@ async def test_restart_with_recurring_refresh_waits_for_spacing(
     assert await hass.config_entries.async_setup(config_entry.entry_id)
     await hass.async_block_till_done()
 
-    # The usual restart delay passes without a wake-up, it is held back
-    # until 15 minutes after the last one
+    # The restart does not move the schedule forward: the next wake-up is
+    # still due 30 minutes after the last one, which was 2 minutes ago
     await step(hass, freezer, 5)
     assert deep_refreshes(mock_client) == 0
-    await step(hass, freezer, 9)
+    await step(hass, freezer, 22)
+    assert deep_refreshes(mock_client) == 0
+    await step(hass, freezer, 2)
     assert deep_refreshes(mock_client) == 1
 
 
@@ -162,17 +222,35 @@ async def test_without_pin_nothing_wakes(hass, freezer, config_entry, mock_clien
 
 def test_state_round_trip_keeps_wake_up_history():
     woken = datetime(2026, 10, 17, 12, 0, tzinfo=timezone.utc)
-    state = SocEstimationState(last_deep_refresh=woken, deep_refreshes_this_session=4)
+    state = SocEstimationState(
+        last_deep_refresh=woken,
+        deep_refreshes_this_session=4,
+        deep_refresh_times=[woken - timedelta(hours=1), woken],
+        soc_at_last_deep_refresh=55.0,
+        deep_refreshes_without_progress=2,
+    )
     restored = SocEstimationState.from_dict(state.to_dict())
     assert restored.last_deep_refresh == woken
     assert restored.deep_refreshes_this_session == 4
+    assert restored.deep_refresh_times == [woken - timedelta(hours=1), woken]
+    assert restored.soc_at_last_deep_refresh == 55.0
+    assert restored.deep_refreshes_without_progress == 2
 
     # States saved by older versions have neither field
     old = state.to_dict()
-    del old["last_deep_refresh"], old["deep_refreshes_this_session"]
+    for key in (
+        "last_deep_refresh",
+        "deep_refreshes_this_session",
+        "deep_refresh_times",
+        "soc_at_last_deep_refresh",
+        "deep_refreshes_without_progress",
+    ):
+        del old[key]
     restored = SocEstimationState.from_dict(old)
     assert restored.last_deep_refresh is None
     assert restored.deep_refreshes_this_session == 0
+    assert restored.deep_refresh_times == []
+    assert restored.deep_refreshes_without_progress == 0
 
 
 async def test_restarts_with_recurring_refresh_keep_spacing(
@@ -192,6 +270,6 @@ async def test_restarts_with_recurring_refresh_keep_spacing(
         assert await hass.config_entries.async_reload(config_entry.entry_id)
         await hass.async_block_till_done()
 
-    # Restarts reset the 30 minute timer, but never below the 15 minute
-    # spacing: at most one wake-up per quarter hour
-    assert 1 <= deep_refreshes(mock_client) <= 4
+    # Restarts do not shorten the 30 minute interval: one wake-up three
+    # minutes after charging started and one 30 minutes later
+    assert deep_refreshes(mock_client) == 2
