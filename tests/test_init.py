@@ -130,11 +130,31 @@ async def test_entities_turn_unavailable_after_repeated_failures(
     assert coordinator.consecutive_failures == 0
 
 
-async def test_scheduled_polling_runs(hass, setup_integration, mock_client):
+async def test_scheduled_polling_runs(hass, config_entry, mock_client, vehicle):
+    # Not charging, so no deep refresh adds its own poll
+    vehicle.charging = False
+    config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
     calls = mock_client.refresh.call_count
     async_fire_time_changed(hass, dt_util.utcnow() + timedelta(minutes=6))
     await hass.async_block_till_done()
     assert mock_client.refresh.call_count == calls + 1
+    mock_client.command_verify.assert_not_called()
+
+
+async def test_deep_refresh_after_charging_starts(hass, setup_integration, mock_client):
+    # The fixture vehicle is charging: one deep refresh follows a few minutes
+    # later even with the recurring refresh disabled, then none repeat
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(minutes=4))
+    await hass.async_block_till_done()
+    assert mock_client.command_verify.call_count == 1
+    assert mock_client.command_verify.call_args.args[1].name == "DEEPREFRESH"
+
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(minutes=60))
+    await hass.async_block_till_done()
+    assert mock_client.command_verify.call_count == 1
 
 
 async def test_vehicle_dropping_out_makes_entities_unavailable(

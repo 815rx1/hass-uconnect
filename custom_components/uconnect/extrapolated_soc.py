@@ -61,6 +61,13 @@ CHARGE_START_REFRESH_DELAY = timedelta(minutes=3)
 # A command the vehicle never answers ties up the status poll for a minute and
 # some thirty requests, so stop trying once it is clearly not listening
 MAX_DEEP_REFRESH_FAILURES = 3
+# Every deep refresh wakes the vehicle. These limits hold however the refresh
+# was scheduled, also across Home Assistant restarts, which used to fire a
+# new one each time while charging: no two closer together than this
+MIN_DEEP_REFRESH_SPACING = timedelta(minutes=15)
+# and no more than this many in one charging session, so a vehicle the cloud
+# keeps reporting as charging is not woken around the clock
+MAX_DEEP_REFRESHES_PER_SESSION = 12
 
 
 @dataclass
@@ -82,6 +89,8 @@ class SocEstimationState:
     idle_drain_rate_pct_per_hour: float = DEFAULT_IDLE_DRAIN_RATE
     learned_correction_factor: float = DEFAULT_CORRECTION_FACTOR
     target_soc: float = 100.0
+    last_deep_refresh: datetime | None = None  # When the vehicle was last woken
+    deep_refreshes_this_session: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         """Convert state to dictionary for storage."""
@@ -103,6 +112,10 @@ class SocEstimationState:
             "idle_drain_rate_pct_per_hour": self.idle_drain_rate_pct_per_hour,
             "learned_correction_factor": self.learned_correction_factor,
             "target_soc": self.target_soc,
+            "last_deep_refresh": (
+                self.last_deep_refresh.isoformat() if self.last_deep_refresh else None
+            ),
+            "deep_refreshes_this_session": self.deep_refreshes_this_session,
         }
 
     @classmethod
@@ -195,7 +208,25 @@ class SocEstimationState:
             idle_drain_rate_pct_per_hour=float(drain_rate),
             learned_correction_factor=float(correction),
             target_soc=float(target_soc),
+            last_deep_refresh=_parse_aware_datetime(data.get("last_deep_refresh")),
+            deep_refreshes_this_session=(
+                count
+                if isinstance(count := data.get("deep_refreshes_this_session"), int)
+                and count >= 0
+                else 0
+            ),
         )
+
+
+def _parse_aware_datetime(value: Any) -> datetime | None:
+    """Parse an ISO timestamp, ignoring anything unusable."""
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
 def select_time_to_full(
@@ -326,8 +357,13 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
         self._update_from_vehicle()
 
         # Resume the deep refresh schedule when Home Assistant restarts during
-        # a charge, the charging state carries over so no transition is seen
-        if self._state.is_charging:
+        # a charge, the charging state carries over so no transition is seen.
+        # With the recurring refresh disabled only the one at the start of the
+        # session is wanted, so a restart after it must not add another.
+        if self._state.is_charging and (
+            self.coordinator.charging_refresh_interval
+            or self._state.deep_refreshes_this_session == 0
+        ):
             self._schedule_deep_refresh(CHARGE_START_REFRESH_DELAY)
 
         # Set up periodic timer for extrapolation updates
@@ -444,6 +480,25 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
                     self._deep_refresh_failures,
                 )
                 return
+            if self._state.deep_refreshes_this_session >= MAX_DEEP_REFRESHES_PER_SESSION:
+                _LOGGER.info(
+                    "Not waking %s again, %d deep refreshes already this charging "
+                    "session",
+                    self._vin,
+                    self._state.deep_refreshes_this_session,
+                )
+                return
+            now = datetime.now(timezone.utc)
+            last = self._state.last_deep_refresh
+            if last is not None and now - last < MIN_DEEP_REFRESH_SPACING:
+                # Too soon after the last wake-up, typically right after a
+                # restart: wait until the spacing has passed instead
+                self._schedule_deep_refresh(MIN_DEEP_REFRESH_SPACING - (now - last))
+                return
+            self._state.last_deep_refresh = now
+            self._state.deep_refreshes_this_session += 1
+            # Persist the wake-up right away, a restart must not forget it
+            self.async_write_ha_state()
             interval = self.coordinator.charging_refresh_interval
             if interval:
                 self._schedule_deep_refresh(timedelta(minutes=interval))
@@ -699,6 +754,7 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
         # the vehicle held before the charger was negotiated
         if self._state.is_charging and not was_charging:
             self._deep_refresh_failures = 0
+            self._state.deep_refreshes_this_session = 0
             self._schedule_deep_refresh(CHARGE_START_REFRESH_DELAY)
         elif was_charging and not self._state.is_charging:
             self._cancel_deep_refresh()
@@ -936,6 +992,12 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
             ),
             "correction_factor": round(self._state.learned_correction_factor, 2),
             "target_soc": self._state.target_soc,
+            "last_deep_refresh": (
+                self._state.last_deep_refresh.isoformat()
+                if self._state.last_deep_refresh
+                else None
+            ),
+            "deep_refreshes_this_session": self._state.deep_refreshes_this_session,
         }
         # Include estimation state for restore
         attrs["estimation_state"] = self._state.to_dict()
