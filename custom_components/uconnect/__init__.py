@@ -3,7 +3,6 @@ from homeassistant.const import (
     Platform,
 )
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers import config_validation as cv
 
 from .const import DOMAIN
@@ -37,10 +36,9 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> b
 
     coordinator = UconnectDataUpdateCoordinator(hass, config_entry)
 
-    try:
-        await coordinator.async_config_entry_first_refresh()
-    except Exception as e:
-        raise ConfigEntryNotReady(f"Config Not Ready: {e}")
+    # Raises ConfigEntryNotReady on update failures and starts the reauth
+    # flow when the credentials were rejected
+    await coordinator.async_config_entry_first_refresh()
 
     hass.data.setdefault(DOMAIN, {})
     await async_setup_frontend_cards(hass)

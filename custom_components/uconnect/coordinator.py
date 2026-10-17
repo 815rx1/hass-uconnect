@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Callable
 from datetime import timedelta
 import logging
+import re
+from typing import Any, TypeVar
+
+from requests.adapters import HTTPAdapter
 
 from py_uconnect import Client
 from py_uconnect.command import Command
@@ -18,21 +24,64 @@ from homeassistant.const import (
     CONF_USERNAME,
 )
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
+from homeassistant.helpers.update_coordinator import (
+    DataUpdateCoordinator,
+    UpdateFailed,
+)
+from homeassistant.util import dt as dt_util
 
 from .const import (
+    AUTH_ERROR_CODES,
     CONF_BRAND_REGION,
     CONF_CHARGING_REFRESH_INTERVAL,
     CONF_DISABLE_TLS_VERIFICATION,
     BRANDS,
     DEFAULT_CHARGING_REFRESH_INTERVAL,
     DEFAULT_SCAN_INTERVAL,
+    MAX_CONSECUTIVE_FAILURES,
     MIN_CHARGING_REFRESH_INTERVAL,
+    REQUEST_TIMEOUT,
+    SLOW_EXTRA_DATA_INTERVAL,
     DOMAIN,
 )
 
 _LOGGER = logging.getLogger(DOMAIN)
+
+_T = TypeVar("_T")
+
+_ERROR_CODE_RE = re.compile(r"['\"]errorCode['\"]\s*:\s*(\d+)")
+
+
+class _TimeoutHTTPAdapter(HTTPAdapter):
+    """HTTP adapter that applies a timeout to requests made without one.
+
+    The library sends every request without a timeout, so a cloud endpoint
+    that stops answering holds an executor thread forever and the periodic
+    update never runs again until the integration is reloaded.
+    """
+
+    def send(self, request, **kwargs):
+        if kwargs.get("timeout") is None:
+            kwargs["timeout"] = REQUEST_TIMEOUT
+        return super().send(request, **kwargs)
+
+
+def is_auth_error(err: BaseException) -> bool:
+    """Return whether the error means the stored credentials were rejected.
+
+    The library raises plain exceptions carrying the login response, so the
+    error code of the identity provider is the only reliable signal. Network
+    errors and rate limits must not be mistaken for bad credentials, because
+    that would ask the user to log in again for no reason.
+    """
+
+    message = str(err)
+    if "account login failed" not in message:
+        return False
+
+    match = _ERROR_CODE_RE.search(message)
+    return match is not None and int(match.group(1)) in AUTH_ERROR_CODES
 
 
 class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
@@ -57,6 +106,19 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
             ),
         )
 
+        adapter = _TimeoutHTTPAdapter()
+        self.client.api.sess.mount("https://", adapter)
+        self.client.api.sess.mount("http://", adapter)
+
+        # The client shares its token and vehicle objects between calls, so a
+        # command and a poll running in two executor threads at once could log
+        # in twice or update a vehicle while it is read
+        self._client_lock = asyncio.Lock()
+
+        self.consecutive_failures: int = 0
+        self.last_successful_update = None
+        self._last_slow_extra_update = None
+
         self.refresh_interval: int = (
             config_entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL) * 60
         )
@@ -69,6 +131,7 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
             hass,
             _LOGGER,
             name=DOMAIN,
+            config_entry=config_entry,
             update_interval=timedelta(seconds=self.refresh_interval),
             always_update=True,
         )
@@ -102,50 +165,91 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
 
         return max(minutes, MIN_CHARGING_REFRESH_INTERVAL)
 
+    async def async_run(self, func: Callable[..., _T], *args: Any) -> _T:
+        """Run a blocking client call in the executor, one call at a time."""
+
+        async with self._client_lock:
+            return await self.hass.async_add_executor_job(func, *args)
+
     async def _async_update_data(self):
         """Update data via library. Called by update_coordinator periodically."""
 
         try:
-            await self.hass.async_add_executor_job(self.client.refresh)
+            await self.async_run(self.client.refresh)
         except Exception as err:
-            # On first run (no cached data), re-raise to signal setup failure
-            if self.data is None and not self.client.vehicles:
-                _LOGGER.error("Initial data fetch failed: %s", err)
-                raise
-            # On subsequent runs, log and fall back to cached data
-            _LOGGER.warning("Update failed, falling back to cached data: %s", err)
+            if is_auth_error(err):
+                raise ConfigEntryAuthFailed(f"Credentials rejected: {err}") from err
+
+            self.consecutive_failures += 1
+
+            # Without any vehicle there is nothing cached to fall back to
+            if not self.client.vehicles:
+                raise UpdateFailed(f"Initial data fetch failed: {err}") from err
+
+            # A single failed poll is common with this cloud, so the cached
+            # data is kept for a while. After that the entities have to turn
+            # unavailable rather than show stale values as if they were fresh.
+            if self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                raise UpdateFailed(
+                    f"Update failed {self.consecutive_failures} times in a row: {err}"
+                ) from err
+
+            _LOGGER.warning(
+                "Update failed (%d/%d), falling back to cached data: %s",
+                self.consecutive_failures,
+                MAX_CONSECUTIVE_FAILURES,
+                err,
+            )
+        else:
+            self.consecutive_failures = 0
+            self.last_successful_update = dt_util.utcnow()
 
         await self._async_update_extra_data()
 
         return True
 
     async def _async_update_extra_data(self) -> None:
-        """Fetch extra data (VHR, maintenance) for all vehicles."""
+        """Fetch extra data (VHR, maintenance, schedules, SVLA) for all vehicles.
 
-        for vin in self.client.vehicles:
-            try:
-                self.vhr_data[vin] = await self.hass.async_add_executor_job(
-                    self.client.get_vehicle_health_report, vin
-                )
-            except Exception as err:
-                _LOGGER.debug("VHR not available for %s: %s", vin, err)
+        The health report and the maintenance history change at most daily,
+        so they are fetched on a slow interval instead of on every poll. That
+        halves the requests per poll and lowers the risk of rate limiting.
+        """
+
+        now = dt_util.utcnow()
+        fetch_slow = (
+            self._last_slow_extra_update is None
+            or now - self._last_slow_extra_update >= SLOW_EXTRA_DATA_INTERVAL
+            or any(vin not in self.vhr_data for vin in self.client.vehicles)
+        )
+
+        for vin in list(self.client.vehicles):
+            if fetch_slow:
+                try:
+                    self.vhr_data[vin] = await self.async_run(
+                        self.client.get_vehicle_health_report, vin
+                    )
+                except Exception as err:
+                    _LOGGER.debug("VHR not available for %s: %s", vin, err)
+
+                try:
+                    self.maintenance_data[vin] = await self.async_run(
+                        self.client.get_maintenance_history, vin
+                    )
+                except Exception as err:
+                    _LOGGER.debug(
+                        "Maintenance history not available for %s: %s", vin, err
+                    )
 
             try:
-                self.maintenance_data[vin] = await self.hass.async_add_executor_job(
-                    self.client.get_maintenance_history, vin
-                )
-            except Exception as err:
-                _LOGGER.debug("Maintenance history not available for %s: %s", vin, err)
-
-            try:
-                self.charge_schedule_data[vin] = await self.hass.async_add_executor_job(
+                self.charge_schedule_data[vin] = await self.async_run(
                     self.client.get_charge_schedules, vin
                 )
             except Exception as err:
                 _LOGGER.debug("Charge schedules not available for %s: %s", vin, err)
 
             try:
-                self.svla_data[vin] = await self.hass.async_add_executor_job(
+                self.svla_data[vin] = await self.async_run(
                     self.client.get_stolen_vehicle_status, vin
                 )
             except Exception as err:
@@ -153,12 +257,13 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
                     "Stolen vehicle status not available for %s: %s", vin, err
                 )
 
+        if fetch_slow:
+            self._last_slow_extra_update = now
+
     async def async_set_charge_schedule(self, vin: str, schedule: dict) -> None:
         """Set a charge schedule"""
 
-        r = await self.hass.async_add_executor_job(
-            self.client.set_charge_schedule_verify, vin, schedule
-        )
+        r = await self.async_run(self.client.set_charge_schedule_verify, vin, schedule)
         await self.async_refresh()
 
         if not r:
@@ -167,7 +272,7 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
     async def async_command(self, vin: str, cmd: Command) -> None:
         """Execute the given command"""
 
-        r = await self.hass.async_add_executor_job(self.client.command_verify, vin, cmd)
+        r = await self.async_run(self.client.command_verify, vin, cmd)
         await self.async_refresh()
 
         if not r:
@@ -180,9 +285,7 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
             raise ValueError(f"Invalid charging level: {level}")
         level = CHARGING_LEVELS_BY_NAME[level]
 
-        r = await self.hass.async_add_executor_job(
-            self.client.set_charging_level_verify, vin, level
-        )
+        r = await self.async_run(self.client.set_charging_level_verify, vin, level)
         await self.async_refresh()
 
         if not r:

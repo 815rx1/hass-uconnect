@@ -42,7 +42,7 @@ async def async_setup_entry(
         if not image_url:
             # Try the dedicated image API endpoint
             try:
-                result = await hass.async_add_executor_job(
+                result = await coordinator.async_run(
                     coordinator.client.get_vehicle_image, vehicle.vin
                 )
                 _LOGGER.debug(
