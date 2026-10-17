@@ -32,6 +32,7 @@ from py_uconnect.command import (
     Command,
 )
 
+from .charge_schedule import enabled_days, supports_emea_schedules
 from .const import DOMAIN, CONF_ADD_COMMAND_ENTITIES
 from .coordinator import UconnectDataUpdateCoordinator
 from .entity import UconnectEntity
@@ -134,6 +135,12 @@ async def async_setup_entry(
             ) and description.is_available(vehicle):
                 entities.append(UconnectSwitch(coordinator, description, vehicle))
 
+        if supports_emea_schedules(coordinator.client, vehicle):
+            for slot in range(len(vehicle.charge_schedules)):
+                entities.append(
+                    UconnectChargeScheduleSwitch(coordinator, vehicle, slot)
+                )
+
     async_add_entities(entities)
 
 
@@ -193,3 +200,69 @@ class UconnectSwitch(SwitchEntity, UconnectEntity):
         except Exception as err:
             _LOGGER.error("Failed to turn off %s: %s", self.entity_description.key, err)
             raise HomeAssistantError(f"Failed to turn off: {err}") from err
+
+
+class UconnectChargeScheduleSwitch(SwitchEntity, UconnectEntity):
+    """Enables or disables one inline charge schedule slot of an EMEA vehicle."""
+
+    def __init__(
+        self,
+        coordinator: UconnectDataUpdateCoordinator,
+        vehicle: Vehicle,
+        slot: int,
+    ):
+        UconnectEntity.__init__(self, coordinator, vehicle)
+
+        self._slot = slot
+        self._attr_name = (
+            f"{vehicle.make} {vehicle.nickname or vehicle.model} "
+            f"Charge Schedule {slot + 1}"
+        )
+        self._attr_unique_id = f"{DOMAIN}_{vehicle.vin}_charge_schedule_{slot + 1}"
+        self._attr_icon = "mdi:calendar-clock"
+
+    @property
+    def _schedule(self):
+        schedules = getattr(self.vehicle, "charge_schedules", None) or []
+        return schedules[self._slot] if self._slot < len(schedules) else None
+
+    @property
+    def available(self) -> bool:
+        return super().available and self._schedule is not None
+
+    @property
+    def is_on(self):
+        schedule = self._schedule
+        return schedule.enable if schedule is not None else None
+
+    @property
+    def extra_state_attributes(self):
+        schedule = self._schedule
+        if schedule is None:
+            return None
+
+        return {
+            "start_time": schedule.start_time,
+            "end_time": schedule.end_time,
+            "days": enabled_days(schedule),
+            "charge_to_full": schedule.charge_to_full,
+            "cabin_priority": schedule.cabin_priority,
+            "repeat_schedule": schedule.repeat_schedule,
+        }
+
+    async def _async_set_enable(self, enable: bool):
+        try:
+            await self.coordinator.async_set_emea_charge_schedule(
+                self._vin, self._slot, enable=enable
+            )
+        except Exception as err:
+            _LOGGER.error(
+                "Failed to set charge schedule %d: %s", self._slot + 1, err
+            )
+            raise HomeAssistantError(f"Failed to set charge schedule: {err}") from err
+
+    async def async_turn_on(self, **kwargs):
+        await self._async_set_enable(True)
+
+    async def async_turn_off(self, **kwargs):
+        await self._async_set_enable(False)

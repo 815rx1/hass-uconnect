@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+import dataclasses
 from datetime import timedelta
 import logging
 import re
@@ -15,6 +16,11 @@ from py_uconnect import Client
 from py_uconnect.command import Command
 from py_uconnect.api import CHARGING_LEVELS_BY_NAME
 from py_uconnect.brands import BRANDS as BRANDS_BY_NAME
+
+try:
+    from py_uconnect.api import AuthenticationError
+except ImportError:  # py-uconnect without a dedicated authentication error
+    AuthenticationError = None
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
@@ -31,6 +37,7 @@ from homeassistant.helpers.update_coordinator import (
 )
 from homeassistant.util import dt as dt_util
 
+from .charge_schedule import WEEKDAYS, supports_emea_schedules
 from .const import (
     AUTH_ERROR_CODES,
     CONF_BRAND_REGION,
@@ -75,6 +82,9 @@ def is_auth_error(err: BaseException) -> bool:
     errors and rate limits must not be mistaken for bad credentials, because
     that would ask the user to log in again for no reason.
     """
+
+    if AuthenticationError is not None and isinstance(err, AuthenticationError):
+        return True
 
     message = str(err)
     if "account login failed" not in message:
@@ -241,12 +251,17 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
                         "Maintenance history not available for %s: %s", vin, err
                     )
 
-            try:
-                self.charge_schedule_data[vin] = await self.async_run(
-                    self.client.get_charge_schedules, vin
-                )
-            except Exception as err:
-                _LOGGER.debug("Charge schedules not available for %s: %s", vin, err)
+            # EMEA vehicles report their schedules inline, and the v4 schedule
+            # endpoint only answers HTTP 500 for them
+            if not supports_emea_schedules(self.client, self.client.vehicles[vin]):
+                try:
+                    self.charge_schedule_data[vin] = await self.async_run(
+                        self.client.get_charge_schedules, vin
+                    )
+                except Exception as err:
+                    _LOGGER.debug(
+                        "Charge schedules not available for %s: %s", vin, err
+                    )
 
             try:
                 self.svla_data[vin] = await self.async_run(
@@ -264,6 +279,35 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
         """Set a charge schedule"""
 
         r = await self.async_run(self.client.set_charge_schedule_verify, vin, schedule)
+        await self.async_refresh()
+
+        if not r:
+            raise HomeAssistantError("Set charge schedule failed")
+
+    async def async_set_emea_charge_schedule(
+        self, vin: str, slot: int, **changes: Any
+    ) -> None:
+        """Change one inline charge schedule slot of an EMEA vehicle.
+
+        The backend replaces the whole list on every write, so the other slots
+        are sent back unchanged. Days are given as a list of weekday names.
+        """
+
+        vehicle = self.client.vehicles.get(vin)
+        schedules = list(getattr(vehicle, "charge_schedules", None) or [])
+        if not 0 <= slot < len(schedules):
+            raise HomeAssistantError(f"Charge schedule {slot + 1} does not exist")
+
+        current = schedules[slot]
+        if (days := changes.pop("days", None)) is not None:
+            changes["days"] = dataclasses.replace(
+                current.days, **{day: day in days for day in WEEKDAYS}
+            )
+        schedules[slot] = dataclasses.replace(current, **changes)
+
+        r = await self.async_run(
+            self.client.set_charge_schedule_emea, vin, schedules, True
+        )
         await self.async_refresh()
 
         if not r:

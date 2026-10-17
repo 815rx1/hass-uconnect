@@ -284,6 +284,57 @@
                     "description": "Ladeplan als JSON-Objekt"
                 }
             }
+        },
+        "set_charge_schedule_slot": {
+            "name": "Ladeplan-Slot festlegen",
+            "description": "Einen Ladeplan-Slot eines EMEA-Fahrzeugs (z. B. Fiat 500e) ändern; die anderen Slots bleiben unverändert",
+            "fields": {
+                "device_id": {
+                    "name": "Fahrzeug",
+                    "description": "Zielfahrzeug"
+                },
+                "slot": {
+                    "name": "Slot",
+                    "description": "Ladeplan-Slot (1-3)"
+                },
+                "enabled": {
+                    "name": "Aktiv",
+                    "description": "Slot ein- oder ausschalten"
+                },
+                "start_time": {
+                    "name": "Startzeit",
+                    "description": "Uhrzeit, zu der das Laden beginnt"
+                },
+                "end_time": {
+                    "name": "Endzeit",
+                    "description": "Uhrzeit, zu der das Laden endet"
+                },
+                "days": {
+                    "name": "Tage",
+                    "description": "Wochentage, an denen der Slot aktiv ist"
+                },
+                "charge_to_full": {
+                    "name": "Voll laden",
+                    "description": "Auf 100 % laden statt zur Endzeit aufzuhören"
+                },
+                "cabin_priority": {
+                    "name": "Innenraum zuerst",
+                    "description": "Vorklimatisierung des Innenraums bevorzugen"
+                }
+            }
+        }
+    },
+    "selector": {
+        "weekday": {
+            "options": {
+                "monday": "Montag",
+                "tuesday": "Dienstag",
+                "wednesday": "Mittwoch",
+                "thursday": "Donnerstag",
+                "friday": "Freitag",
+                "saturday": "Samstag",
+                "sunday": "Sonntag"
+            }
         }
     }
 }

@@ -284,6 +284,57 @@
                     "description": "Charge schedule as a JSON object"
                 }
             }
+        },
+        "set_charge_schedule_slot": {
+            "name": "Set Charge Schedule Slot",
+            "description": "Change one charge schedule slot of an EMEA vehicle (e.g. Fiat 500e); the other slots stay unchanged",
+            "fields": {
+                "device_id": {
+                    "name": "Vehicle",
+                    "description": "Target vehicle"
+                },
+                "slot": {
+                    "name": "Slot",
+                    "description": "Schedule slot (1-3)"
+                },
+                "enabled": {
+                    "name": "Enabled",
+                    "description": "Enable or disable the slot"
+                },
+                "start_time": {
+                    "name": "Start time",
+                    "description": "Time charging starts"
+                },
+                "end_time": {
+                    "name": "End time",
+                    "description": "Time charging ends"
+                },
+                "days": {
+                    "name": "Days",
+                    "description": "Weekdays the slot is active on"
+                },
+                "charge_to_full": {
+                    "name": "Charge to full",
+                    "description": "Charge to 100% instead of stopping at the end time"
+                },
+                "cabin_priority": {
+                    "name": "Cabin priority",
+                    "description": "Prioritise cabin preconditioning"
+                }
+            }
+        }
+    },
+    "selector": {
+        "weekday": {
+            "options": {
+                "monday": "Monday",
+                "tuesday": "Tuesday",
+                "wednesday": "Wednesday",
+                "thursday": "Thursday",
+                "friday": "Friday",
+                "saturday": "Saturday",
+                "sunday": "Sunday"
+            }
         }
     }
 }

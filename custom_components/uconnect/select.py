@@ -71,7 +71,7 @@ class UconnectSelectSetChargingLevel(SelectEntity, UconnectEntity):
 
     @property
     def icon(self):
-        return ICONS.get(self.vehicle.charging_level_preference, "mdi:battery-charging")
+        return ICONS.get(self.current_option, "mdi:battery-charging")
 
     @property
     def options(self):
@@ -79,7 +79,17 @@ class UconnectSelectSetChargingLevel(SelectEntity, UconnectEntity):
 
     @property
     def current_option(self):
-        return self.vehicle.charging_level_preference
+        """Return the preference as a level name.
+
+        Older py-uconnect versions report the raw name such as LEVEL_FIVE,
+        newer ones map it to the integer scale 1 to 5 used by charging_level.
+        """
+        preference = self.vehicle.charging_level_preference
+        if isinstance(preference, int):
+            if 1 <= preference <= len(CHARGING_LEVEL_NAMES):
+                return CHARGING_LEVEL_NAMES[preference - 1]
+            return None
+        return preference
 
     async def async_select_option(self, option: str) -> None:
         try:

@@ -3,6 +3,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import ServiceCall, callback, HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import device_registry
+from homeassistant.util import dt as dt_util
 
 from py_uconnect.command import (
     COMMAND_CABIN_VENTILATION,
@@ -31,6 +32,7 @@ from py_uconnect.command import (
     Command,
 )
 
+from .charge_schedule import WEEKDAYS, format_time, supports_emea_schedules
 from .const import DOMAIN
 from .coordinator import UconnectDataUpdateCoordinator
 
@@ -59,6 +61,7 @@ SERVICE_DEEP_REFRESH = "deep_refresh"
 SERVICE_DEEP_REFRESH_V2 = "deep_refresh_v2"
 SERVICE_REFRESH_LOCATION = "refresh_location"
 SERVICE_SET_CHARGE_SCHEDULE = "set_charge_schedule"
+SERVICE_SET_CHARGE_SCHEDULE_SLOT = "set_charge_schedule_slot"
 
 SUPPORTED_SERVICES = [
     SERVICE_UPDATE,
@@ -170,6 +173,54 @@ def async_setup_services(hass: HomeAssistant, config_entry: ConfigEntry) -> bool
             DOMAIN, SERVICE_SET_CHARGE_SCHEDULE, async_set_charge_schedule
         )
 
+    # Register the slot service if any vehicle reports inline EMEA schedules
+    if any(
+        supports_emea_schedules(coordinator.client, v)
+        for v in coordinator.client.vehicles.values()
+    ):
+
+        async def async_set_charge_schedule_slot(call: ServiceCall):
+            coord = _get_coordinator_from_device(hass, call)
+            vin = _get_vin_from_device(hass, call)
+            changes = {}
+
+            if "enabled" in call.data:
+                changes["enable"] = bool(call.data["enabled"])
+
+            for field in ("start_time", "end_time"):
+                if field in call.data:
+                    value = dt_util.parse_time(str(call.data[field]))
+                    if value is None:
+                        raise HomeAssistantError(f"Invalid {field}: {call.data[field]}")
+                    changes[field] = format_time(value)
+
+            if "days" in call.data:
+                days = call.data["days"]
+                if isinstance(days, str):
+                    days = [days]
+                invalid = [d for d in days if d not in WEEKDAYS]
+                if invalid:
+                    raise HomeAssistantError(f"Invalid days: {invalid}")
+                changes["days"] = list(days)
+
+            for field in ("charge_to_full", "cabin_priority"):
+                if field in call.data:
+                    changes[field] = bool(call.data[field])
+
+            if not changes:
+                raise HomeAssistantError("Nothing to change")
+
+            try:
+                slot = int(call.data.get("slot", 1)) - 1
+            except (TypeError, ValueError) as err:
+                raise HomeAssistantError("slot must be a number") from err
+
+            await coord.async_set_emea_charge_schedule(vin, slot, **changes)
+
+        hass.services.async_register(
+            DOMAIN, SERVICE_SET_CHARGE_SCHEDULE_SLOT, async_set_charge_schedule_slot
+        )
+
     return True
 
 
@@ -177,8 +228,9 @@ def async_setup_services(hass: HomeAssistant, config_entry: ConfigEntry) -> bool
 def async_unload_services(hass) -> None:
     for service in SUPPORTED_SERVICES:
         hass.services.async_remove(DOMAIN, service)
-    if hass.services.has_service(DOMAIN, SERVICE_SET_CHARGE_SCHEDULE):
-        hass.services.async_remove(DOMAIN, SERVICE_SET_CHARGE_SCHEDULE)
+    for service in (SERVICE_SET_CHARGE_SCHEDULE, SERVICE_SET_CHARGE_SCHEDULE_SLOT):
+        if hass.services.has_service(DOMAIN, service):
+            hass.services.async_remove(DOMAIN, service)
 
 
 def _get_vin_from_device(hass: HomeAssistant, call: ServiceCall) -> str:

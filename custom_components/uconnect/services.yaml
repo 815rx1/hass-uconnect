@@ -186,3 +186,47 @@ set_charge_schedule:
       required: true
       selector:
         object:
+
+set_charge_schedule_slot:
+  fields:
+    device_id:
+      required: true
+      selector:
+        device:
+          integration: uconnect
+    slot:
+      required: true
+      default: 1
+      selector:
+        number:
+          min: 1
+          max: 3
+          mode: box
+    enabled:
+      selector:
+        boolean:
+    start_time:
+      selector:
+        time:
+    end_time:
+      selector:
+        time:
+    days:
+      selector:
+        select:
+          multiple: true
+          translation_key: weekday
+          options:
+            - monday
+            - tuesday
+            - wednesday
+            - thursday
+            - friday
+            - saturday
+            - sunday
+    charge_to_full:
+      selector:
+        boolean:
+    cabin_priority:
+      selector:
+        boolean:
