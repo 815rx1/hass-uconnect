@@ -19,7 +19,7 @@
         "custom_components.uconnect"
     ],
     "requirements": [
-        "py-uconnect==0.4.6"
+        "py-uconnect @ git+https://github.com/815rx1/py-uconnect.git@1e46eb4c5b5f7b77313f32e31b08ed7ffd5ee54c"
     ],
     "version": "0.5.4"
 }
