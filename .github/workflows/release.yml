@@ -14,7 +14,15 @@ jobs:
     steps:
     - uses: actions/checkout@v6
 
+    # Tags such as v0.6.0b1 or v0.6.0rc1 become pre-releases, which HACS only
+    # offers to users who enabled beta versions. A release created by hand
+    # before the tag is pushed keeps its notes.
     - uses: ncipollo/release-action@v1
       with:
-        makeLatest: true
-        body: "Home Assistant Uconnect Release"
+        allowUpdates: true
+        omitBodyDuringUpdate: true
+        omitNameDuringUpdate: true
+        omitPrereleaseDuringUpdate: true
+        generateReleaseNotes: true
+        prerelease: ${{ contains(github.ref_name, 'b') || contains(github.ref_name, 'rc') }}
+        makeLatest: ${{ !(contains(github.ref_name, 'b') || contains(github.ref_name, 'rc')) }}
