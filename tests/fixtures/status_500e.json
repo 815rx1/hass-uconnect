@@ -1,0 +1,53 @@
+{
+    "vehicleInfo": {
+        "odometer": {"odometer": {"value": "12345", "unit": "km"}},
+        "tyrePressure": [
+            {"warning": false, "pressure": {"value": "250", "unit": "kPa"}, "type": "FL", "status": "NORMAL"},
+            {"warning": false, "pressure": {"value": "250", "unit": "kPa"}, "type": "FR", "status": "NORMAL"},
+            {"warning": false, "pressure": {"value": "240", "unit": "kPa"}, "type": "RL", "status": "NORMAL"},
+            {"warning": true, "pressure": {"value": "180", "unit": "kPa"}, "type": "RR", "status": "LOW"}
+        ],
+        "batteryInfo": {"batteryStatus": "0", "batteryVoltage": {"value": "14.55", "unit": "volts"}},
+        "tripsInfo": {
+            "trips": [
+                {"name": "TripA", "totalDistance": {"value": "1013", "unit": "km"},
+                 "totalElectricDistance": {"value": "null", "unit": "km"}},
+                {"name": "TripB", "totalDistance": {"value": "14", "unit": "km"},
+                 "totalElectricDistance": {"value": "null", "unit": "km"}}
+            ]
+        },
+        "distanceToService": {"distanceToService": {"value": "5127.0", "unit": "km"}},
+        "daysToService": 200,
+        "hVBatSOH": 97,
+        "timestamp": 1760000000000
+    },
+    "evInfo": {
+        "battery": {
+            "stateOfCharge": 72,
+            "chargingLevel": "LEVEL_2",
+            "plugInStatus": true,
+            "timeToFullyChargeL2": 205,
+            "chargingStatus": "CHARGING",
+            "totalRange": 172,
+            "distanceToEmpty": {"value": 172, "unit": "km"}
+        },
+        "chargePowerPreference": "LEVEL_THREE",
+        "ignitionStatus": "OFF",
+        "timestamp": 1760000100000,
+        "schedules": [
+            {"chargeToFull": false, "scheduleType": "CHARGE", "enableScheduleType": true,
+             "scheduledDays": {"sunday": false, "saturday": false, "tuesday": true, "wednesday": true,
+                               "thursday": true, "friday": true, "monday": true},
+             "startTime": "01:00", "endTime": "05:00", "cabinPriority": false, "repeatSchedule": true},
+            {"chargeToFull": false, "scheduleType": "NONE", "enableScheduleType": false,
+             "scheduledDays": {"sunday": false, "saturday": false, "tuesday": false, "wednesday": false,
+                               "thursday": false, "friday": false, "monday": false},
+             "startTime": "00:00", "endTime": "00:00", "cabinPriority": false, "repeatSchedule": true},
+            {"chargeToFull": false, "scheduleType": "NONE", "enableScheduleType": false,
+             "scheduledDays": {"sunday": false, "saturday": false, "tuesday": false, "wednesday": false,
+                               "thursday": false, "friday": false, "monday": false},
+             "startTime": "00:00", "endTime": "00:00", "cabinPriority": false, "repeatSchedule": true}
+        ]
+    },
+    "timestamp": 1760000200000
+}
