@@ -18,4 +18,5 @@ jobs:
           category: "integration"
 
       - name: HASS validation
+        if: always()
         uses: home-assistant/actions/hassfest@master
