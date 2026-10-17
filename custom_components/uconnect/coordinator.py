@@ -7,20 +7,14 @@ from collections.abc import Callable
 import dataclasses
 from datetime import timedelta
 import logging
-import re
 from typing import Any, TypeVar
 
-from requests.adapters import HTTPAdapter
+from .pyuconnect import Client
+from .pyuconnect.command import Command
+from .pyuconnect.api import CHARGING_LEVELS_BY_NAME
+from .pyuconnect.brands import BRANDS as BRANDS_BY_NAME
 
-from py_uconnect import Client
-from py_uconnect.command import Command
-from py_uconnect.api import CHARGING_LEVELS_BY_NAME
-from py_uconnect.brands import BRANDS as BRANDS_BY_NAME
-
-try:
-    from py_uconnect.api import AuthenticationError
-except ImportError:  # py-uconnect without a dedicated authentication error
-    AuthenticationError = None
+from .pyuconnect.api import AuthenticationError
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
@@ -30,7 +24,11 @@ from homeassistant.const import (
     CONF_USERNAME,
 )
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
+from homeassistant.exceptions import (
+    ConfigEntryAuthFailed,
+    HomeAssistantError,
+    ServiceValidationError,
+)
 from homeassistant.helpers.update_coordinator import (
     DataUpdateCoordinator,
     UpdateFailed,
@@ -39,7 +37,6 @@ from homeassistant.util import dt as dt_util
 
 from .charge_schedule import WEEKDAYS, supports_emea_schedules
 from .const import (
-    AUTH_ERROR_CODES,
     CONF_BRAND_REGION,
     CONF_CHARGING_REFRESH_INTERVAL,
     CONF_DISABLE_TLS_VERIFICATION,
@@ -48,50 +45,33 @@ from .const import (
     DEFAULT_SCAN_INTERVAL,
     MAX_CONSECUTIVE_FAILURES,
     MIN_CHARGING_REFRESH_INTERVAL,
-    REQUEST_TIMEOUT,
     SLOW_EXTRA_DATA_INTERVAL,
     DOMAIN,
 )
 
-_LOGGER = logging.getLogger(DOMAIN)
+_LOGGER = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
-
-_ERROR_CODE_RE = re.compile(r"['\"]errorCode['\"]\s*:\s*(\d+)")
-
-
-class _TimeoutHTTPAdapter(HTTPAdapter):
-    """HTTP adapter that applies a timeout to requests made without one.
-
-    The library sends every request without a timeout, so a cloud endpoint
-    that stops answering holds an executor thread forever and the periodic
-    update never runs again until the integration is reloaded.
-    """
-
-    def send(self, request, **kwargs):
-        if kwargs.get("timeout") is None:
-            kwargs["timeout"] = REQUEST_TIMEOUT
-        return super().send(request, **kwargs)
 
 
 def is_auth_error(err: BaseException) -> bool:
     """Return whether the error means the stored credentials were rejected.
 
-    The library raises plain exceptions carrying the login response, so the
-    error code of the identity provider is the only reliable signal. Network
-    errors and rate limits must not be mistaken for bad credentials, because
-    that would ask the user to log in again for no reason.
+    Network errors and rate limits must not be mistaken for bad credentials,
+    because that would ask the user to log in again for no reason, so only
+    the library's dedicated error counts.
     """
 
-    if AuthenticationError is not None and isinstance(err, AuthenticationError):
-        return True
+    return isinstance(err, AuthenticationError)
 
-    message = str(err)
-    if "account login failed" not in message:
-        return False
 
-    match = _ERROR_CODE_RE.search(message)
-    return match is not None and int(match.group(1)) in AUTH_ERROR_CODES
+class UconnectRequestError(HomeAssistantError):
+    """A vehicle action could not be sent or its outcome is unknown.
+
+    Unlike a plain HomeAssistantError, which means the vehicle answered and
+    refused, the cloud may still carry this action out, and no refresh has
+    followed it yet.
+    """
 
 
 class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
@@ -115,10 +95,6 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
                 CONF_DISABLE_TLS_VERIFICATION
             ),
         )
-
-        adapter = _TimeoutHTTPAdapter()
-        self.client.api.sess.mount("https://", adapter)
-        self.client.api.sess.mount("http://", adapter)
 
         # The client shares its token and vehicle objects between calls, so a
         # command and a poll running in two executor threads at once could log
@@ -214,7 +190,10 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
             self.consecutive_failures = 0
             self.last_successful_update = dt_util.utcnow()
 
-        await self._async_update_extra_data()
+            # Only after a successful poll: each of these calls can take until
+            # the request timeout while the cloud is down, and they hold the
+            # client lock, so commands would queue behind them for minutes
+            await self._async_update_extra_data()
 
         return True
 
@@ -278,11 +257,9 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
     async def async_set_charge_schedule(self, vin: str, schedule: dict) -> None:
         """Set a charge schedule"""
 
-        r = await self.async_run(self.client.set_charge_schedule_verify, vin, schedule)
-        await self.async_refresh()
-
-        if not r:
-            raise HomeAssistantError("Set charge schedule failed")
+        await self._async_vehicle_action(
+            "Set charge schedule", self.client.set_charge_schedule_verify, vin, schedule
+        )
 
     async def async_set_emea_charge_schedule(
         self, vin: str, slot: int, **changes: Any
@@ -305,35 +282,56 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
             )
         schedules[slot] = dataclasses.replace(current, **changes)
 
-        r = await self.async_run(
-            self.client.set_charge_schedule_emea, vin, schedules, True
+        await self._async_vehicle_action(
+            "Set charge schedule",
+            self.client.set_charge_schedule_emea,
+            vin,
+            schedules,
+            True,
         )
-        await self.async_refresh()
-
-        if not r:
-            raise HomeAssistantError("Set charge schedule failed")
 
     async def async_command(self, vin: str, cmd: Command) -> None:
         """Execute the given command"""
 
-        r = await self.async_run(self.client.command_verify, vin, cmd)
-        await self.async_refresh()
-
-        if not r:
-            raise HomeAssistantError("Command execution failed")
+        await self._async_vehicle_action(
+            f"Command {cmd.name}", self.client.command_verify, vin, cmd
+        )
 
     async def async_set_charging_level(self, vin: str, level: str) -> None:
         """Set the charging level"""
 
         if level not in CHARGING_LEVELS_BY_NAME:
-            raise ValueError(f"Invalid charging level: {level}")
-        level = CHARGING_LEVELS_BY_NAME[level]
+            raise ServiceValidationError(f"Invalid charging level: {level}")
 
-        r = await self.async_run(self.client.set_charging_level_verify, vin, level)
+        await self._async_vehicle_action(
+            "Set charging level",
+            self.client.set_charging_level_verify,
+            vin,
+            CHARGING_LEVELS_BY_NAME[level],
+        )
+
+    async def _async_vehicle_action(
+        self, what: str, func: Callable[..., Any], *args: Any
+    ) -> None:
+        """Run a vehicle action, refresh afterwards and report the outcome.
+
+        Errors from the library are turned into UconnectRequestError so the
+        UI shows the reason instead of "Unknown error". A falsy result means
+        the vehicle refused, which is reported only after the refresh so the
+        entities show what the vehicle really did.
+        """
+
+        try:
+            result = await self.async_run(func, *args)
+        except HomeAssistantError:
+            raise
+        except Exception as err:
+            raise UconnectRequestError(f"{what} failed: {err}") from err
+
         await self.async_refresh()
 
-        if not r:
-            raise HomeAssistantError("Set charging level failed")
+        if not result:
+            raise HomeAssistantError(f"{what} was not confirmed by the vehicle")
 
     async def update_options(self, hass: HomeAssistant, config_entry: ConfigEntry):
         self.update_interval = timedelta(

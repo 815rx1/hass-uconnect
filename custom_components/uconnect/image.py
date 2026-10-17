@@ -14,7 +14,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.util import dt as dt_util
 
-from py_uconnect.client import Vehicle
+from .pyuconnect.client import Vehicle
 
 from .const import DOMAIN
 from .coordinator import UconnectDataUpdateCoordinator

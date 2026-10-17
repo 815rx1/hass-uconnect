@@ -14,8 +14,12 @@
                 }
             },
             "reauth_confirm": {
-                "title": "Erneute API-Anmeldung",
-                "description": "Die Anmeldung mit deinem Konto ist fehlgeschlagen. Klicke auf Absenden, um dich erneut anzumelden."
+                "title": "Uconnect erneut anmelden",
+                "description": "Die Uconnect-Server haben das gespeicherte Passwort für {username} abgelehnt. Gib das aktuelle Passwort ein. Lässt du die PIN leer, bleibt die gespeicherte erhalten.",
+                "data": {
+                    "password": "Passwort",
+                    "pin": "PIN"
+                }
             }
         },
         "abort": {
@@ -24,7 +28,8 @@
         },
         "error": {
             "invalid_auth": "Die Anmeldung an den Uconnect-Servern ist fehlgeschlagen. Prüfe, dass dein Fahrzeug nicht SiriusXM Guardian nutzt und deine Zugangsdaten stimmen.",
-            "unknown": "Unerwarteter Fehler"
+            "unknown": "Unerwarteter Fehler",
+            "cannot_connect": "Die Uconnect-Server sind nicht erreichbar. Versuche es später erneut."
         }
     },
     "options": {

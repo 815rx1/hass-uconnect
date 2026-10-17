@@ -16,8 +16,8 @@ from homeassistant.components.switch import (
     SwitchEntity,
 )
 
-from py_uconnect.client import Vehicle
-from py_uconnect.command import (
+from .pyuconnect.client import Vehicle
+from .pyuconnect.command import (
     COMMAND_CHARGE,
     COMMAND_COMFORT_OFF,
     COMMAND_COMFORT_ON,

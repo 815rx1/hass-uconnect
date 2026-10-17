@@ -16,7 +16,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from py_uconnect.client import Vehicle
+from .pyuconnect.client import Vehicle
 
 from .const import DOMAIN
 from .coordinator import UconnectDataUpdateCoordinator

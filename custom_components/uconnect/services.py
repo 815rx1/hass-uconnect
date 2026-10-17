@@ -5,7 +5,7 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import device_registry
 from homeassistant.util import dt as dt_util
 
-from py_uconnect.command import (
+from .pyuconnect.command import (
     COMMAND_CABIN_VENTILATION,
     COMMAND_CHARGE,
     COMMAND_CHARGE_V4,
@@ -226,9 +226,12 @@ def async_setup_services(hass: HomeAssistant, config_entry: ConfigEntry) -> bool
 
 @callback
 def async_unload_services(hass) -> None:
-    for service in SUPPORTED_SERVICES:
-        hass.services.async_remove(DOMAIN, service)
-    for service in (SERVICE_SET_CHARGE_SCHEDULE, SERVICE_SET_CHARGE_SCHEDULE_SLOT):
+    # Only the services some vehicle supported were registered
+    for service in (
+        *SUPPORTED_SERVICES,
+        SERVICE_SET_CHARGE_SCHEDULE,
+        SERVICE_SET_CHARGE_SCHEDULE_SLOT,
+    ):
         if hass.services.has_service(DOMAIN, service):
             hass.services.async_remove(DOMAIN, service)
 

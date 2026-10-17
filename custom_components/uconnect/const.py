@@ -2,7 +2,7 @@
 
 from datetime import timedelta
 
-from py_uconnect.brands import (
+from .pyuconnect.brands import (
     ALFA_ROMEO_ASIA,
     ALFA_ROMEO_EU,
     ALFA_ROMEO_US_CANADA,
@@ -54,16 +54,10 @@ DEFAULT_SCAN_INTERVAL: int = 5
 DEFAULT_CHARGING_REFRESH_INTERVAL: int = 30
 MIN_CHARGING_REFRESH_INTERVAL: int = 15
 
-# Connect and read timeout in seconds for every HTTP request to the cloud
-REQUEST_TIMEOUT: tuple[float, float] = (10, 30)
-
 # Failed polls in a row after which entities turn unavailable
 MAX_CONSECUTIVE_FAILURES: int = 3
 
 # How often the health report and maintenance history are fetched
 SLOW_EXTRA_DATA_INTERVAL: timedelta = timedelta(hours=6)
-
-# Gigya error codes of accounts.login that mean the credentials were rejected
-AUTH_ERROR_CODES: frozenset[int] = frozenset({401030, 403042})
 
 UNIT_DYNAMIC: str = "dynamic"

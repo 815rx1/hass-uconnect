@@ -11,7 +11,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from py_uconnect.client import Vehicle
+from .pyuconnect.client import Vehicle
 
 from .charge_schedule import format_time, parse_time, supports_emea_schedules
 from .const import DOMAIN, CONF_ADD_COMMAND_ENTITIES

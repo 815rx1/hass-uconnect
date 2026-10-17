@@ -9,8 +9,8 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from py_uconnect.client import Vehicle
-from py_uconnect.api import (
+from .pyuconnect.client import Vehicle
+from .pyuconnect.api import (
     CHARGING_LEVELS,
     CHARGING_LEVEL_ONE,
     CHARGING_LEVEL_TWO,

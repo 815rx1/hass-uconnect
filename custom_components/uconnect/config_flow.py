@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 import hashlib
 import logging
 from typing import Any
@@ -20,8 +21,8 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.config_entries import ConfigFlowResult
 from homeassistant.exceptions import HomeAssistantError
 
-from py_uconnect.api import API
-from py_uconnect.brands import BRANDS as BRANDS_BY_NAME
+from .pyuconnect.api import API
+from .pyuconnect.brands import BRANDS as BRANDS_BY_NAME
 
 from .const import (
     BRANDS,
@@ -34,6 +35,7 @@ from .const import (
     DEFAULT_PIN,
     DOMAIN,
 )
+from .coordinator import is_auth_error
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -44,6 +46,13 @@ STEP_USER_DATA_SCHEMA = vol.Schema(
         vol.Required(CONF_BRAND_REGION): vol.In(BRANDS),
         vol.Optional(CONF_PIN, default=DEFAULT_PIN): str,
         vol.Required(CONF_DISABLE_TLS_VERIFICATION, default=False): bool,
+    }
+)
+
+STEP_REAUTH_DATA_SCHEMA = vol.Schema(
+    {
+        vol.Required(CONF_PASSWORD): str,
+        vol.Optional(CONF_PIN): str,
     }
 )
 
@@ -66,19 +75,22 @@ OPTIONS_SCHEMA = vol.Schema(
 async def validate_input(hass: HomeAssistant, user_input: dict[str, Any]):
     """Validate the user input allows us to connect."""
 
-    try:
-        api = API(
-            email=user_input[CONF_USERNAME],
-            password=user_input[CONF_PASSWORD],
-            pin=user_input[CONF_PIN],
-            brand=BRANDS_BY_NAME[BRANDS[user_input[CONF_BRAND_REGION]]],
-            disable_tls_verification=user_input[CONF_DISABLE_TLS_VERIFICATION],
-        )
+    api = API(
+        email=user_input[CONF_USERNAME],
+        password=user_input[CONF_PASSWORD],
+        pin=user_input.get(CONF_PIN, DEFAULT_PIN),
+        brand=BRANDS_BY_NAME[BRANDS[user_input[CONF_BRAND_REGION]]],
+        disable_tls_verification=user_input.get(CONF_DISABLE_TLS_VERIFICATION, False),
+    )
 
+    try:
         await hass.async_add_executor_job(api.login)
-    except Exception as e:
-        _LOGGER.exception(f"Authentication failed: {e}")
-        raise InvalidAuth
+    except Exception as err:
+        if is_auth_error(err):
+            _LOGGER.info("Login rejected: %s", err)
+            raise InvalidAuth from err
+        _LOGGER.warning("Unable to reach the Uconnect servers: %s", err)
+        raise CannotConnect from err
 
 
 class UconnectOptionFlowHandler(config_entries.OptionsFlow):
@@ -105,7 +117,6 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Uconnect"""
 
     VERSION = 1
-    reauth_entry: ConfigEntry | None = None
 
     @staticmethod
     @callback
@@ -127,47 +138,75 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             await validate_input(self.hass, user_input)
         except InvalidAuth:
             errors["base"] = "invalid_auth"
+        except CannotConnect:
+            errors["base"] = "cannot_connect"
         except Exception:
             _LOGGER.exception("Unexpected exception")
             errors["base"] = "unknown"
         else:
-            if self.reauth_entry is None:
-                title = f"{BRANDS[user_input[CONF_BRAND_REGION]]} {
-                    user_input[CONF_USERNAME]
-                }"
-                await self.async_set_unique_id(
-                    hashlib.sha256(title.encode("utf-8")).hexdigest()
-                )
-                self._abort_if_unique_id_configured()
-                return self.async_create_entry(title=title, data=user_input)
-            else:
-                self.hass.config_entries.async_update_entry(
-                    self.reauth_entry, data=user_input
-                )
-                await self.hass.config_entries.async_reload(self.reauth_entry.entry_id)
-                return self.async_abort(reason="reauth_successful")
+            title = f"{BRANDS[user_input[CONF_BRAND_REGION]]} {
+                user_input[CONF_USERNAME]
+            }"
+            await self.async_set_unique_id(
+                hashlib.sha256(title.encode("utf-8")).hexdigest()
+            )
+            self._abort_if_unique_id_configured()
+            return self.async_create_entry(title=title, data=user_input)
 
         return self.async_show_form(
-            step_id="user", data_schema=STEP_USER_DATA_SCHEMA, errors=errors
+            step_id="user",
+            data_schema=self.add_suggested_values_to_schema(
+                STEP_USER_DATA_SCHEMA,
+                {k: v for k, v in user_input.items() if k != CONF_PASSWORD},
+            ),
+            errors=errors,
         )
 
-    async def async_step_reauth(self, user_input=None):
-        """Perform reauth upon an API authentication error."""
-        self.reauth_entry = self.hass.config_entries.async_get_entry(
-            self.context["entry_id"]
-        )
+    async def async_step_reauth(
+        self, entry_data: Mapping[str, Any]
+    ) -> ConfigFlowResult:
+        """Start reauth after the stored credentials were rejected."""
         return await self.async_step_reauth_confirm()
 
-    async def async_step_reauth_confirm(self, user_input=None):
-        """Dialog that informs the user that reauth is required."""
-        if user_input is None:
-            return self.async_show_form(
-                step_id="reauth_confirm",
-                data_schema=vol.Schema({}),
-            )
-        self._reauth_config = True
-        return await self.async_step_user()
+    async def async_step_reauth_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Ask for the new password and log in with it.
+
+        Account and brand stay as they are, because the entry's unique id is
+        derived from them and the vehicles belong to that account.
+        """
+        entry = self._get_reauth_entry()
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            data = {**entry.data, CONF_PASSWORD: user_input[CONF_PASSWORD]}
+            if user_input.get(CONF_PIN):
+                data[CONF_PIN] = user_input[CONF_PIN]
+
+            try:
+                await validate_input(self.hass, data)
+            except InvalidAuth:
+                errors["base"] = "invalid_auth"
+            except CannotConnect:
+                errors["base"] = "cannot_connect"
+            except Exception:
+                _LOGGER.exception("Unexpected exception")
+                errors["base"] = "unknown"
+            else:
+                return self.async_update_reload_and_abort(entry, data=data)
+
+        return self.async_show_form(
+            step_id="reauth_confirm",
+            data_schema=STEP_REAUTH_DATA_SCHEMA,
+            description_placeholders={"username": entry.data.get(CONF_USERNAME, "")},
+            errors=errors,
+        )
 
 
 class InvalidAuth(HomeAssistantError):
     """Error to indicate there is invalid auth."""
+
+
+class CannotConnect(HomeAssistantError):
+    """Error to indicate the servers could not be reached."""

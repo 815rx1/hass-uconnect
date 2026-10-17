@@ -156,7 +156,7 @@ class UconnectVehicleCard extends HTMLElement {
 
     if (!this._initialized) {
       this._initialized = true;
-      this.attachShadow({ mode: "open" });
+      if (!this.shadowRoot) this.attachShadow({ mode: "open" });
       this.shadowRoot.innerHTML = `
         <style>
           :host { display: block; }

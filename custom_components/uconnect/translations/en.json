@@ -14,8 +14,12 @@
                 }
             },
             "reauth_confirm": {
-                "title": "API Reauthentication",
-                "description": "Your account is unable to authenticate. Click Submit to reauthenticate."
+                "title": "Reauthenticate Uconnect",
+                "description": "The Uconnect servers rejected the stored password for {username}. Enter the current password. Leave the PIN empty to keep the stored one.",
+                "data": {
+                    "password": "Password",
+                    "pin": "PIN"
+                }
             }
         },
         "abort": {
@@ -24,7 +28,8 @@
         },
         "error": {
             "invalid_auth": "The login failed to the Uconnect servers. Double check your vehicle doesn't use SiriusXM Guardian and your credentials are correct.",
-            "unknown": "Unexpected error"
+            "unknown": "Unexpected error",
+            "cannot_connect": "Unable to reach the Uconnect servers. Try again later."
         }
     },
     "options": {

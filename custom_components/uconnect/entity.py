@@ -3,7 +3,7 @@
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.helpers.entity import DeviceInfo
 
-from py_uconnect.client import Vehicle
+from .pyuconnect.client import Vehicle
 
 from .const import DOMAIN
 from .coordinator import UconnectDataUpdateCoordinator

@@ -88,6 +88,12 @@ async def async_setup_frontend_cards(hass: HomeAssistant) -> None:
     """
     domain_data = hass.data.setdefault(DOMAIN, {})
     if domain_data.get(_DATA_KEY):
+        # The websocket command and the static path live as long as HA does,
+        # but the resource may have been removed with the last config entry
+        if hass.state is CoreState.running and not domain_data.get(_RESOURCE_ID_KEY):
+            resource_id = await _async_register_lovelace_resource(hass)
+            if resource_id:
+                domain_data[_RESOURCE_ID_KEY] = resource_id
         return
 
     try:
@@ -131,21 +137,35 @@ async def async_setup_frontend_cards(hass: HomeAssistant) -> None:
     domain_data[_DATA_KEY] = True
 
 
-async def async_unload_frontend_cards_if_last_entry(
-    hass: HomeAssistant,
-) -> None:
-    """Remove the Lovelace resource if no Uconnect entries remain."""
-    domain_data: dict[str, Any] | None = hass.data.get(DOMAIN)
-    if not domain_data:
+async def async_remove_frontend_cards_if_last_entry(hass: HomeAssistant) -> None:
+    """Remove the Lovelace resource once the last Uconnect entry is deleted.
+
+    This must not run on unload: a reload unloads the entry too, and the
+    resource would then be gone until HA restarts, leaving every dashboard
+    with a "Custom element doesn't exist" error.
+    """
+    if hass.config_entries.async_entries(DOMAIN):
         return
 
-    remaining_entries = [k for k in domain_data if not k.startswith("_")]
-    if remaining_entries:
-        return
-
-    resource_id = domain_data.get(_RESOURCE_ID_KEY)
+    domain_data: dict[str, Any] = hass.data.get(DOMAIN) or {}
+    resource_id = domain_data.pop(_RESOURCE_ID_KEY, None)
+    if not resource_id:
+        # Not registered during this run, look it up by URL instead
+        resource_id = await _async_find_lovelace_resource(hass)
     if isinstance(resource_id, str) and resource_id:
         await _async_unregister_lovelace_resource(hass, resource_id)
+
+
+async def _async_find_lovelace_resource(hass: HomeAssistant) -> str | None:
+    """Return the id of the card resource if it is registered."""
+    lovelace_data = hass.data.get("lovelace")
+    resources = getattr(lovelace_data, "resources", None)
+    if resources is None or (hasattr(resources, "loaded") and not resources.loaded):
+        return None
+    for item in resources.async_items():
+        if item.get("url") == _STATIC_BASE_URL:
+            return item["id"]
+    return None
 
 
 # ---- Websocket API ----

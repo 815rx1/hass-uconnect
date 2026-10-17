@@ -10,8 +10,8 @@ from __future__ import annotations
 
 from datetime import time
 
-from py_uconnect import Client
-from py_uconnect.client import Vehicle
+from .pyuconnect import Client
+from .pyuconnect.client import Vehicle
 
 WEEKDAYS: tuple[str, ...] = (
     "monday",

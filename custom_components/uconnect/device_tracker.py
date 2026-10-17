@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from py_uconnect.client import Vehicle
+from .pyuconnect.client import Vehicle
 
 from homeassistant.components.device_tracker import SourceType, TrackerEntity
 from homeassistant.config_entries import ConfigEntry

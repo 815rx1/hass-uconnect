@@ -6,20 +6,19 @@
         "lovelace"
     ],
     "codeowners": [
-        "@blind-oracle"
+        "@815rx1"
     ],
     "config_flow": true,
-    "documentation": "https://github.com/hass-uconnect/hass-uconnect",
+    "documentation": "https://github.com/815rx1/hass-uconnect",
     "integration_type": "hub",
     "iot_class": "cloud_polling",
-    "issue_tracker": "https://github.com/hass-uconnect/hass-uconnect/issues",
+    "issue_tracker": "https://github.com/815rx1/hass-uconnect/issues",
     "loggers": [
-        "uconnect",
-        "py_uconnect",
         "custom_components.uconnect"
     ],
     "requirements": [
-        "py-uconnect @ git+https://github.com/815rx1/py-uconnect.git@1e46eb4c5b5f7b77313f32e31b08ed7ffd5ee54c"
+        "requests-auth-aws-sigv4>=0.7",
+        "dataclasses-json>=0.6.7"
     ],
-    "version": "0.5.4"
+    "version": "0.6.0b1"
 }

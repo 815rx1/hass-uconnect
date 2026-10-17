@@ -26,11 +26,11 @@ from homeassistant.helpers.event import (
 )
 from homeassistant.helpers.restore_state import RestoreEntity
 
-from py_uconnect.client import Vehicle
-from py_uconnect.command import COMMAND_DEEP_REFRESH
+from .pyuconnect.client import Vehicle
+from .pyuconnect.command import COMMAND_DEEP_REFRESH
 
 from .const import DOMAIN
-from .coordinator import UconnectDataUpdateCoordinator
+from .coordinator import UconnectDataUpdateCoordinator, UconnectRequestError
 from .entity import UconnectEntity
 
 _LOGGER = logging.getLogger(__name__)
@@ -297,6 +297,11 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
         """Restore state when added to hass."""
         await super().async_added_to_hass()
 
+        # Registered here rather than at construction, so a disabled entity
+        # that never joins Home Assistant is not handed work by the button or
+        # the options listener
+        self.coordinator.extrapolated_soc_sensors[self._vin] = self
+
         # Restore previous state
         if (last_state := await self.async_get_last_state()) is not None:
             if last_state.attributes.get("estimation_state"):
@@ -384,7 +389,9 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
             # unanswered needs another: the status poll gives up after a
             # minute, which the vehicle can outlast, so a slow but successful
             # refresh would be wasted
-            if not isinstance(err, HomeAssistantError):
+            if not isinstance(err, HomeAssistantError) or isinstance(
+                err, UconnectRequestError
+            ):
                 await self.coordinator.async_request_refresh()
 
     def _can_deep_refresh(self) -> bool:
@@ -435,7 +442,12 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
             interval = self.coordinator.charging_refresh_interval
             if interval:
                 self._schedule_deep_refresh(timedelta(minutes=interval))
-            self.hass.async_create_task(self._async_do_deep_refresh())
+            # Tied to the config entry so an unload cancels a refresh in flight
+            self.coordinator.config_entry.async_create_background_task(
+                self.hass,
+                self._async_do_deep_refresh(),
+                f"uconnect deep refresh {self._vin}",
+            )
 
         self._cancel_deep_refresh()
         self._unsub_deep_refresh = async_call_later(self.hass, delay, _fire)

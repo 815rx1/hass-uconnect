@@ -6,7 +6,7 @@ from typing import Final, Callable, Any
 from dataclasses import dataclass
 from datetime import datetime
 
-from py_uconnect.client import Vehicle
+from .pyuconnect.client import Vehicle
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
@@ -15,6 +15,7 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.const import (
+    EntityCategory,
     PERCENTAGE,
     UnitOfElectricPotential,
     UnitOfTime,
@@ -207,6 +208,47 @@ SENSOR_DESCRIPTIONS: Final[tuple[UconnectSensorEntityDescription, ...]] = (
         device_class=SensorDeviceClass.TIMESTAMP,
     ),
     UconnectSensorEntityDescription(
+        key="timestamp_vehicle_info",
+        name="Vehicle Data Uploaded At",
+        icon="mdi:car-clock",
+        device_class=SensorDeviceClass.TIMESTAMP,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    UconnectSensorEntityDescription(
+        key="timestamp_ev_info",
+        name="EV Data Uploaded At",
+        icon="mdi:car-clock",
+        device_class=SensorDeviceClass.TIMESTAMP,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    UconnectSensorEntityDescription(
+        key="trip_a_distance",
+        name="Trip A",
+        icon="mdi:map-marker-distance",
+        device_class=SensorDeviceClass.DISTANCE,
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        native_unit_of_measurement=UNIT_DYNAMIC,
+        suggested_display_precision=0,
+    ),
+    UconnectSensorEntityDescription(
+        key="trip_b_distance",
+        name="Trip B",
+        icon="mdi:map-marker-distance",
+        device_class=SensorDeviceClass.DISTANCE,
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        native_unit_of_measurement=UNIT_DYNAMIC,
+        suggested_display_precision=0,
+    ),
+    UconnectSensorEntityDescription(
+        key="battery_soh",
+        name="Battery Health",
+        icon="mdi:battery-heart-variant",
+        native_unit_of_measurement=PERCENTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        suggested_display_precision=0,
+    ),
+    UconnectSensorEntityDescription(
         key="fuel_type",
         name="Fuel Type",
         icon="mdi:gas-station",
@@ -263,9 +305,7 @@ async def async_setup_entry(
 
         # Add extrapolated SOC sensors for EVs/PHEVs
         if getattr(vehicle, "state_of_charge", None) is not None:
-            sensor = UconnectExtrapolatedSocSensor(coordinator, vehicle)
-            entities.append(sensor)
-            coordinator.extrapolated_soc_sensors[vehicle.vin] = sensor
+            entities.append(UconnectExtrapolatedSocSensor(coordinator, vehicle))
             entities.append(UconnectChargingRateSensor(coordinator, vehicle))
 
     async_add_entities(entities)
@@ -293,6 +333,7 @@ class UconnectSensor(SensorEntity, UconnectEntity):
         )
         self._attr_state_class = self._description.state_class
         self._attr_device_class = self._description.device_class
+        self._attr_entity_category = self._description.entity_category
 
     @property
     def native_value(self):

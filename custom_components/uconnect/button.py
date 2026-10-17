@@ -6,6 +6,7 @@ from typing import Final
 
 from homeassistant.core import HomeAssistant
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.components.button import (
     ButtonDeviceClass,
@@ -13,8 +14,8 @@ from homeassistant.components.button import (
     ButtonEntity,
 )
 
-from py_uconnect.client import Vehicle
-from py_uconnect.command import (
+from .pyuconnect.client import Vehicle
+from .pyuconnect.command import (
     COMMAND_CHARGE,
     COMMAND_DEEP_REFRESH,
     COMMAND_LIGHTS,
@@ -86,7 +87,7 @@ async def async_setup_entry(
 
     # EV-specific buttons (always available)
     for vehicle in coordinator.client.vehicles.values():
-        if vehicle.vin in coordinator.extrapolated_soc_sensors:
+        if getattr(vehicle, "state_of_charge", None) is not None:
             entities.append(UconnectResetLearningButton(coordinator, vehicle))
 
     # Command entities (gated behind option)
@@ -168,5 +169,8 @@ class UconnectResetLearningButton(ButtonEntity, UconnectEntity):
 
     async def async_press(self, **kwargs):
         sensor = self.coordinator.extrapolated_soc_sensors.get(self._vin)
-        if sensor is not None:
-            sensor.reset_learning()
+        if sensor is None:
+            raise HomeAssistantError(
+                "The extrapolated battery sensor is disabled, nothing to reset"
+            )
+        sensor.reset_learning()

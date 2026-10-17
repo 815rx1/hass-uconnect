@@ -11,8 +11,8 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from py_uconnect.client import Vehicle
-from py_uconnect.command import (
+from .pyuconnect.client import Vehicle
+from .pyuconnect.command import (
     COMMAND_DOORS_LOCK,
     COMMAND_DOORS_UNLOCK,
     Command,
