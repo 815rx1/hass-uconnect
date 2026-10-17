@@ -96,18 +96,20 @@ async def test_setup_starts_reauth_on_rejected_login(hass, config_entry, mock_cl
 async def test_entities_turn_unavailable_after_repeated_failures(
     hass, setup_integration, mock_client
 ):
+    coordinator = hass.data[DOMAIN][setup_integration.unique_id]
     odometer_id = entity_id(hass, "sensor", "odometer")
     mock_client.refresh.side_effect = Exception("Read timed out")
     calls_before = mock_client.get_vehicle_health_report.call_count
 
-    now = dt_util.utcnow()
-    for i in range(1, 3):
-        async_fire_time_changed(hass, now + timedelta(minutes=6 * i))
+    # Polls are triggered directly: the scheduled ones carry a random offset
+    # of up to a second, which makes stepping the clock racy
+    for _ in range(2):
+        await coordinator.async_refresh()
         await hass.async_block_till_done()
         # Two failures keep the cached values
         assert hass.states.get(odometer_id).state == "12345"
 
-    async_fire_time_changed(hass, now + timedelta(minutes=18))
+    await coordinator.async_refresh()
     await hass.async_block_till_done()
     assert hass.states.get(odometer_id).state == STATE_UNAVAILABLE
 
@@ -116,25 +118,32 @@ async def test_entities_turn_unavailable_after_repeated_failures(
 
     # Recovers on the next good poll
     mock_client.refresh.side_effect = None
-    async_fire_time_changed(hass, now + timedelta(minutes=24))
+    await coordinator.async_refresh()
     await hass.async_block_till_done()
     assert hass.states.get(odometer_id).state == "12345"
+    assert coordinator.consecutive_failures == 0
+
+
+async def test_scheduled_polling_runs(hass, setup_integration, mock_client):
+    calls = mock_client.refresh.call_count
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(minutes=6))
+    await hass.async_block_till_done()
+    assert mock_client.refresh.call_count == calls + 1
 
 
 async def test_vehicle_dropping_out_makes_entities_unavailable(
     hass, setup_integration, mock_client, vehicle
 ):
+    coordinator = hass.data[DOMAIN][setup_integration.unique_id]
     odometer_id = entity_id(hass, "sensor", "odometer")
     mock_client.vehicles.clear()
 
-    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(minutes=6))
+    await coordinator.async_refresh()
     await hass.async_block_till_done()
-
-    state = hass.states.get(odometer_id)
-    assert state.state == STATE_UNAVAILABLE
+    assert hass.states.get(odometer_id).state == STATE_UNAVAILABLE
 
     mock_client.vehicles[VIN] = vehicle
-    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(minutes=12))
+    await coordinator.async_refresh()
     await hass.async_block_till_done()
     assert hass.states.get(odometer_id).state == "12345"
 
