@@ -1,0 +1,289 @@
+{
+    "title": "Uconnect",
+    "config": {
+        "step": {
+            "user": {
+                "title": "API-Anmeldung",
+                "description": "Richte dein Uconnect-fähiges Fahrzeug für Home Assistant ein.",
+                "data": {
+                    "username": "Benutzername",
+                    "password": "Passwort",
+                    "brand_region": "Marke + Region",
+                    "pin": "PIN",
+                    "disable_tls_verification": "TLS-Zertifikatsprüfung deaktivieren"
+                }
+            },
+            "reauth_confirm": {
+                "title": "Erneute API-Anmeldung",
+                "description": "Die Anmeldung mit deinem Konto ist fehlgeschlagen. Klicke auf Absenden, um dich erneut anzumelden."
+            }
+        },
+        "abort": {
+            "already_configured": "Gerät ist bereits eingerichtet",
+            "reauth_successful": "Erneute Anmeldung erfolgreich"
+        },
+        "error": {
+            "invalid_auth": "Die Anmeldung an den Uconnect-Servern ist fehlgeschlagen. Prüfe, dass dein Fahrzeug nicht SiriusXM Guardian nutzt und deine Zugangsdaten stimmen.",
+            "unknown": "Unerwarteter Fehler"
+        }
+    },
+    "options": {
+        "step": {
+            "init": {
+                "title": "API-Konfiguration",
+                "data": {
+                    "scan_interval": "Abfrageintervall (Min.)",
+                    "pin": "PIN",
+                    "charging_refresh_interval": "Deep Refresh während des Ladens (Min., 0 = aus, mindestens 15)",
+                    "add_command_entities": "Befehls-Entitäten hinzufügen (Button/Schloss/Schalter)"
+                }
+            }
+        }
+    },
+    "services": {
+        "update": {
+            "name": "Aktualisieren",
+            "description": "Fahrzeugdaten aus der Cloud abrufen",
+            "fields": {
+                "device_id": {
+                    "name": "Fahrzeug",
+                    "description": "Zielfahrzeug"
+                }
+            }
+        },
+        "engine_on": {
+            "name": "Motor - Einschalten",
+            "description": "Motor starten",
+            "fields": {
+                "device_id": {
+                    "name": "Fahrzeug",
+                    "description": "Zielfahrzeug"
+                }
+            }
+        },
+        "engine_off": {
+            "name": "Motor - Ausschalten",
+            "description": "Motor abstellen",
+            "fields": {
+                "device_id": {
+                    "name": "Fahrzeug",
+                    "description": "Zielfahrzeug"
+                }
+            }
+        },
+        "comfort_on": {
+            "name": "Komfort - Einschalten",
+            "description": "Komfortmodus einschalten",
+            "fields": {
+                "device_id": {
+                    "name": "Fahrzeug",
+                    "description": "Zielfahrzeug"
+                }
+            }
+        },
+        "comfort_off": {
+            "name": "Komfort - Ausschalten",
+            "description": "Komfortmodus ausschalten",
+            "fields": {
+                "device_id": {
+                    "name": "Fahrzeug",
+                    "description": "Zielfahrzeug"
+                }
+            }
+        },
+        "hvac_on": {
+            "name": "Klima - Einschalten",
+            "description": "Klimaanlage einschalten",
+            "fields": {
+                "device_id": {
+                    "name": "Fahrzeug",
+                    "description": "Zielfahrzeug"
+                }
+            }
+        },
+        "hvac_off": {
+            "name": "Klima - Ausschalten",
+            "description": "Klimaanlage ausschalten",
+            "fields": {
+                "device_id": {
+                    "name": "Fahrzeug",
+                    "description": "Zielfahrzeug"
+                }
+            }
+        },
+        "precond_on": {
+            "name": "Vorklimatisierung - Einschalten",
+            "description": "Vorklimatisierung des Fahrzeugs einschalten",
+            "fields": {
+                "device_id": {
+                    "name": "Fahrzeug",
+                    "description": "Zielfahrzeug"
+                }
+            }
+        },
+        "precond_off": {
+            "name": "Vorklimatisierung - Ausschalten",
+            "description": "Vorklimatisierung des Fahrzeugs ausschalten",
+            "fields": {
+                "device_id": {
+                    "name": "Fahrzeug",
+                    "description": "Zielfahrzeug"
+                }
+            }
+        },
+        "lights": {
+            "name": "Licht",
+            "description": "Lichthupe auslösen",
+            "fields": {
+                "device_id": {
+                    "name": "Fahrzeug",
+                    "description": "Zielfahrzeug"
+                }
+            }
+        },
+        "lights_horn": {
+            "name": "Licht und Hupe",
+            "description": "Lichter blinken lassen und hupen",
+            "fields": {
+                "device_id": {
+                    "name": "Fahrzeug",
+                    "description": "Zielfahrzeug"
+                }
+            }
+        },
+        "doors_lock": {
+            "name": "Türen verriegeln",
+            "description": "Türen verriegeln",
+            "fields": {
+                "device_id": {
+                    "name": "Fahrzeug",
+                    "description": "Zielfahrzeug"
+                }
+            }
+        },
+        "doors_unlock": {
+            "name": "Türen entriegeln",
+            "description": "Türen entriegeln",
+            "fields": {
+                "device_id": {
+                    "name": "Fahrzeug",
+                    "description": "Zielfahrzeug"
+                }
+            }
+        },
+        "trunk_lock": {
+            "name": "Kofferraum verriegeln",
+            "description": "Kofferraum verriegeln",
+            "fields": {
+                "device_id": {
+                    "name": "Fahrzeug",
+                    "description": "Zielfahrzeug"
+                }
+            }
+        },
+        "trunk_unlock": {
+            "name": "Kofferraum entriegeln",
+            "description": "Kofferraum entriegeln",
+            "fields": {
+                "device_id": {
+                    "name": "Fahrzeug",
+                    "description": "Zielfahrzeug"
+                }
+            }
+        },
+        "liftgate_lock": {
+            "name": "Heckklappe verriegeln",
+            "description": "Heckklappe verriegeln",
+            "fields": {
+                "device_id": {
+                    "name": "Fahrzeug",
+                    "description": "Zielfahrzeug"
+                }
+            }
+        },
+        "liftgate_unlock": {
+            "name": "Heckklappe entriegeln",
+            "description": "Heckklappe entriegeln",
+            "fields": {
+                "device_id": {
+                    "name": "Fahrzeug",
+                    "description": "Zielfahrzeug"
+                }
+            }
+        },
+        "cabin_ventilation": {
+            "name": "Innenraumbelüftung",
+            "description": "Innenraumbelüftung aktivieren",
+            "fields": {
+                "device_id": {
+                    "name": "Fahrzeug",
+                    "description": "Zielfahrzeug"
+                }
+            }
+        },
+        "charge_now": {
+            "name": "Jetzt laden",
+            "description": "Ladevorgang starten",
+            "fields": {
+                "device_id": {
+                    "name": "Fahrzeug",
+                    "description": "Zielfahrzeug"
+                }
+            }
+        },
+        "charge_now_v4": {
+            "name": "Jetzt laden (V4)",
+            "description": "Ladevorgang über die V4-API starten",
+            "fields": {
+                "device_id": {
+                    "name": "Fahrzeug",
+                    "description": "Zielfahrzeug"
+                }
+            }
+        },
+        "deep_refresh": {
+            "name": "Deep Refresh",
+            "description": "Ladestand und weitere Werte direkt vom Fahrzeug abfragen",
+            "fields": {
+                "device_id": {
+                    "name": "Fahrzeug",
+                    "description": "Zielfahrzeug"
+                }
+            }
+        },
+        "deep_refresh_v2": {
+            "name": "Deep Refresh (V2)",
+            "description": "Ladestand und weitere Werte über die V2-API direkt vom Fahrzeug abfragen",
+            "fields": {
+                "device_id": {
+                    "name": "Fahrzeug",
+                    "description": "Zielfahrzeug"
+                }
+            }
+        },
+        "refresh_location": {
+            "name": "Standort aktualisieren",
+            "description": "Fahrzeugstandort aktualisieren",
+            "fields": {
+                "device_id": {
+                    "name": "Fahrzeug",
+                    "description": "Zielfahrzeug"
+                }
+            }
+        },
+        "set_charge_schedule": {
+            "name": "Ladeplan festlegen",
+            "description": "Ladeplan des E-Fahrzeugs festlegen",
+            "fields": {
+                "device_id": {
+                    "name": "Fahrzeug",
+                    "description": "Zielfahrzeug"
+                },
+                "schedule": {
+                    "name": "Ladeplan",
+                    "description": "Ladeplan als JSON-Objekt"
+                }
+            }
+        }
+    }
+}

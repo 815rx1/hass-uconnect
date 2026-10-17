@@ -19,7 +19,8 @@
             }
         },
         "abort": {
-            "already_configured": "Device is already configured"
+            "already_configured": "Device is already configured",
+            "reauth_successful": "Re-authentication was successful"
         },
         "error": {
             "invalid_auth": "The login failed to the Uconnect servers. Double check your vehicle doesn't use SiriusXM Guardian and your credentials are correct.",
