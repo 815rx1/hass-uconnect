@@ -403,3 +403,53 @@ async def test_image_follows_url_and_sniffs_type(hass, setup_integration, mock_c
     await setup_integration.runtime_data.async_refresh()
     await hass.async_block_till_done()
     assert hass.states.get(image_id).state != before
+
+
+async def test_registered_entities_survive_missing_values(
+    hass, config_entry, mock_client, vehicle
+):
+    from custom_components.uconnect.pyuconnect.client import Location
+
+    vehicle.location = Location(longitude=11.5, latitude=48.1)
+    config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+    setup_integration = config_entry
+    registry = er.async_get(hass)
+    keys = {
+        ("sensor", "trip_a_distance"),
+        ("sensor", "extrapolated_soc"),
+        ("select", "charging_level_preference"),
+        ("switch", "charge_schedule_2"),
+        ("time", "charge_schedule_2_start_time"),
+        ("device_tracker", "location"),
+    }
+    ids = {k: entity_id(hass, *k) for k in keys}
+    assert all(ids.values()), ids
+
+    # The next start sees a vehicle whose status came back without values
+    vehicle.trip_a_distance = None
+    vehicle.state_of_charge = None
+    vehicle.charging_level_preference = None
+    vehicle.charge_schedules = []
+    vehicle.location = None
+    assert await hass.config_entries.async_reload(setup_integration.entry_id)
+    await hass.async_block_till_done()
+
+    for key, eid in ids.items():
+        assert registry.async_get(eid) is not None, key
+        # Provided by the integration again, not a placeholder Home Assistant
+        # keeps for an entity nobody created
+        state = hass.states.get(eid)
+        assert state is not None and not state.attributes.get("restored"), key
+
+
+async def test_unreported_entities_are_not_created(hass, config_entry, mock_client, vehicle):
+    vehicle.trip_a_distance = None
+    vehicle.charge_schedules = []
+    config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert entity_id(hass, "sensor", "trip_a_distance") is None
+    assert entity_id(hass, "switch", "charge_schedule_1") is None

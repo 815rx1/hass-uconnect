@@ -20,7 +20,7 @@ from .pyuconnect.client import Vehicle
 
 from .const import DOMAIN
 from .coordinator import UconnectDataUpdateCoordinator
-from .entity import UconnectEntity
+from .entity import UconnectEntity, was_added
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -183,7 +183,9 @@ async def async_setup_entry(
 
     for vehicle in coordinator.client.vehicles.values():
         for description in SENSOR_DESCRIPTIONS:
-            if getattr(vehicle, description.key, None) is not None:
+            if getattr(vehicle, description.key, None) is not None or was_added(
+                hass, "binary_sensor", vehicle.vin, description.key
+            ):
                 entities.append(UconnectBinarySensor(coordinator, description, vehicle))
 
         if vehicle.vin in coordinator.svla_data:

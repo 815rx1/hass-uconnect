@@ -32,10 +32,10 @@ from .pyuconnect.command import (
     Command,
 )
 
-from .charge_schedule import enabled_days, supports_emea_schedules
+from .charge_schedule import enabled_days
 from .const import DOMAIN, CONF_ADD_COMMAND_ENTITIES
 from .coordinator import UconnectDataUpdateCoordinator
-from .entity import UconnectEntity
+from .entity import UconnectEntity, schedule_slot_count
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -136,11 +136,10 @@ async def async_setup_entry(
             ) and description.is_available(vehicle):
                 entities.append(UconnectSwitch(coordinator, description, vehicle))
 
-        if supports_emea_schedules(coordinator.client, vehicle):
-            for slot in range(len(vehicle.charge_schedules)):
-                entities.append(
-                    UconnectChargeScheduleSwitch(coordinator, vehicle, slot)
-                )
+        for slot in range(schedule_slot_count(hass, vehicle)):
+            entities.append(
+                UconnectChargeScheduleSwitch(coordinator, vehicle, slot)
+            )
 
     async_add_entities(entities)
 

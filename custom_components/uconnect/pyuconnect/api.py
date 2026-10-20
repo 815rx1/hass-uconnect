@@ -4,6 +4,7 @@ import json
 import base64
 import logging
 import threading
+import time
 import http.client as http_client
 
 from dataclasses import dataclass
@@ -22,6 +23,11 @@ DEFAULT_TIMEOUT = (10, 30)
 
 # Gigya error codes of accounts.login that mean the credentials were rejected
 AUTH_ERROR_CODES = {401030, 403042}
+
+
+# A cached PIN authentication token is renewed this many seconds before the
+# lifetime the backend gives it runs out
+PIN_TOKEN_MARGIN = 15
 
 
 class AuthenticationError(Exception):
@@ -128,6 +134,9 @@ class API:
         # several threads do not log in at the same time
         self._login_lock = threading.Lock()
 
+        # PIN authentication token and the monotonic time it is valid until
+        self._pin_token: tuple[str, float] | None = None
+
         self.sess = _TimeoutSession(timeout)
         self.sess.headers.update({"User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -179,6 +188,8 @@ class API:
         self.sess.verify = verify
 
     def set_pin(self, pin: str):
+        if pin != self.pin:
+            self._pin_token = None
         self.pin = pin
 
     def login(self):
@@ -346,6 +357,11 @@ class API:
                 auth=self.aws_auth,
                 **kwargs,
             )
+
+            # A request carrying the PIN token that fails may have failed over
+            # the token, so the next one asks for a fresh token
+            if r.status_code >= 400 and "pinAuth" in (kwargs.get("json") or {}):
+                self._pin_token = None
 
             if attempt == 0 and not self.dev_mode and _is_token_rejected(r):
                 _LOGGER.info(
@@ -720,6 +736,17 @@ class API:
         return r
 
     def _pin_auth(self) -> str:
+        """Returns a PIN authentication token, reusing one until it expires.
+
+        The official apps authenticate once and send several commands with the
+        token, so asking for a new one before every command only doubles the
+        requests.
+        """
+
+        cached = self._pin_token
+        if cached is not None and time.monotonic() < cached[1]:
+            return cached[0]
+
         data = {
             "pin": base64.b64encode(self.pin.encode()).decode(encoding="utf-8"),
         }
@@ -740,6 +767,19 @@ class API:
 
         if "token" not in r:
             raise Exception(f"authentication failed: no token found: {r}")
+
+        # The expiry is the token's lifetime in milliseconds. Without one the
+        # token is used once, as before.
+        expiry = r.get("expiry")
+        if (
+            isinstance(expiry, (int, float))
+            and not isinstance(expiry, bool)
+            and expiry / 1000 > PIN_TOKEN_MARGIN
+        ):
+            self._pin_token = (
+                r["token"],
+                time.monotonic() + expiry / 1000 - PIN_TOKEN_MARGIN,
+            )
 
         return r["token"]
 

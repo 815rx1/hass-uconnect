@@ -11,7 +11,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
 from .coordinator import UconnectDataUpdateCoordinator
-from .entity import UconnectEntity
+from .entity import UconnectEntity, was_added
 
 
 PARALLEL_UPDATES = 0
@@ -25,7 +25,9 @@ async def async_setup_entry(
     coordinator: UconnectDataUpdateCoordinator = config_entry.runtime_data
     entities = []
     for vehicle in coordinator.client.vehicles.values():
-        if vehicle.location is not None:
+        if vehicle.location is not None or was_added(
+            hass, "device_tracker", vehicle.vin, "location"
+        ):
             entities.append(UconnectTracker(coordinator, vehicle))
 
     async_add_entities(entities)

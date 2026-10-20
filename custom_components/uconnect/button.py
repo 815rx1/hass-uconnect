@@ -26,7 +26,7 @@ from .pyuconnect.command import (
 
 from .const import DOMAIN, CONF_ADD_COMMAND_ENTITIES
 from .coordinator import UconnectDataUpdateCoordinator
-from .entity import UconnectEntity
+from .entity import UconnectEntity, was_added
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -88,7 +88,9 @@ async def async_setup_entry(
 
     # EV-specific buttons (always available)
     for vehicle in coordinator.client.vehicles.values():
-        if getattr(vehicle, "state_of_charge", None) is not None:
+        if getattr(vehicle, "state_of_charge", None) is not None or was_added(
+            hass, "button", vehicle.vin, "reset_battery_learning"
+        ):
             entities.append(UconnectResetLearningButton(coordinator, vehicle))
 
     # Command entities (gated behind option)

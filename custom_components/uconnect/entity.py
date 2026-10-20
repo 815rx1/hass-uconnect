@@ -1,5 +1,7 @@
 """Base Entity for Uconnect integration."""
 
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.helpers.entity import DeviceInfo
 
@@ -7,6 +9,33 @@ from .pyuconnect.client import Vehicle
 
 from .const import DOMAIN
 from .coordinator import UconnectDataUpdateCoordinator
+
+
+def was_added(hass: HomeAssistant, platform: str, vin: str, key: str) -> bool:
+    """Return whether the entity of this vehicle and key was created before.
+
+    Entities are created for the values a vehicle reports. A value missing at
+    startup, because an endpoint failed or the cloud left a block out, must
+    not make an existing entity vanish together with its dashboard cards and
+    automations, so registered ones are always created again.
+    """
+
+    return (
+        er.async_get(hass).async_get_entity_id(platform, DOMAIN, f"{DOMAIN}_{vin}_{key}")
+        is not None
+    )
+
+
+def schedule_slot_count(hass: HomeAssistant, vehicle: Vehicle) -> int:
+    """Return how many charge schedule slots to create entities for."""
+
+    reported = len(getattr(vehicle, "charge_schedules", None) or [])
+    registered = sum(
+        1
+        for slot in range(1, 4)
+        if was_added(hass, "switch", vehicle.vin, f"charge_schedule_{slot}")
+    )
+    return max(reported, registered)
 
 
 class UconnectEntity(CoordinatorEntity):

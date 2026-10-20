@@ -28,7 +28,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN, UNIT_DYNAMIC
-from .entity import UconnectEntity
+from .entity import UconnectEntity, was_added
 from .coordinator import UconnectDataUpdateCoordinator
 from .extrapolated_soc import (
     UconnectExtrapolatedSocSensor,
@@ -307,6 +307,7 @@ async def async_setup_entry(
             if (
                 getattr(vehicle, description.key, None) is not None
                 or description.get is not None
+                or was_added(hass, "sensor", vehicle.vin, description.key)
             ):
                 entities.append(UconnectSensor(coordinator, description, vehicle))
 
@@ -323,7 +324,9 @@ async def async_setup_entry(
             entities.append(UconnectChargeScheduleSensor(coordinator, vehicle))
 
         # Add extrapolated SOC sensors for EVs/PHEVs
-        if getattr(vehicle, "state_of_charge", None) is not None:
+        if getattr(vehicle, "state_of_charge", None) is not None or was_added(
+            hass, "sensor", vehicle.vin, "extrapolated_soc"
+        ):
             entities.append(UconnectExtrapolatedSocSensor(coordinator, vehicle))
             entities.append(UconnectChargingRateSensor(coordinator, vehicle))
 

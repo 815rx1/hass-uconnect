@@ -306,3 +306,74 @@ def test_poll_survives_request_timeouts():
 
     with patch("custom_components.uconnect.pyuconnect.client.sleep"):
         assert client._poll_correlation_id(VIN, "corr") is True
+
+
+def logged_in_api() -> API:
+    api = API("user@example.com", "pw", "1234", FIAT_EU)
+    api.uid = "uid1"
+    api.expire_time = datetime.now(timezone.utc) + timedelta(hours=1)
+    return api
+
+
+def test_pin_token_is_reused_until_it_expires():
+    api = logged_in_api()
+    answers = [
+        response(200, {"token": "pin-1", "expiry": 300000}),
+        response(200, {"responseStatus": "pending", "correlationId": "a"}),
+        response(200, {"responseStatus": "pending", "correlationId": "b"}),
+    ]
+    with patch.object(api.sess, "request", side_effect=answers) as req:
+        assert api.command(VIN, COMMAND_DOORS_LOCK) == "a"
+        assert api.command(VIN, COMMAND_DOORS_LOCK) == "b"
+
+    # One PIN authentication for two commands, both sent with its token
+    assert req.call_count == 3
+    assert [c.kwargs["json"].get("pinAuth") for c in req.call_args_list[1:]] == [
+        "pin-1",
+        "pin-1",
+    ]
+
+    # Once expired a new one is fetched
+    api._pin_token = ("pin-1", 0)
+    answers = [
+        response(200, {"token": "pin-2", "expiry": 300000}),
+        response(200, {"responseStatus": "pending", "correlationId": "c"}),
+    ]
+    with patch.object(api.sess, "request", side_effect=answers) as req:
+        api.command(VIN, COMMAND_DOORS_LOCK)
+    assert req.call_args_list[1].kwargs["json"]["pinAuth"] == "pin-2"
+
+
+def test_pin_token_without_expiry_is_not_cached():
+    api = logged_in_api()
+    answers = [
+        response(200, {"token": "pin-1"}),
+        response(200, {"responseStatus": "pending", "correlationId": "a"}),
+        response(200, {"token": "pin-2"}),
+        response(200, {"responseStatus": "pending", "correlationId": "b"}),
+    ]
+    with patch.object(api.sess, "request", side_effect=answers) as req:
+        api.command(VIN, COMMAND_DOORS_LOCK)
+        api.command(VIN, COMMAND_DOORS_LOCK)
+    assert req.call_count == 4
+
+
+def test_failed_command_drops_pin_token():
+    api = logged_in_api()
+    answers = [
+        response(200, {"token": "pin-1", "expiry": 300000}),
+        response(403, {"debugMsg": "FORBIDDEN"}),
+    ]
+    with patch.object(api.sess, "request", side_effect=answers):
+        with pytest.raises(requests.HTTPError):
+            api.command(VIN, COMMAND_DOORS_LOCK)
+    assert api._pin_token is None
+
+
+def test_changed_pin_drops_pin_token():
+    api = logged_in_api()
+    api._pin_token = ("pin-1", float("inf"))
+    api.set_pin("1234")
+    assert api._pin_token is not None
+    api.set_pin("9999")
+    assert api._pin_token is None

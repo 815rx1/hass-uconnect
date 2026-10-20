@@ -13,10 +13,10 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .pyuconnect.client import Vehicle
 
-from .charge_schedule import format_time, parse_time, supports_emea_schedules
+from .charge_schedule import format_time, parse_time
 from .const import DOMAIN, CONF_ADD_COMMAND_ENTITIES
 from .coordinator import UconnectDataUpdateCoordinator
-from .entity import UconnectEntity
+from .entity import UconnectEntity, schedule_slot_count
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -42,10 +42,7 @@ async def async_setup_entry(
     coordinator: UconnectDataUpdateCoordinator = config_entry.runtime_data
     entities: list[UconnectChargeScheduleTime] = []
     for vehicle in coordinator.client.vehicles.values():
-        if not supports_emea_schedules(coordinator.client, vehicle):
-            continue
-
-        for slot in range(len(vehicle.charge_schedules)):
+        for slot in range(schedule_slot_count(hass, vehicle)):
             for field, suffix, icon in TIME_FIELDS:
                 entities.append(
                     UconnectChargeScheduleTime(

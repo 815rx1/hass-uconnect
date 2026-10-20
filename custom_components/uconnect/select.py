@@ -21,7 +21,7 @@ from .pyuconnect.api import (
 
 from .const import DOMAIN, CONF_ADD_COMMAND_ENTITIES
 from .coordinator import UconnectDataUpdateCoordinator
-from .entity import UconnectEntity
+from .entity import UconnectEntity, was_added
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -51,7 +51,9 @@ async def async_setup_entry(
     coordinator: UconnectDataUpdateCoordinator = config_entry.runtime_data
     entities: list[UconnectSelectSetChargingLevel] = []
     for vehicle in coordinator.client.vehicles.values():
-        if getattr(vehicle, "charging_level_preference", None) is not None:
+        if getattr(vehicle, "charging_level_preference", None) is not None or was_added(
+            hass, "select", vehicle.vin, "charging_level_preference"
+        ):
             entities.append(UconnectSelectSetChargingLevel(coordinator, vehicle))
 
     async_add_entities(entities)
