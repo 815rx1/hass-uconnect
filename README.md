@@ -2,6 +2,8 @@
 
 Connect your Uconnect-enabled vehicle to Home Assistant. This integration has been made from the reverse-engineered Stellantis vehicle-branded apps and websites.
 
+> This is an independently maintained fork of [hass-uconnect/hass-uconnect](https://github.com/hass-uconnect/hass-uconnect). It keeps the same integration domain and entity IDs, so it can replace the original without losing configuration or history, see [Switching from the original](#switching-from-the-original). Its focus is on not waking or unlocking the vehicle by accident, see [Safety](#safety-).
+
 ## Car Brands
 
 US, Canada, EU & Asia regions are supported. Try a different region if the originally selected region does not authenticate.
@@ -39,7 +41,10 @@ US, Canada, EU & Asia regions are supported. Try a different region if the origi
 
 - Imports statistics like battery level 🔋, tire pressure ‍💨, odometer ⏲, fuel type, vehicle health report, maintenance history, stolen vehicle status etc. into Home Assistant
 - **Vehicle Image**: Displays your vehicle's image as an entity. The image is downloaded once and cached locally for fast access
-- **Extrapolated Battery**: For EVs, provides a real-time battery estimate between API updates by tracking charging rate and idle drain, the drain being learned only from spells where the odometer confirms the car did not move. Automatically rejects stale data that would show impossible values (e.g., battery dropping while charging), and does not learn from a reading it rejected, and correctly handles state transitions (e.g., idle to charging, charging to driving). Polling alone returns a cached SOC that can go unchanged for hours, so a deep refresh is sent three minutes after charging starts, once the vehicle has settled on a time-to-full for the connected charger, and repeated at the configured interval until the session ends. The charging rate follows the vehicle's time-to-full until it can be measured from real SOC changes, and is preserved across sessions so extrapolation begins immediately on the next one
+- **Extrapolated Battery**: For EVs, provides a real-time battery estimate between API updates by tracking charging rate and idle drain, the drain being learned only from spells where the odometer confirms the car did not move. Automatically rejects stale data that would show impossible values (e.g., battery dropping while charging), and does not learn from a reading it rejected, and correctly handles state transitions (e.g., idle to charging, charging to driving). Polling alone returns a cached SOC that can go unchanged for hours, so while charging the vehicle can be asked to push fresh data (a deep refresh) at the configured interval, within the limits described under [Safety](#safety-). The charging rate follows the vehicle's time-to-full until it can be measured from real SOC changes, and is preserved across sessions so extrapolation begins immediately on the next one
+- **Charge schedules** (EMEA vehicles such as the Fiat 500e): each of the vehicle's schedule slots gets a switch to turn it on or off and time entities for its start and end; the `set_charge_schedule_slot` action also sets the days, charge to full and cabin priority. The current schedules are read right before each change, so changes made in the app are kept, and nothing is sent when a slot already has the requested values
+- **Trip A/B, battery health and upload times**: the trip computers, the traction battery state of health where the vehicle reports it, and when the vehicle last uploaded its data
+- **Diagnostics download** (with VIN, account, PIN and position removed), including when and why the vehicle was woken
 - **Charging Rate**: Shows the current charging speed in %/hour. Picks the time-to-full matching the charger the vehicle reports, including a domestic socket, and reports nothing rather than another charger's figure when the connected one publishes none. Computed over a 60-minute sliding window of SOC readings for stable output even with integer SOC values and irregular polling. Falls back to a time-to-full estimate until the first SOC gain is seen, since a window with no new reading means the API has not updated rather than that charging has stopped, and returns to that estimate once the last measurement is older than the window itself
 - **Reset Battery Learning**: Button to reset the learned charging correction factor and idle drain rate back to defaults, and to drop the charging rate carried over from the last session. Useful when changing chargers or if learned values have drifted, the next session then starts from the vehicle's own time-to-full. The correction factor only applies while the rate comes from the vehicle's time-to-full, a rate measured from actual SOC changes is used as is, including one carried over from an earlier session
 - Multiple Brands: Abarth, Alfa Romeo, Chrysler, Dodge, Fiat, Jeep, Lancia, Maserati & Ram
@@ -49,7 +54,7 @@ US, Canada, EU & Asia regions are supported. Try a different region if the origi
 - Live vehicle status such as windows/doors, and ignition status for supported vehicles
 - Home Assistant zones (home 🏠, work 🏦 etc.) support
 - Uses the same data source as the official app 📱
-- Remote commands (unlock doors 🚪, switch HVAC 🧊 on , ...). **Use a service (action) to trigger commands**. Some commands may not work with all vehicles
+- Remote commands (unlock doors 🚪, switch HVAC 🧊 on , ...). **Use a service (action) to trigger commands**. Some commands may not work with all vehicles. With more than one vehicle known to Home Assistant, an action needs `device_id`; unlocking needs the Uconnect PIN as `code` unless that is turned off in the options
 - Available commands are:
   - `Refresh Location`: Updates the vehicle location
   - `Deep Refresh`: Refreshes EV battery level
@@ -57,11 +62,12 @@ US, Canada, EU & Asia regions are supported. Try a different region if the origi
   - `Lights/Horn`: Trigger vehicle horn and lights
   - `Lights`: Trigger vehicle lights
   - `Preconditioning On/Off`: Toggle vehicle preconditioning
-  - `Trunk Lock/Unlock` / `Liftgate Lock/Unlock`: Lock/Unlock trunk/liftgate
-  - `Doors Lock/Unlock`: Lock/Unlock vehicle doors
+  - `Trunk Lock/Unlock` / `Liftgate Lock/Unlock`: Lock/Unlock trunk/liftgate (unlock takes `code`)
+  - `Doors Lock/Unlock`: Lock/Unlock vehicle doors (unlock takes `code`)
   - `Engine On/Off`: Remotely starts/stops the vehicle engine
   - `Cabin Ventilation`: Activates cabin ventilation
-  - `Set Charge Schedule`: Sets the EV charge schedule (accepts a JSON object)
+  - `Set Charge Schedule`: Sets the EV charge schedule (accepts a JSON object, North American vehicles)
+  - `Set Charge Schedule Slot`: Changes one charge schedule slot of an EMEA vehicle, the others stay as they are
   - `Charge Now`: Initiates EV charging
   - `Charge Now (V4)`: Initiates EV charging using V4 API
   - `HVAC On/Off`: Toggles the HVAC
@@ -99,13 +105,45 @@ issue with your vehicle year, make, model, and whether it shows in the official 
 - Some commands are vehicle specific and do not work across all makes and models.
 - Some vehicles do not support live status for locks/windows/ignition. 
 
+## Safety 🛡️
+
+Every remote command wakes the vehicle's telematics unit, which draws on its 12 V battery. Reading data does not: polls only fetch what the cloud holds.
+
+**Automatic wake-ups.** The only thing that wakes the vehicle on its own is the deep refresh while charging, and only when all of this holds:
+
+- the option *Deep Refresh While Charging* is not 0 (0 turns automatic wake-ups off entirely)
+- the last poll worked and reports the vehicle as charging and not unplugged, with a known state of charge below 100 % and charge data the vehicle uploaded less than 12 hours ago
+- at least 15 minutes passed since Home Assistant started and since any command was sent to the vehicle, and the interval passed since the last refresh of this charge
+- fewer than 24 automatic refreshes in the last 24 hours
+- the last 3 refreshes brought new charge data and did not fail; otherwise there are none until the next charge
+
+Charging that pauses for less than 30 minutes, like a wallbox following solar surplus, counts as the same charge. These limits are kept per vehicle and written to disk before each wake-up, so they hold across restarts, crashes, reloads and several entries for the same car. The extrapolated battery sensor shows `last_deep_refresh`, `deep_refreshes_this_session` and `deep_refreshes_last_24h`.
+
+**Commands on request** are never delayed, with three exceptions that catch automations stuck in a loop: a deep refresh or location refresh within 10 minutes of the last refresh (at most 48 a day), the same command again within a minute of being confirmed, and more than 30 commands within an hour.
+
+**Unlocking** needs the Uconnect PIN as the code by default, for the lock entities and the unlock actions alike, so an automation unlocking all locks, a scene, a voice assistant or an accidental tap cannot open the car. Five wrong codes pause unlocking for 5 minutes. Locking needs no code. This can be turned off in the options.
+
+**Bulk actions.** The trunk and liftgate are locks, not switches, so "turn off all switches" cannot open them. The remaining command switches (engine, preconditioning, climate, charging), the charge schedule entities and the charging level are configuration entities: they are not reached by turning off a whole area or device, not bridged to HomeKit by default and not exposed to voice assistants. Switches exposed by earlier versions are taken out of Assist, Alexa and Google once; expose them again if you want them by voice. A switch is not sent "on" again while the vehicle already reports it on.
+
+## Switching from the original
+
+Configuration, entities and history are kept, because the domain and the entity IDs are the same.
+
+1. Make a backup (Settings → System → Backups).
+2. In HACS, open the original Uconnect integration and choose **Remove**. This removes the files only; do **not** delete the integration under Settings → Devices & services.
+3. Add `https://github.com/815rx1/hass-uconnect` as a custom repository (type *Integration*) and download it.
+4. Restart Home Assistant.
+
+Going back works the same way the other way round. Entities only this fork has then show as unavailable and keep their history. The trunk of vehicles that had the *Lock Trunk* switch is now a lock entity; the old switch shows as unavailable and can be deleted.
+
 ## How to install 🛠️
 
 - Make sure you have [HACS](https://hacs.xyz/docs/use/#getting-started-with-hacs) already installed
-- Add the [repository URL](https://github.com/hass-uconnect/hass-uconnect) to your HACS custom repositories as type `integration`
+- Add the [repository URL](https://github.com/815rx1/hass-uconnect) to your HACS custom repositories as type `integration`
 - Install the integration and restart Home Assistant
 - Go to your integrations configuration page once started and add the Uconnect integration
 - Fill e-mail, password and optionally PIN if you want to issue commands
+- Requires Home Assistant 2024.12 or newer
 
 After the integration is initialized - you might want to go into its options and enable the creation of command entities:
 
@@ -114,9 +152,10 @@ After the integration is initialized - you might want to go into its options and
 The options are:
 
 - **Scan Interval (min)**: how often the integration polls the API, 5 minutes by default
-- **Pin**: needed to issue remote commands, set it here if it was left empty during setup. A change takes effect straight away, and clearing the field falls back to the PIN given during setup
-- **Deep Refresh While Charging (min, 0 disables, 15 minimum)**: how often to ask an EV to push fresh data while it is charging, 30 minutes by default. Polling alone returns a cached state of charge, so without this the extrapolated battery has nothing to correct itself against. Set it to 0 to only refresh once at the start of a charge. A change takes effect on the charge already under way. Requires a PIN and a vehicle that supports deep refresh. Three failures in a row end the refreshes for that session, since a vehicle that does not answer holds the request open for a minute each time
+- **Pin**: needed to issue remote commands, set it here if it was left empty during setup. A change takes effect straight away, and clearing the field falls back to the PIN given during setup. A PIN entered when reauthenticating or reconfiguring replaces this one too
+- **Deep Refresh While Charging (min, 0 = no automatic wake-ups, 15 minimum)**: how often to ask an EV to push fresh data while it is charging, 30 minutes by default. Polling alone returns a cached state of charge, so without this the extrapolated battery has nothing to correct itself against. 0 turns automatic deep refreshes off entirely. A change takes effect on the charge already under way. Requires a PIN and a vehicle that supports deep refresh. See [Safety](#safety-) for the limits that always apply
 - **Add command entities (Button/Lock/Switch)**: create entities for the remote commands instead of using actions only
+- **Require the Uconnect PIN to unlock**: on by default, unlocking then asks for the PIN as its code
 
 ## Built-in Vehicle Card
 

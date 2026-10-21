@@ -14,6 +14,7 @@ from typing import Any
 from homeassistant.components import websocket_api
 from homeassistant.components.frontend import add_extra_js_url, remove_extra_js_url
 from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import CoreState, HomeAssistant
 
 from .const import DOMAIN
@@ -168,14 +169,20 @@ async def _async_load_card(hass: HomeAssistant, domain_data: dict[str, Any]) -> 
     )
 
 
-async def async_remove_frontend_cards_if_last_entry(hass: HomeAssistant) -> None:
+async def async_remove_frontend_cards_if_last_entry(
+    hass: HomeAssistant, removed: ConfigEntry
+) -> None:
     """Remove the Lovelace resource once the last Uconnect entry is deleted.
 
     This must not run on unload: a reload unloads the entry too, and the
     resource would then be gone until HA restarts, leaving every dashboard
-    with a "Custom element doesn't exist" error.
+    with a "Custom element doesn't exist" error. The entry being removed is
+    left out, older Home Assistant versions still list it at this point.
     """
-    if hass.config_entries.async_entries(DOMAIN):
+    if any(
+        entry.entry_id != removed.entry_id
+        for entry in hass.config_entries.async_entries(DOMAIN)
+    ):
         return
 
     domain_data: dict[str, Any] = hass.data.get(DOMAIN) or {}

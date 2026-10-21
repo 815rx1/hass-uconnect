@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Final
 
+from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.exceptions import HomeAssistantError
@@ -37,12 +38,15 @@ class UconnectButtonEntityDescription(ButtonEntityDescription):
 
 
 BUTTON_DESCRIPTIONS: Final[tuple[UconnectButtonEntityDescription, ...]] = (
+    # Refreshes only fetch data, so they sit with the diagnostics and are not
+    # pressed along with the buttons of an area
     UconnectButtonEntityDescription(
         key="button_location",
         name="Refresh Location",
         icon="mdi:crosshairs-gps",
         command=COMMAND_REFRESH_LOCATION,
         device_class=ButtonDeviceClass.UPDATE,
+        entity_category=EntityCategory.DIAGNOSTIC,
     ),
     UconnectButtonEntityDescription(
         key="button_deep_refresh",
@@ -50,6 +54,7 @@ BUTTON_DESCRIPTIONS: Final[tuple[UconnectButtonEntityDescription, ...]] = (
         icon="mdi:refresh",
         command=COMMAND_DEEP_REFRESH,
         device_class=ButtonDeviceClass.UPDATE,
+        entity_category=EntityCategory.DIAGNOSTIC,
     ),
     UconnectButtonEntityDescription(
         key="button_charge",
@@ -102,7 +107,7 @@ async def async_setup_entry(
                 if (
                     description.command is not None
                     and description.command.name in vehicle.supported_commands
-                ):
+                ) or was_added(hass, "button", vehicle.vin, description.key):
                     entities.append(UconnectButton(coordinator, description, vehicle))
 
     async_add_entities(entities)
@@ -128,9 +133,14 @@ class UconnectButton(ButtonEntity, UconnectEntity):
         return self.entity_description.icon
 
     async def async_press(self, **kwargs):
-        await self.coordinator.async_command(
-            self.vehicle.vin, self.entity_description.command
-        )
+        try:
+            await self.coordinator.async_command(
+                self.vehicle.vin, self.entity_description.command
+            )
+        except HomeAssistantError:
+            raise
+        except Exception as err:
+            raise HomeAssistantError(f"Command failed: {err}") from err
 
 
 class UconnectButtonUpdate(ButtonEntity, UconnectEntity):
@@ -145,6 +155,7 @@ class UconnectButtonUpdate(ButtonEntity, UconnectEntity):
             f"{vehicle.make} {vehicle.nickname or vehicle.model} Update Data"
         )
         self._attr_unique_id = f"{DOMAIN}_{vehicle.vin}_update"
+        self._attr_entity_category = EntityCategory.DIAGNOSTIC
 
     @property
     def icon(self):
@@ -169,6 +180,7 @@ class UconnectResetLearningButton(ButtonEntity, UconnectEntity):
         )
         self._attr_unique_id = f"{DOMAIN}_{vehicle.vin}_reset_battery_learning"
         self._attr_icon = "mdi:head-sync-outline"
+        self._attr_entity_category = EntityCategory.CONFIG
 
     async def async_press(self, **kwargs):
         sensor = self.coordinator.extrapolated_soc_sensors.get(self._vin)

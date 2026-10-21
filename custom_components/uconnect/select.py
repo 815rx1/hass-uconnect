@@ -3,6 +3,7 @@
 from __future__ import annotations
 import logging
 
+from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.components.select import SelectEntity
 from homeassistant.config_entries import ConfigEntry
@@ -60,6 +61,8 @@ async def async_setup_entry(
 
 
 class UconnectSelectSetChargingLevel(SelectEntity, UconnectEntity):
+    _attr_entity_category = EntityCategory.CONFIG
+
     def __init__(
         self,
         coordinator: UconnectDataUpdateCoordinator,

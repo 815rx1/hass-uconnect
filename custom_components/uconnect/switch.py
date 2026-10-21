@@ -8,7 +8,8 @@ import logging
 
 from homeassistant.core import HomeAssistant
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.const import EntityCategory
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.components.switch import (
     SwitchDeviceClass,
@@ -27,15 +28,13 @@ from .pyuconnect.command import (
     COMMAND_HVAC_ON,
     COMMAND_PRECOND_OFF,
     COMMAND_PRECOND_ON,
-    COMMAND_TRUNK_LOCK,
-    COMMAND_TRUNK_UNLOCK,
     Command,
 )
 
 from .charge_schedule import enabled_days
 from .const import DOMAIN, CONF_ADD_COMMAND_ENTITIES
 from .coordinator import UconnectDataUpdateCoordinator
-from .entity import UconnectEntity, schedule_slot_count
+from .entity import UconnectEntity, schedule_slot_count, was_added
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -76,6 +75,7 @@ SWITCH_DESCRIPTIONS: Final[tuple[UconnectSwitchEntityDescription, ...]] = (
         on_icon="mdi:hvac",
         command_on=COMMAND_HVAC_ON,
         command_off=COMMAND_HVAC_OFF,
+        is_on=lambda x: getattr(x, "hvac_on", None),
         device_class=SwitchDeviceClass.SWITCH,
     ),
     UconnectSwitchEntityDescription(
@@ -95,15 +95,7 @@ SWITCH_DESCRIPTIONS: Final[tuple[UconnectSwitchEntityDescription, ...]] = (
         is_on=lambda x: getattr(x, "charging", None),
         device_class=SwitchDeviceClass.SWITCH,
     ),
-    UconnectSwitchEntityDescription(
-        key="switch_trunk",
-        name="Lock Trunk",
-        on_icon="mdi:lock",
-        off_icon="mdi:lock-open",
-        command_on=COMMAND_TRUNK_LOCK,
-        command_off=COMMAND_TRUNK_UNLOCK,
-        device_class=SwitchDeviceClass.SWITCH,
-    ),
+    # The trunk is a lock now, see lock.py
 )
 
 
@@ -124,16 +116,13 @@ async def async_setup_entry(
 
     for vehicle in coordinator.client.vehicles.values():
         for description in SWITCH_DESCRIPTIONS:
+            supported = any(
+                command is not None and command.name in vehicle.supported_commands
+                for command in (description.command_on, description.command_off)
+            )
             if (
-                (
-                    description.command_on is not None
-                    and description.command_on.name in vehicle.supported_commands
-                )
-                or (
-                    description.command_off is not None
-                    and description.command_off.name in vehicle.supported_commands
-                )
-            ) and description.is_available(vehicle):
+                supported and description.is_available(vehicle)
+            ) or was_added(hass, "switch", vehicle.vin, description.key):
                 entities.append(UconnectSwitch(coordinator, description, vehicle))
 
         for slot in range(schedule_slot_count(hass, vehicle)):
@@ -145,6 +134,17 @@ async def async_setup_entry(
 
 
 class UconnectSwitch(SwitchEntity, UconnectEntity):
+    """A remote command as a switch.
+
+    Kept out of bulk actions: as configuration entities they are not reached
+    by turning off a whole area or device, not bridged to HomeKit by default
+    and not exposed to voice assistants by default. "Turn everything off"
+    would otherwise wake the vehicle once per switch, and "turn everything
+    on" start its engine or climate.
+    """
+
+    _attr_entity_category = EntityCategory.CONFIG
+
     def __init__(
         self,
         coordinator: UconnectDataUpdateCoordinator,
@@ -175,35 +175,45 @@ class UconnectSwitch(SwitchEntity, UconnectEntity):
 
     async def async_turn_on(self, **kwargs):
         if self.entity_description.command_on is None:
-            raise HomeAssistantError(
+            raise ServiceValidationError(
                 f"{self.entity_description.name} cannot be turned on"
             )
 
-        try:
-            await self.coordinator.async_command(
-                self.vehicle.vin, self.entity_description.command_on
-            )
-        except Exception as err:
-            _LOGGER.error("Failed to turn on %s: %s", self.entity_description.key, err)
-            raise HomeAssistantError(f"Failed to turn on: {err}") from err
+        # Already reported on: sending it again would only wake the vehicle
+        if self.is_on is True:
+            _LOGGER.debug("%s is already on, not sending", self.entity_description.key)
+            return
+
+        await self._async_send(self.entity_description.command_on, "turn on")
 
     async def async_turn_off(self, **kwargs):
         if self.entity_description.command_off is None:
-            raise HomeAssistantError(
+            raise ServiceValidationError(
                 f"{self.entity_description.name} cannot be turned off"
             )
 
+        # Unlike turning on, turning off is always sent: a state that is out
+        # of date must not leave an engine or the climate running
+        await self._async_send(self.entity_description.command_off, "turn off")
+
+    async def _async_send(self, command: Command, what: str) -> None:
         try:
-            await self.coordinator.async_command(
-                self.vehicle.vin, self.entity_description.command_off
-            )
+            await self.coordinator.async_command(self.vehicle.vin, command)
+        except HomeAssistantError:
+            raise
         except Exception as err:
-            _LOGGER.error("Failed to turn off %s: %s", self.entity_description.key, err)
-            raise HomeAssistantError(f"Failed to turn off: {err}") from err
+            _LOGGER.error("Failed to %s %s: %s", what, self.entity_description.key, err)
+            raise HomeAssistantError(f"Failed to {what}: {err}") from err
 
 
 class UconnectChargeScheduleSwitch(SwitchEntity, UconnectEntity):
-    """Enables or disables one inline charge schedule slot of an EMEA vehicle."""
+    """Enables or disables one inline charge schedule slot of an EMEA vehicle.
+
+    A configuration entity, so turning off everything in an area does not
+    switch off the charging schedules.
+    """
+
+    _attr_entity_category = EntityCategory.CONFIG
 
     def __init__(
         self,
@@ -255,6 +265,8 @@ class UconnectChargeScheduleSwitch(SwitchEntity, UconnectEntity):
             await self.coordinator.async_set_emea_charge_schedule(
                 self._vin, self._slot, enable=enable
             )
+        except HomeAssistantError:
+            raise
         except Exception as err:
             _LOGGER.error(
                 "Failed to set charge schedule %d: %s", self._slot + 1, err

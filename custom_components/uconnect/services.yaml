@@ -96,6 +96,11 @@ doors_unlock:
       selector:
         device:
           integration: uconnect
+    code:
+      required: false
+      selector:
+        text:
+          type: password
 
 trunk_lock:
   fields:
@@ -111,6 +116,11 @@ trunk_unlock:
       selector:
         device:
           integration: uconnect
+    code:
+      required: false
+      selector:
+        text:
+          type: password
 
 liftgate_lock:
   fields:
@@ -126,6 +136,11 @@ liftgate_unlock:
       selector:
         device:
           integration: uconnect
+    code:
+      required: false
+      selector:
+        text:
+          type: password
 
 cabin_ventilation:
   fields:

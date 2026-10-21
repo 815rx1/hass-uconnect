@@ -144,19 +144,6 @@ async def test_scheduled_polling_runs(hass, config_entry, mock_client, vehicle):
     mock_client.command_verify.assert_not_called()
 
 
-async def test_deep_refresh_after_charging_starts(hass, setup_integration, mock_client):
-    # The fixture vehicle is charging: one deep refresh follows a few minutes
-    # later even with the recurring refresh disabled, then none repeat
-    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(minutes=4))
-    await hass.async_block_till_done()
-    assert mock_client.command_verify.call_count == 1
-    assert mock_client.command_verify.call_args.args[1].name == "DEEPREFRESH"
-
-    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(minutes=60))
-    await hass.async_block_till_done()
-    assert mock_client.command_verify.call_count == 1
-
-
 async def test_vehicle_dropping_out_makes_entities_unavailable(
     hass, setup_integration, mock_client, vehicle
 ):
@@ -219,11 +206,15 @@ async def test_schedule_switch_writes_full_list(hass, setup_integration, mock_cl
         "switch", "turn_on", {"entity_id": switch_id}, blocking=True
     )
 
-    vin, schedules, verify = mock_client.set_charge_schedule_emea.call_args.args
+    vin, schedules, verify = mock_client.send_charge_schedules_emea.call_args.args
     assert vin == VIN and verify is True
-    assert [s.enable for s in schedules] == [True, True, False]
+    assert [s["enableScheduleType"] for s in schedules] == [True, True, False]
     # The first slot went back unchanged
-    assert schedules[0].start_time == "01:00" and schedules[0].days.monday
+    assert schedules[0]["startTime"] == "01:00"
+    assert schedules[0]["scheduledDays"]["monday"] is True
+    # An unused slot gets the charge type, the vehicle ignores NONE
+    assert schedules[1]["scheduleType"] == "CHARGE"
+    assert schedules[2]["scheduleType"] == "NONE"
 
 
 async def test_schedule_time_entity(hass, setup_integration, mock_client):
@@ -232,9 +223,9 @@ async def test_schedule_time_entity(hass, setup_integration, mock_client):
         "time", "set_value", {"entity_id": time_id, "time": "06:30:00"}, blocking=True
     )
 
-    schedules = mock_client.set_charge_schedule_emea.call_args.args[1]
-    assert schedules[0].end_time == "06:30"
-    assert schedules[0].start_time == "01:00"
+    schedules = mock_client.send_charge_schedules_emea.call_args.args[1]
+    assert schedules[0]["endTime"] == "06:30"
+    assert schedules[0]["startTime"] == "01:00"
 
 
 async def test_schedule_slot_service(hass, setup_integration, mock_client):
@@ -254,10 +245,11 @@ async def test_schedule_slot_service(hass, setup_integration, mock_client):
         blocking=True,
     )
 
-    slot = mock_client.set_charge_schedule_emea.call_args.args[1][2]
-    assert slot.enable and slot.charge_to_full
-    assert (slot.start_time, slot.end_time) == ("22:15", "04:00")
-    assert slot.days.saturday and slot.days.sunday and not slot.days.monday
+    slot = mock_client.send_charge_schedules_emea.call_args.args[1][2]
+    assert slot["enableScheduleType"] and slot["chargeToFull"]
+    assert (slot["startTime"], slot["endTime"]) == ("22:15", "04:00")
+    days = slot["scheduledDays"]
+    assert days["saturday"] and days["sunday"] and not days["monday"]
 
 
 async def test_schedule_slot_service_rejects_bad_input(hass, setup_integration):

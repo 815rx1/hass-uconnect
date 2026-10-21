@@ -7,6 +7,7 @@ import logging
 
 from homeassistant.components.time import TimeEntity
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -56,6 +57,8 @@ async def async_setup_entry(
 class UconnectChargeScheduleTime(TimeEntity, UconnectEntity):
     """Start or end time of one inline charge schedule slot of an EMEA vehicle."""
 
+    _attr_entity_category = EntityCategory.CONFIG
+
     def __init__(
         self,
         coordinator: UconnectDataUpdateCoordinator,
@@ -97,6 +100,8 @@ class UconnectChargeScheduleTime(TimeEntity, UconnectEntity):
             await self.coordinator.async_set_emea_charge_schedule(
                 self._vin, self._slot, **{self._field: format_time(value)}
             )
+        except HomeAssistantError:
+            raise
         except Exception as err:
             _LOGGER.error(
                 "Failed to set charge schedule %d %s: %s",

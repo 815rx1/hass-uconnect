@@ -188,7 +188,9 @@ async def async_setup_entry(
             ):
                 entities.append(UconnectBinarySensor(coordinator, description, vehicle))
 
-        if vehicle.vin in coordinator.svla_data:
+        if vehicle.vin in coordinator.svla_data or was_added(
+            hass, "binary_sensor", vehicle.vin, "svla"
+        ):
             entities.append(UconnectStolenVehicleSensor(coordinator, vehicle))
 
     async_add_entities(entities)

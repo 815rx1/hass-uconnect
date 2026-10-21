@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-import dataclasses
-from datetime import timedelta
+from datetime import datetime, timedelta
+import hmac
 import logging
+import time
 from typing import Any, TypeVar
 
 from .pyuconnect import Client
@@ -35,23 +36,32 @@ from homeassistant.helpers.update_coordinator import (
 )
 from homeassistant.util import dt as dt_util
 
-from .charge_schedule import WEEKDAYS, supports_emea_schedules
+from .charge_schedule import supports_emea_schedules
 from .const import (
     CONF_BRAND_REGION,
     CONF_CHARGING_REFRESH_INTERVAL,
     CONF_DISABLE_TLS_VERIFICATION,
+    CONF_UNLOCK_REQUIRES_PIN,
     BRANDS,
     DEFAULT_CHARGING_REFRESH_INTERVAL,
     DEFAULT_SCAN_INTERVAL,
+    DEFAULT_UNLOCK_REQUIRES_PIN,
     MAX_CONSECUTIVE_FAILURES,
     MIN_CHARGING_REFRESH_INTERVAL,
     SLOW_EXTRA_DATA_INTERVAL,
+    UNLOCK_COMMANDS,
+    UNLOCK_LOCKOUT,
+    UNLOCK_MAX_WRONG_CODES,
     DOMAIN,
 )
+from .wake_guard import Blocked, async_get_wake_guard
 
 _LOGGER = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
+
+# Name the wake guard records a schedule write under
+SCHEDULE_COMMAND = "CPPLUS"
 
 
 def is_auth_error(err: BaseException) -> bool:
@@ -79,7 +89,6 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
 
     def __init__(self, hass: HomeAssistant, config_entry: ConfigEntry) -> None:
         """Initialize the coordinator."""
-        self.platforms: set[str] = set()
         self.extrapolated_soc_sensors: dict = {}
         self.vhr_data: dict[str, dict] = {}
         self.maintenance_data: dict[str, dict] = {}
@@ -103,11 +112,16 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
 
         self.consecutive_failures: int = 0
         self.last_successful_update = None
-        self._last_slow_extra_update = None
-
-        self.refresh_interval: int = (
-            config_entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL) * 60
-        )
+        # When the health report and maintenance history were last asked
+        # for, per vehicle, whether that worked or not
+        self._last_slow_attempt: dict[str, datetime] = {}
+        # Set once the login was rejected. Until the entry is set up again
+        # with new credentials nothing is sent, every further attempt with
+        # the old ones only brings the account closer to a lockout.
+        self.auth_failed = False
+        # Wrong unlock codes in a row, and until when unlocking is refused
+        self._wrong_codes = 0
+        self._unlock_refused_until = 0.0
 
         self.charging_refresh_interval: int = self._read_charging_refresh_interval(
             config_entry
@@ -118,7 +132,11 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
             _LOGGER,
             name=DOMAIN,
             config_entry=config_entry,
-            update_interval=timedelta(seconds=self.refresh_interval),
+            update_interval=timedelta(
+                minutes=config_entry.options.get(
+                    CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL
+                )
+            ),
             always_update=True,
         )
 
@@ -137,25 +155,101 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
     def _read_charging_refresh_interval(config_entry: ConfigEntry) -> int:
         """Return the deep refresh interval while charging, in minutes.
 
-        Zero disables the recurring refresh. Shorter intervals are raised to
-        the floor because each deep refresh wakes the vehicle and holds an
-        executor thread for as long as the command status poll takes.
+        Zero turns the automatic refresh off entirely. Shorter intervals are
+        raised to the floor because each deep refresh wakes the vehicle and
+        holds an executor thread for as long as the command status poll takes.
         """
 
         minutes = config_entry.options.get(
             CONF_CHARGING_REFRESH_INTERVAL, DEFAULT_CHARGING_REFRESH_INTERVAL
         )
 
-        if not isinstance(minutes, int) or minutes <= 0:
+        if not isinstance(minutes, int) or isinstance(minutes, bool) or minutes <= 0:
             return 0
 
         return max(minutes, MIN_CHARGING_REFRESH_INTERVAL)
 
-    async def async_run(self, func: Callable[..., _T], *args: Any) -> _T:
+    @property
+    def unlock_requires_pin(self) -> bool:
+        """Whether unlocking asks for the Uconnect PIN as its code."""
+        return bool(
+            self.config_entry.options.get(
+                CONF_UNLOCK_REQUIRES_PIN, DEFAULT_UNLOCK_REQUIRES_PIN
+            )
+        )
+
+    def check_unlock_code(self, code: str | None) -> None:
+        """Raise unless the code given with an unlock is the Uconnect PIN.
+
+        Without the code an unlock stays where it came from: an automation
+        unlocking "all" locks on a smoke alarm, a scene, a voice assistant,
+        an accidental tap. Several wrong codes in a row refuse unlocking for
+        a while.
+        """
+        if not self.unlock_requires_pin:
+            return
+
+        if time.monotonic() < self._unlock_refused_until:
+            raise ServiceValidationError(
+                "Unlocking is paused after several wrong codes.",
+                translation_domain=DOMAIN,
+                translation_key="unlock_locked_out",
+                translation_placeholders={
+                    "minutes": str(int(UNLOCK_LOCKOUT.total_seconds() // 60))
+                },
+            )
+
+        if not code:
+            raise ServiceValidationError(
+                "Unlocking needs the Uconnect PIN as the code.",
+                translation_domain=DOMAIN,
+                translation_key="unlock_code_required",
+            )
+
+        pin = str(self.client.api.pin or "")
+        if not pin or not hmac.compare_digest(str(code).encode(), pin.encode()):
+            self._wrong_codes += 1
+            if self._wrong_codes >= UNLOCK_MAX_WRONG_CODES:
+                self._wrong_codes = 0
+                self._unlock_refused_until = (
+                    time.monotonic() + UNLOCK_LOCKOUT.total_seconds()
+                )
+                _LOGGER.warning(
+                    "Unlocking refused for %s after %d wrong codes",
+                    UNLOCK_LOCKOUT,
+                    UNLOCK_MAX_WRONG_CODES,
+                )
+            raise ServiceValidationError(
+                "The code is not the Uconnect PIN.",
+                translation_domain=DOMAIN,
+                translation_key="unlock_code_wrong",
+            )
+
+        self._wrong_codes = 0
+
+    async def async_run(
+        self, func: Callable[..., _T], *args: Any, on_request: bool = False
+    ) -> _T:
         """Run a blocking client call in the executor, one call at a time."""
 
         async with self._client_lock:
+            return await self._async_run_locked(func, *args, on_request=on_request)
+
+    async def _async_run_locked(
+        self, func: Callable[..., _T], *args: Any, on_request: bool = False
+    ) -> _T:
+        """Run a client call while the client lock is already held.
+
+        Calls made on request may log in although the login is backing off
+        after failures: somebody locking the car must not wait for that.
+        """
+
+        api = self.client.api
+        api.bypass_login_backoff = on_request
+        try:
             return await self.hass.async_add_executor_job(func, *args)
+        finally:
+            api.bypass_login_backoff = False
 
     async def _async_update_data(self):
         """Update data via library. Called by update_coordinator periodically."""
@@ -164,6 +258,7 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
             await self.async_run(self.client.refresh)
         except Exception as err:
             if is_auth_error(err):
+                self.auth_failed = True
                 raise ConfigEntryAuthFailed(f"Credentials rejected: {err}") from err
 
             self.consecutive_failures += 1
@@ -203,17 +298,21 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
         The health report and the maintenance history change at most daily,
         so they are fetched on a slow interval instead of on every poll. That
         halves the requests per poll and lowers the risk of rate limiting.
+        These are reads of what the cloud holds, none of them wakes a vehicle.
         """
 
         now = dt_util.utcnow()
-        fetch_slow = (
-            self._last_slow_extra_update is None
-            or now - self._last_slow_extra_update >= SLOW_EXTRA_DATA_INTERVAL
-            or any(vin not in self.vhr_data for vin in self.client.vehicles)
-        )
 
         for vin in list(self.client.vehicles):
-            if fetch_slow:
+            vehicle = self.client.vehicles.get(vin)
+            if vehicle is None:
+                continue
+
+            # Timed from the attempt, so a vehicle whose report keeps failing
+            # is not asked again on every poll
+            last = self._last_slow_attempt.get(vin)
+            if last is None or now - last >= SLOW_EXTRA_DATA_INTERVAL:
+                self._last_slow_attempt[vin] = now
                 try:
                     self.vhr_data[vin] = await self.async_run(
                         self.client.get_vehicle_health_report, vin
@@ -230,9 +329,12 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
                         "Maintenance history not available for %s: %s", vin, err
                     )
 
-            # EMEA vehicles report their schedules inline, and the v4 schedule
-            # endpoint only answers HTTP 500 for them
-            if not supports_emea_schedules(self.client, self.client.vehicles[vin]):
+            # Only electrified vehicles have charge schedules. EMEA vehicles
+            # report theirs inline, and the v4 schedule endpoint only answers
+            # HTTP 500 for them.
+            if getattr(vehicle, "state_of_charge", None) is not None and not (
+                supports_emea_schedules(self.client, vehicle)
+            ):
                 try:
                     self.charge_schedule_data[vin] = await self.async_run(
                         self.client.get_charge_schedules, vin
@@ -251,14 +353,16 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
                     "Stolen vehicle status not available for %s: %s", vin, err
                 )
 
-        if fetch_slow:
-            self._last_slow_extra_update = now
-
     async def async_set_charge_schedule(self, vin: str, schedule: dict) -> None:
         """Set a charge schedule"""
 
         await self._async_vehicle_action(
-            "Set charge schedule", self.client.set_charge_schedule_verify, vin, schedule
+            "Set charge schedule",
+            vin,
+            "SCHEDULE_V4",
+            self.client.set_charge_schedule_verify,
+            vin,
+            schedule,
         )
 
     async def async_set_emea_charge_schedule(
@@ -266,35 +370,74 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
     ) -> None:
         """Change one inline charge schedule slot of an EMEA vehicle.
 
-        The backend replaces the whole list on every write, so the other slots
-        are sent back unchanged. Days are given as a list of weekday names.
+        The backend replaces the whole list on every write. The list is read
+        fresh and written within one hold of the client lock, so two changes
+        made one right after the other cannot undo each other, and changes
+        made in the app since the last poll are kept. Nothing is sent, and the
+        vehicle not woken, when the slot already has the requested values.
+        Days are given as a list of weekday names.
         """
 
-        vehicle = self.client.vehicles.get(vin)
-        schedules = list(getattr(vehicle, "charge_schedules", None) or [])
-        if not 0 <= slot < len(schedules):
-            raise HomeAssistantError(f"Charge schedule {slot + 1} does not exist")
+        self._check_can_send(vin)
+        what = "Set charge schedule"
 
-        current = schedules[slot]
-        if (days := changes.pop("days", None)) is not None:
-            changes["days"] = dataclasses.replace(
-                current.days, **{day: day in days for day in WEEKDAYS}
-            )
-        schedules[slot] = dataclasses.replace(current, **changes)
+        async with self._client_lock:
+            try:
+                schedules = await self._async_run_locked(
+                    self.client.plan_charge_schedule_emea,
+                    vin,
+                    slot,
+                    changes,
+                    on_request=True,
+                )
+            except ValueError as err:
+                raise HomeAssistantError(f"{what} failed: {err}") from err
+            except Exception as err:
+                raise UconnectRequestError(f"{what} failed: {err}") from err
+
+            if schedules is None:
+                return
+
+            record = await self._async_record_manual(vin, SCHEDULE_COMMAND)
+            try:
+                result = await self._async_run_locked(
+                    self.client.send_charge_schedules_emea,
+                    vin,
+                    schedules,
+                    True,
+                    on_request=True,
+                )
+            except Exception as err:
+                raise UconnectRequestError(f"{what} failed: {err}") from err
+
+        await self._async_finish_action(what, record, result)
+
+    async def async_command(
+        self,
+        vin: str,
+        cmd: Command,
+        *,
+        automatic: bool = False,
+        code: str | None = None,
+    ) -> None:
+        """Execute the given command.
+
+        automatic is set by the deep refresh while charging, which the wake
+        guard has already allowed and recorded. code is what came with an
+        unlock, see check_unlock_code.
+        """
+
+        if cmd.name in UNLOCK_COMMANDS:
+            self.check_unlock_code(code)
 
         await self._async_vehicle_action(
-            "Set charge schedule",
-            self.client.set_charge_schedule_emea,
+            f"Command {cmd.name}",
             vin,
-            schedules,
-            True,
-        )
-
-    async def async_command(self, vin: str, cmd: Command) -> None:
-        """Execute the given command"""
-
-        await self._async_vehicle_action(
-            f"Command {cmd.name}", self.client.command_verify, vin, cmd
+            cmd.name,
+            self.client.command_verify,
+            vin,
+            cmd,
+            automatic=automatic,
         )
 
     async def async_set_charging_level(self, vin: str, level: str) -> None:
@@ -305,13 +448,64 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
 
         await self._async_vehicle_action(
             "Set charging level",
+            vin,
+            "CHARGE_PREFERENCE",
             self.client.set_charging_level_verify,
             vin,
             CHARGING_LEVELS_BY_NAME[level],
         )
 
+    def _check_can_send(self, vin: str) -> None:
+        """Raise if no command can be sent at all, before anything else."""
+
+        if self.auth_failed:
+            raise HomeAssistantError(
+                "The Uconnect login was rejected. Reauthenticate the integration "
+                "before sending commands."
+            )
+        if not self.client.api.pin:
+            raise ServiceValidationError(
+                "Commands need the Uconnect PIN, set it in the integration options."
+            )
+        if vin not in self.client.vehicles:
+            raise ServiceValidationError(f"Vehicle {vin} is currently not available")
+
+    async def _async_record_manual(self, vin: str, command: str):
+        """Check a command sent on request against the guard and record it.
+
+        The record is on disk before the command goes out.
+        """
+
+        guard = async_get_wake_guard(self.hass)
+        try:
+            guard.check_manual_command(vin, command)
+        except Blocked as err:
+            raise ServiceValidationError(
+                f"{command} not sent: {err}",
+                translation_domain=DOMAIN,
+                translation_key=err.key,
+                translation_placeholders={
+                    "command": command,
+                    "minutes": str(
+                        max(int(err.wait.total_seconds() // 60) + 1, 1)
+                        if err.wait
+                        else 1
+                    ),
+                },
+            ) from err
+
+        record = guard.record_command(vin, command)
+        await guard.async_flush()
+        return record
+
     async def _async_vehicle_action(
-        self, what: str, func: Callable[..., Any], *args: Any
+        self,
+        what: str,
+        vin: str,
+        command: str,
+        func: Callable[..., Any],
+        *args: Any,
+        automatic: bool = False,
     ) -> None:
         """Run a vehicle action, refresh afterwards and report the outcome.
 
@@ -321,12 +515,23 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
         entities show what the vehicle really did.
         """
 
+        self._check_can_send(vin)
+        record = None if automatic else await self._async_record_manual(vin, command)
+
         try:
-            result = await self.async_run(func, *args)
+            result = await self.async_run(func, *args, on_request=not automatic)
         except HomeAssistantError:
             raise
         except Exception as err:
+            if is_auth_error(err):
+                self.auth_failed = True
             raise UconnectRequestError(f"{what} failed: {err}") from err
+
+        await self._async_finish_action(what, record, result)
+
+    async def _async_finish_action(self, what: str, record, result: Any) -> None:
+        if result and record is not None:
+            async_get_wake_guard(self.hass).command_confirmed(record)
 
         await self.async_refresh()
 
@@ -335,15 +540,20 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
 
     async def update_options(self, hass: HomeAssistant, config_entry: ConfigEntry):
         self.update_interval = timedelta(
-            seconds=config_entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
-            * 60
+            minutes=config_entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
         )
         self.charging_refresh_interval = self._read_charging_refresh_interval(
             config_entry
         )
-        self.client.set_pin(self._read_pin(config_entry))
+        new_pin = self._read_pin(config_entry)
+        pin_changed = new_pin != self.client.api.pin
+        # Under the lock, so a PIN authentication already running finishes
+        # with the old PIN before its token is dropped
+        async with self._client_lock:
+            self.client.set_pin(new_pin)
 
         # A dormant deep refresh schedule has nothing left to re-arm it, so a
-        # charge already under way has to be told the options allow one now
+        # charge already under way has to be told the options allow one now,
+        # or that they no longer do
         for sensor in self.extrapolated_soc_sensors.values():
-            sensor.resume_deep_refresh()
+            sensor.resume_deep_refresh(pin_changed=pin_changed)

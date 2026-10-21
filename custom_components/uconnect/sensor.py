@@ -312,15 +312,21 @@ async def async_setup_entry(
                 entities.append(UconnectSensor(coordinator, description, vehicle))
 
         # Add VHR sensor if data is available
-        if vehicle.vin in coordinator.vhr_data:
+        if vehicle.vin in coordinator.vhr_data or was_added(
+            hass, "sensor", vehicle.vin, "vhr"
+        ):
             entities.append(UconnectVhrSensor(coordinator, vehicle))
 
         # Add maintenance history sensor if data is available
-        if vehicle.vin in coordinator.maintenance_data:
+        if vehicle.vin in coordinator.maintenance_data or was_added(
+            hass, "sensor", vehicle.vin, "maintenance"
+        ):
             entities.append(UconnectMaintenanceSensor(coordinator, vehicle))
 
         # Add charge schedule sensor if data is available
-        if vehicle.vin in coordinator.charge_schedule_data:
+        if vehicle.vin in coordinator.charge_schedule_data or was_added(
+            hass, "sensor", vehicle.vin, "charge_schedule"
+        ):
             entities.append(UconnectChargeScheduleSensor(coordinator, vehicle))
 
         # Add extrapolated SOC sensors for EVs/PHEVs

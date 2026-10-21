@@ -49,8 +49,9 @@
                 "data": {
                     "scan_interval": "Scan Interval (min)",
                     "pin": "Pin",
-                    "charging_refresh_interval": "Deep Refresh While Charging (min, 0 disables, 15 minimum)",
-                    "add_command_entities": "Add command entities (Button/Lock/Switch)"
+                    "charging_refresh_interval": "Deep Refresh While Charging (min, 0 = no automatic wake-ups, 15 minimum)",
+                    "add_command_entities": "Add command entities (Button/Lock/Switch)",
+                    "unlock_requires_pin": "Require the Uconnect PIN to unlock"
                 }
             }
         }
@@ -183,6 +184,10 @@
                 "device_id": {
                     "name": "Vehicle",
                     "description": "Target vehicle"
+                },
+                "code": {
+                    "name": "Code",
+                    "description": "The Uconnect PIN, needed when unlocking requires it"
                 }
             }
         },
@@ -203,6 +208,10 @@
                 "device_id": {
                     "name": "Vehicle",
                     "description": "Target vehicle"
+                },
+                "code": {
+                    "name": "Code",
+                    "description": "The Uconnect PIN, needed when unlocking requires it"
                 }
             }
         },
@@ -223,6 +232,10 @@
                 "device_id": {
                     "name": "Vehicle",
                     "description": "Target vehicle"
+                },
+                "code": {
+                    "name": "Code",
+                    "description": "The Uconnect PIN, needed when unlocking requires it"
                 }
             }
         },
@@ -350,6 +363,29 @@
                 "saturday": "Saturday",
                 "sunday": "Sunday"
             }
+        }
+    },
+    "exceptions": {
+        "refresh_cooldown": {
+            "message": "Not sent: the vehicle was refreshed shortly before. Try again in {minutes} min."
+        },
+        "refresh_daily_limit": {
+            "message": "Not sent: the daily limit for refreshes requested by hand is reached. Try again in {minutes} min."
+        },
+        "repeated_command": {
+            "message": "Not sent: {command} was confirmed by the vehicle less than a minute ago."
+        },
+        "hourly_limit": {
+            "message": "Not sent: more commands than a person sends within an hour, which looks like an automation stuck in a loop. Try again in {minutes} min."
+        },
+        "unlock_code_required": {
+            "message": "Unlocking needs the Uconnect PIN as the code. The requirement can be turned off in the integration options."
+        },
+        "unlock_code_wrong": {
+            "message": "The code is not the Uconnect PIN."
+        },
+        "unlock_locked_out": {
+            "message": "Unlocking is paused for {minutes} min after several wrong codes."
         }
     }
 }

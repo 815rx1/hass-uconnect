@@ -49,8 +49,9 @@
                 "data": {
                     "scan_interval": "Abfrageintervall (Min.)",
                     "pin": "PIN",
-                    "charging_refresh_interval": "Deep Refresh während des Ladens (Min., 0 = aus, mindestens 15)",
-                    "add_command_entities": "Befehls-Entitäten hinzufügen (Button/Schloss/Schalter)"
+                    "charging_refresh_interval": "Deep Refresh während des Ladens (Min., 0 = kein automatisches Wecken, mindestens 15)",
+                    "add_command_entities": "Befehls-Entitäten hinzufügen (Button/Schloss/Schalter)",
+                    "unlock_requires_pin": "Uconnect-PIN zum Entriegeln verlangen"
                 }
             }
         }
@@ -183,6 +184,10 @@
                 "device_id": {
                     "name": "Fahrzeug",
                     "description": "Zielfahrzeug"
+                },
+                "code": {
+                    "name": "Code",
+                    "description": "Die Uconnect-PIN, nötig wenn das Entriegeln sie verlangt"
                 }
             }
         },
@@ -203,6 +208,10 @@
                 "device_id": {
                     "name": "Fahrzeug",
                     "description": "Zielfahrzeug"
+                },
+                "code": {
+                    "name": "Code",
+                    "description": "Die Uconnect-PIN, nötig wenn das Entriegeln sie verlangt"
                 }
             }
         },
@@ -223,6 +232,10 @@
                 "device_id": {
                     "name": "Fahrzeug",
                     "description": "Zielfahrzeug"
+                },
+                "code": {
+                    "name": "Code",
+                    "description": "Die Uconnect-PIN, nötig wenn das Entriegeln sie verlangt"
                 }
             }
         },
@@ -350,6 +363,29 @@
                 "saturday": "Samstag",
                 "sunday": "Sonntag"
             }
+        }
+    },
+    "exceptions": {
+        "refresh_cooldown": {
+            "message": "Nicht gesendet: Das Fahrzeug wurde eben erst aktualisiert. Versuche es in {minutes} Min. erneut."
+        },
+        "refresh_daily_limit": {
+            "message": "Nicht gesendet: Das Tageslimit für von Hand angeforderte Aktualisierungen ist erreicht. Versuche es in {minutes} Min. erneut."
+        },
+        "repeated_command": {
+            "message": "Nicht gesendet: {command} wurde vom Fahrzeug vor weniger als einer Minute bestätigt."
+        },
+        "hourly_limit": {
+            "message": "Nicht gesendet: Mehr Befehle innerhalb einer Stunde, als ein Mensch sendet, das sieht nach einer Automation in einer Schleife aus. Versuche es in {minutes} Min. erneut."
+        },
+        "unlock_code_required": {
+            "message": "Zum Entriegeln wird die Uconnect-PIN als Code benötigt. Die Abfrage lässt sich in den Optionen der Integration abschalten."
+        },
+        "unlock_code_wrong": {
+            "message": "Der Code ist nicht die Uconnect-PIN."
+        },
+        "unlock_locked_out": {
+            "message": "Entriegeln ist nach mehreren falschen Codes für {minutes} Min. gesperrt."
         }
     }
 }

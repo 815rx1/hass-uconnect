@@ -19,9 +19,9 @@ from .pyuconnect.client import Vehicle
 
 from .const import DOMAIN
 from .coordinator import UconnectDataUpdateCoordinator
-from .entity import UconnectEntity
+from .entity import UconnectEntity, was_added
 
-_LOGGER = logging.getLogger(DOMAIN)
+_LOGGER = logging.getLogger(__name__)
 
 CACHE_DIR = ".storage/uconnect"
 IMAGE_RETRY_AFTER = timedelta(hours=1)
@@ -99,8 +99,10 @@ async def async_setup_entry(
                         err,
                     )
 
-        if image_url:
-            entities.append(UconnectVehicleImage(coordinator, vehicle, hass, image_url))
+        if image_url or was_added(hass, "image", vehicle.vin, "image"):
+            entities.append(
+                UconnectVehicleImage(coordinator, vehicle, hass, image_url or "")
+            )
 
     async_add_entities(entities)
 

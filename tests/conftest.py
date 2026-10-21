@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 import sys
@@ -18,7 +19,12 @@ from custom_components.uconnect.const import (
     CONF_DISABLE_TLS_VERIFICATION,
     DOMAIN,
 )
-from custom_components.uconnect.pyuconnect.client import Vehicle, _update_vehicle
+from custom_components.uconnect.pyuconnect.brands import FIAT_EU
+from custom_components.uconnect.pyuconnect.client import (
+    Client,
+    Vehicle,
+    _update_vehicle,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 VIN = "ZFAEFAC39MX000001"
@@ -63,6 +69,7 @@ def make_vehicle() -> Vehicle:
         "DEEPREFRESH",
         "VF",
     ]
+    vehicle.enabled_services = [*vehicle.supported_commands, "CPPLUS"]
     _update_vehicle(vehicle, load_fixture("status_500e.json"))
     return vehicle
 
@@ -73,7 +80,13 @@ def vehicle() -> Vehicle:
 
 
 @pytest.fixture
-def mock_client(vehicle):
+def cloud_status() -> dict:
+    """The status the mocked cloud answers with, tests may change it."""
+    return load_fixture("status_500e.json")
+
+
+@pytest.fixture
+def mock_client(vehicle, cloud_status):
     """Patch the API client used by the coordinator."""
     client = MagicMock()
     client.api.sess = requests.Session()
@@ -86,6 +99,14 @@ def mock_client(vehicle):
     client.get_vehicle_image.return_value = {}
     client.command_verify.return_value = True
     client.set_charge_schedule_emea.return_value = True
+
+    # Schedule changes are planned by the real library code, against what the
+    # mocked cloud answers right then
+    planner = Client("user@example.com", "pw", "1234", FIAT_EU)
+    planner.api = MagicMock()
+    planner.api.get_vehicle.side_effect = lambda vin: copy.deepcopy(cloud_status)
+    client.plan_charge_schedule_emea.side_effect = planner.plan_charge_schedule_emea
+    client.send_charge_schedules_emea.return_value = True
     with patch(
         "custom_components.uconnect.coordinator.Client", return_value=client
     ):

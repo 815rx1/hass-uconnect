@@ -35,6 +35,8 @@ from .const import (
     CONF_CHARGING_REFRESH_INTERVAL,
     CONF_DISABLE_TLS_VERIFICATION,
     CONF_ADD_COMMAND_ENTITIES,
+    CONF_UNLOCK_REQUIRES_PIN,
+    DEFAULT_UNLOCK_REQUIRES_PIN,
     DEFAULT_CHARGING_REFRESH_INTERVAL,
     DEFAULT_SCAN_INTERVAL,
     DEFAULT_PIN,
@@ -84,6 +86,9 @@ OPTIONS_SCHEMA = vol.Schema(
             default=DEFAULT_CHARGING_REFRESH_INTERVAL,
         ): vol.All(vol.Coerce(int), vol.Range(min=0, max=1440)),
         vol.Required(CONF_ADD_COMMAND_ENTITIES): bool,
+        vol.Required(
+            CONF_UNLOCK_REQUIRES_PIN, default=DEFAULT_UNLOCK_REQUIRES_PIN
+        ): bool,
     }
 )
 
@@ -148,7 +153,19 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if user_input is None:
             return self.async_show_form(data_schema=STEP_USER_DATA_SCHEMA)
 
+        user_input = {**user_input, CONF_USERNAME: user_input[CONF_USERNAME].strip()}
         errors = {}
+
+        # The unique id is derived from the username as typed, so the same
+        # account in other letter case would get a second entry polling and
+        # commanding the same vehicles
+        account = user_input[CONF_USERNAME].casefold()
+        for entry in self._async_current_entries(include_ignore=False):
+            if (
+                entry.data.get(CONF_BRAND_REGION) == user_input[CONF_BRAND_REGION]
+                and str(entry.data.get(CONF_USERNAME, "")).strip().casefold() == account
+            ):
+                return self.async_abort(reason="already_configured")
 
         try:
             await validate_input(self.hass, user_input)
@@ -210,7 +227,9 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 _LOGGER.exception("Unexpected exception")
                 errors["base"] = "unknown"
             else:
-                return self.async_update_reload_and_abort(entry, data=data)
+                return self.async_update_reload_and_abort(
+                    entry, data=data, options=_options_with_pin(entry, user_input)
+                )
 
         return self.async_show_form(
             step_id="reauth_confirm",
@@ -251,7 +270,9 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 _LOGGER.exception("Unexpected exception")
                 errors["base"] = "unknown"
             else:
-                return self.async_update_reload_and_abort(entry, data=data)
+                return self.async_update_reload_and_abort(
+                    entry, data=data, options=_options_with_pin(entry, user_input)
+                )
 
         return self.async_show_form(
             step_id="reconfigure",
@@ -266,6 +287,18 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             description_placeholders={"username": entry.data.get(CONF_USERNAME, "")},
             errors=errors,
         )
+
+
+def _options_with_pin(entry: ConfigEntry, user_input: dict[str, Any]) -> dict[str, Any]:
+    """Return the options with a newly entered PIN.
+
+    A PIN set in the options wins over the one in the entry data, so a new PIN
+    given here would otherwise have no effect.
+    """
+    options = dict(entry.options)
+    if user_input.get(CONF_PIN) and options.get(CONF_PIN):
+        options[CONF_PIN] = user_input[CONF_PIN]
+    return options
 
 
 class InvalidAuth(HomeAssistantError):

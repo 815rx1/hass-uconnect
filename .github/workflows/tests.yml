@@ -7,17 +7,33 @@ on:
 
 jobs:
   pytest:
+    name: pytest (${{ matrix.name }})
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: current Home Assistant
+            python: "3.14"
+            install: "-r requirements_test.txt"
+          # The oldest version hacs.json allows, so code that needs anything
+          # newer is caught
+          - name: Home Assistant 2024.12, Python 3.12
+            python: "3.12"
+            install: 'pytest-homeassistant-custom-component==0.13.190 "requests-auth-aws-sigv4>=0.7" "dataclasses-json>=0.6.7"'
+          - name: Home Assistant 2024.12, Python 3.13
+            python: "3.13"
+            install: 'pytest-homeassistant-custom-component==0.13.190 "requests-auth-aws-sigv4>=0.7" "dataclasses-json>=0.6.7"'
 
     steps:
       - uses: actions/checkout@v6
 
       - uses: actions/setup-python@v6
         with:
-          python-version: "3.14"
+          python-version: ${{ matrix.python }}
 
       - name: Install dependencies
-        run: pip install -r requirements_test.txt
+        run: pip install ${{ matrix.install }}
 
       - name: Run tests
         run: python -m pytest -q

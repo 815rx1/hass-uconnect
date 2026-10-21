@@ -28,6 +28,7 @@ CONF_BRAND_REGION: str = "brand_region"
 CONF_DISABLE_TLS_VERIFICATION: str = "disable_tls_verification"
 CONF_ADD_COMMAND_ENTITIES: str = "add_command_entities"
 CONF_CHARGING_REFRESH_INTERVAL: str = "charging_refresh_interval"
+CONF_UNLOCK_REQUIRES_PIN: str = "unlock_requires_pin"
 
 BRANDS = {
     1: FIAT_EU.name,
@@ -53,6 +54,13 @@ DEFAULT_PIN: str = ""
 DEFAULT_SCAN_INTERVAL: int = 5
 DEFAULT_CHARGING_REFRESH_INTERVAL: int = 30
 MIN_CHARGING_REFRESH_INTERVAL: int = 15
+
+# Unlocking asks for the Uconnect PIN as its code unless turned off
+DEFAULT_UNLOCK_REQUIRES_PIN: bool = True
+UNLOCK_COMMANDS: frozenset[str] = frozenset({"RDU", "ROTRUNKUNLOCK", "ROLIFTGATEUNLOCK"})
+# Wrong codes in a row after which unlocking is refused for a while
+UNLOCK_MAX_WRONG_CODES: int = 5
+UNLOCK_LOCKOUT: timedelta = timedelta(minutes=5)
 
 # Failed polls in a row after which entities turn unavailable
 MAX_CONSECUTIVE_FAILURES: int = 3

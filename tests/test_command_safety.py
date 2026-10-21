@@ -1,0 +1,348 @@
+"""Tests that the vehicle is only unlocked or commanded on purpose."""
+
+from __future__ import annotations
+
+import dataclasses
+
+import pytest
+from homeassistant.const import EntityCategory
+from homeassistant.exceptions import ServiceValidationError
+from homeassistant.helpers import area_registry as ar
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
+from homeassistant.setup import async_setup_component
+from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+from custom_components.uconnect.const import CONF_UNLOCK_REQUIRES_PIN, DOMAIN
+from custom_components.uconnect.lock import doors_locked
+from custom_components.uconnect.pyuconnect.command import COMMAND_DOORS_LOCK
+
+from .conftest import VIN
+
+PIN = "1234"
+
+
+def sent(mock_client) -> list[str]:
+    return [call.args[1].name for call in mock_client.command_verify.call_args_list]
+
+
+def entity_id(hass, platform: str, key: str) -> str | None:
+    return er.async_get(hass).async_get_entity_id(platform, DOMAIN, f"{DOMAIN}_{VIN}_{key}")
+
+
+async def setup(hass, config_entry, **options) -> None:
+    config_entry.add_to_hass(hass)
+    if options:
+        hass.config_entries.async_update_entry(
+            config_entry, options={**config_entry.options, **options}
+        )
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+
+# --- Unlocking needs the PIN --------------------------------------------
+
+
+async def test_unlock_without_code_is_refused(hass, config_entry, mock_client):
+    await setup(hass, config_entry)
+    lock = entity_id(hass, "lock", "lock_doors")
+    assert hass.states.get(lock).attributes["code_format"] == r"^\d*$"
+
+    with pytest.raises(ServiceValidationError):
+        await hass.services.async_call("lock", "unlock", {"entity_id": lock}, blocking=True)
+    assert "RDU" not in sent(mock_client)
+
+
+async def test_unlock_with_the_pin(hass, config_entry, mock_client):
+    await setup(hass, config_entry)
+    lock = entity_id(hass, "lock", "lock_doors")
+    await hass.services.async_call(
+        "lock", "unlock", {"entity_id": lock, "code": PIN}, blocking=True
+    )
+    assert sent(mock_client) == ["RDU"]
+
+
+async def test_lock_needs_no_code(hass, config_entry, mock_client):
+    await setup(hass, config_entry)
+    lock = entity_id(hass, "lock", "lock_doors")
+    await hass.services.async_call("lock", "lock", {"entity_id": lock}, blocking=True)
+    assert sent(mock_client) == ["RDL"]
+
+
+async def test_wrong_codes_pause_unlocking(hass, config_entry, mock_client):
+    await setup(hass, config_entry)
+    lock = entity_id(hass, "lock", "lock_doors")
+    for _ in range(5):
+        with pytest.raises(ServiceValidationError):
+            await hass.services.async_call(
+                "lock", "unlock", {"entity_id": lock, "code": "0000"}, blocking=True
+            )
+    # Even the right code is refused for a while now
+    with pytest.raises(ServiceValidationError):
+        await hass.services.async_call(
+            "lock", "unlock", {"entity_id": lock, "code": PIN}, blocking=True
+        )
+    assert "RDU" not in sent(mock_client)
+
+
+async def test_unlock_all_locks_leaves_the_car_locked(hass, config_entry, mock_client):
+    # The usual smoke alarm automation
+    await setup(hass, config_entry)
+    with pytest.raises(ServiceValidationError):
+        await hass.services.async_call("lock", "unlock", {"entity_id": "all"}, blocking=True)
+    assert "RDU" not in sent(mock_client)
+
+
+async def test_unlock_action_needs_the_pin(hass, config_entry, mock_client):
+    await setup(hass, config_entry)
+    with pytest.raises(ServiceValidationError):
+        await hass.services.async_call(DOMAIN, "doors_unlock", {}, blocking=True)
+    assert sent(mock_client) == []
+
+    await hass.services.async_call(DOMAIN, "doors_unlock", {"code": PIN}, blocking=True)
+    assert sent(mock_client) == ["RDU"]
+
+
+async def test_pin_requirement_can_be_turned_off(hass, config_entry, mock_client):
+    await setup(hass, config_entry, **{CONF_UNLOCK_REQUIRES_PIN: False})
+    lock = entity_id(hass, "lock", "lock_doors")
+    assert "code_format" not in hass.states.get(lock).attributes
+
+    await hass.services.async_call("lock", "unlock", {"entity_id": lock}, blocking=True)
+    assert sent(mock_client) == ["RDU"]
+
+
+async def test_changing_the_pin_option_reloads(hass, config_entry, mock_client):
+    await setup(hass, config_entry)
+    lock = entity_id(hass, "lock", "lock_doors")
+    hass.config_entries.async_update_entry(
+        config_entry,
+        options={**config_entry.options, CONF_UNLOCK_REQUIRES_PIN: False},
+    )
+    await hass.async_block_till_done()
+    assert "code_format" not in hass.states.get(lock).attributes
+
+
+# --- Trunk and doors ----------------------------------------------------
+
+
+async def test_trunk_is_a_lock_not_a_switch(hass, config_entry, mock_client, vehicle):
+    vehicle.supported_commands += ["ROTRUNKLOCK", "ROTRUNKUNLOCK"]
+    vehicle.trunk_locked = True
+    await setup(hass, config_entry)
+
+    assert entity_id(hass, "switch", "switch_trunk") is None
+    trunk = entity_id(hass, "lock", "lock_trunk")
+    assert hass.states.get(trunk).state == "locked"
+
+    # Turning off every switch does not open it
+    await hass.services.async_call("switch", "turn_off", {"entity_id": "all"}, blocking=True)
+    assert "ROTRUNKUNLOCK" not in sent(mock_client)
+
+    await hass.services.async_call(
+        "lock", "unlock", {"entity_id": trunk, "code": PIN}, blocking=True
+    )
+    assert sent(mock_client)[-1] == "ROTRUNKUNLOCK"
+
+
+def test_doors_locked_looks_at_every_door(vehicle):
+    vehicle.door_driver_locked = True
+    vehicle.door_passenger_locked = False
+    vehicle.door_rear_left_locked = None
+    vehicle.door_rear_right_locked = None
+    assert doors_locked(vehicle) is False
+
+    vehicle.door_passenger_locked = True
+    assert doors_locked(vehicle) is True
+
+    for attr in ("door_driver_locked", "door_passenger_locked"):
+        setattr(vehicle, attr, None)
+    assert doors_locked(vehicle) is None
+
+
+# --- Bulk actions do not reach the commands -----------------------------
+
+
+async def test_area_actions_do_not_command_the_vehicle(
+    hass, config_entry, mock_client, vehicle
+):
+    vehicle.supported_commands += ["REON", "REOFF", "ROHVACON", "ROHVACOFF"]
+    assert await async_setup_component(hass, "homeassistant", {})
+    await setup(hass, config_entry)
+    area = ar.async_get(hass).async_create("Garage")
+    devices = dr.async_get(hass)
+    device = dr.async_entries_for_config_entry(devices, config_entry.entry_id)[0]
+    devices.async_update_device(device.id, area_id=area.id)
+
+    for domain, service in (
+        ("homeassistant", "turn_off"),
+        ("homeassistant", "turn_on"),
+        ("switch", "turn_off"),
+        ("switch", "turn_on"),
+    ):
+        await hass.services.async_call(
+            domain, service, {"area_id": area.id}, blocking=True
+        )
+        await hass.services.async_call(
+            domain, service, {"device_id": device.id}, blocking=True
+        )
+
+    # The lock is reached by area, but its unlock needs the PIN
+    for target in ({"area_id": area.id}, {"device_id": device.id}):
+        with pytest.raises(ServiceValidationError):
+            await hass.services.async_call("lock", "unlock", target, blocking=True)
+
+    assert sent(mock_client) == []
+    mock_client.send_charge_schedules_emea.assert_not_called()
+
+
+async def test_turning_off_disabled_schedules_sends_nothing(
+    hass, config_entry, mock_client
+):
+    await setup(hass, config_entry)
+    for slot in (2, 3):
+        await hass.services.async_call(
+            "switch",
+            "turn_off",
+            {"entity_id": entity_id(hass, "switch", f"charge_schedule_{slot}")},
+            blocking=True,
+        )
+    mock_client.send_charge_schedules_emea.assert_not_called()
+
+
+async def test_known_state_is_not_sent_again(hass, config_entry, mock_client, vehicle):
+    vehicle.supported_commands += ["REON", "REOFF", "CNOW"]
+    vehicle.ignition_on = True
+    vehicle.charging = True
+    await setup(hass, config_entry)
+
+    for key in ("switch_engine", "switch_charging"):
+        await hass.services.async_call(
+            "switch", "turn_on", {"entity_id": entity_id(hass, "switch", key)}, blocking=True
+        )
+    assert sent(mock_client) == []
+
+    # Turning off is always sent, an out of date state must not keep an
+    # engine running
+    await hass.services.async_call(
+        "switch",
+        "turn_off",
+        {"entity_id": entity_id(hass, "switch", "switch_engine")},
+        blocking=True,
+    )
+    assert sent(mock_client) == ["REOFF"]
+
+
+async def test_entity_categories(hass, config_entry, mock_client, vehicle):
+    vehicle.supported_commands += ["ROLIGHTS", "CNOW"]
+    await setup(hass, config_entry)
+    registry = er.async_get(hass)
+
+    def category(platform, key):
+        return registry.async_get(entity_id(hass, platform, key)).entity_category
+
+    assert category("switch", "switch_precondition") is EntityCategory.CONFIG
+    assert category("switch", "charge_schedule_1") is EntityCategory.CONFIG
+    assert category("time", "charge_schedule_1_start_time") is EntityCategory.CONFIG
+    assert category("select", "charging_level_preference") is EntityCategory.CONFIG
+    assert category("button", "button_deep_refresh") is EntityCategory.DIAGNOSTIC
+    assert category("button", "reset_battery_learning") is EntityCategory.CONFIG
+    # What a person reaches for stays a primary control
+    assert category("lock", "lock_doors") is None
+    assert category("button", "button_lights") is None
+    assert category("button", "button_charge") is None
+
+
+async def test_switches_are_taken_out_of_voice_assistants_once(
+    hass, config_entry, mock_client
+):
+    from homeassistant.components.homeassistant.exposed_entities import (
+        async_expose_entity,
+        async_should_expose,
+    )
+
+    assert await async_setup_component(hass, "homeassistant", {})
+    # A switch the previous version created and Assist exposed
+    config_entry.add_to_hass(hass)
+    registry = er.async_get(hass)
+    switch = registry.async_get_or_create(
+        "switch",
+        DOMAIN,
+        f"{DOMAIN}_{VIN}_switch_precondition",
+        config_entry=config_entry,
+    ).entity_id
+    async_expose_entity(hass, "conversation", switch, True)
+
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+    assert async_should_expose(hass, "conversation", switch) is False
+
+    # Exposed again on purpose, a reload does not undo that
+    async_expose_entity(hass, "conversation", switch, True)
+    assert await hass.config_entries.async_reload(config_entry.entry_id)
+    await hass.async_block_till_done()
+    assert async_should_expose(hass, "conversation", switch) is True
+
+
+# --- The right vehicle --------------------------------------------------
+
+
+async def test_action_without_device_with_two_known_vehicles(
+    hass, config_entry, mock_client
+):
+    await setup(hass, config_entry)
+    # A second account, not loaded right now, with its own car
+    other = MockConfigEntry(domain=DOMAIN, unique_id="other", data={}, options={})
+    other.add_to_hass(hass)
+    dr.async_get(hass).async_get_or_create(
+        config_entry_id=other.entry_id, identifiers={(DOMAIN, "ZFAOTHERCAR0000001")}
+    )
+
+    with pytest.raises(ServiceValidationError, match="more than one"):
+        await hass.services.async_call(DOMAIN, "doors_lock", {}, blocking=True)
+    assert sent(mock_client) == []
+
+    # Naming the vehicle works
+    device = dr.async_entries_for_config_entry(dr.async_get(hass), config_entry.entry_id)[0]
+    await hass.services.async_call(
+        DOMAIN, "doors_lock", {"device_id": device.id}, blocking=True
+    )
+    assert sent(mock_client) == ["RDL"]
+
+
+async def test_vehicle_missing_from_the_update_is_not_replaced(
+    hass, config_entry, mock_client, vehicle
+):
+    await setup(hass, config_entry)
+    # The car is briefly not reported: an action must not go elsewhere or
+    # pretend to work
+    mock_client.vehicles.clear()
+    with pytest.raises(ServiceValidationError, match="not available"):
+        await hass.services.async_call(DOMAIN, "doors_lock", {}, blocking=True)
+    assert sent(mock_client) == []
+
+
+# --- Repeats and loops --------------------------------------------------
+
+
+async def test_repeated_lock_right_after_confirmation(hass, config_entry, mock_client):
+    await setup(hass, config_entry)
+    await hass.services.async_call(DOMAIN, "doors_lock", {}, blocking=True)
+    with pytest.raises(ServiceValidationError):
+        await hass.services.async_call(DOMAIN, "doors_lock", {}, blocking=True)
+    assert sent(mock_client) == ["RDL"]
+
+
+async def test_unconfirmed_lock_can_be_retried(hass, config_entry, mock_client):
+    await setup(hass, config_entry)
+    mock_client.command_verify.return_value = False
+    with pytest.raises(Exception):
+        await hass.services.async_call(DOMAIN, "doors_lock", {}, blocking=True)
+    mock_client.command_verify.return_value = True
+    await hass.services.async_call(DOMAIN, "doors_lock", {}, blocking=True)
+    assert sent(mock_client) == ["RDL", "RDL"]
+
+
+def test_commands_cannot_be_changed():
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        COMMAND_DOORS_LOCK.name = "RDU"

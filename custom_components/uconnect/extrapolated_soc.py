@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
@@ -31,6 +31,7 @@ from .pyuconnect.command import COMMAND_DEEP_REFRESH
 
 from .const import DOMAIN
 from .coordinator import UconnectDataUpdateCoordinator, UconnectRequestError
+from .wake_guard import AUTO_REFRESH_MAX_FAILURES, Decision, async_get_wake_guard
 from .entity import UconnectEntity
 
 _LOGGER = logging.getLogger(__name__)
@@ -54,25 +55,17 @@ MAX_IDLE_DRAIN_RATE = 0.04  # Maximum drain rate (0.04%/hour ≈ 1%/day)
 MIN_IDLE_TIME_FOR_LEARNING_HOURS = 1.0  # Minimum 1 hour idle for learning drain rate
 IDLE_DRAIN_EMA_ALPHA = 0.2  # Slower learning for drain rate (less frequent data points)
 
-# Constants for deep refresh scheduling
+# Constants for deep refresh scheduling. The limits on how often the vehicle
+# may be woken are kept per vehicle in wake_guard, this only schedules.
 # The vehicle settles on a time-to-full for the connected charger only a
 # couple of minutes after being plugged in
 CHARGE_START_REFRESH_DELAY = timedelta(minutes=3)
-# A command the vehicle never answers ties up the status poll for a minute and
-# some thirty requests, so stop trying once it is clearly not listening
-MAX_DEEP_REFRESH_FAILURES = 3
-# Every deep refresh wakes the vehicle. These limits hold however the refresh
-# was scheduled, also across Home Assistant restarts, which used to fire a
-# new one each time while charging: no two closer together than this
-MIN_DEEP_REFRESH_SPACING = timedelta(minutes=15)
-# and no more than this many within any 24 hours, which still covers twelve
-# hours of slow charging at the default interval
-MAX_DEEP_REFRESHES_PER_DAY = 24
-DEEP_REFRESH_WINDOW = timedelta(hours=24)
-# A charge that has finished, or stalled, while the cloud still reports it as
-# charging shows no gain in state of charge. After this many deep refreshes
-# in a row without one, the vehicle is not woken again until the next session
-MAX_DEEP_REFRESHES_WITHOUT_PROGRESS = 3
+# When the conditions for a refresh do not hold, they are looked at again
+# after this long, which costs no request
+DEEP_REFRESH_RECHECK = timedelta(minutes=15)
+# Charge data the vehicle uploaded longer ago than this is not taken as proof
+# that it is still charging
+EV_DATA_MAX_AGE = timedelta(hours=12)
 
 
 @dataclass
@@ -94,14 +87,6 @@ class SocEstimationState:
     idle_drain_rate_pct_per_hour: float = DEFAULT_IDLE_DRAIN_RATE
     learned_correction_factor: float = DEFAULT_CORRECTION_FACTOR
     target_soc: float = 100.0
-    last_deep_refresh: datetime | None = None  # When the vehicle was last woken
-    deep_refreshes_this_session: int = 0
-    # Wake-ups within the last 24 hours, for the daily limit
-    deep_refresh_times: list[datetime] = field(default_factory=list)
-    # State of charge after the last deep refresh, and how many refreshes in
-    # a row it did not rise
-    soc_at_last_deep_refresh: float | None = None
-    deep_refreshes_without_progress: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         """Convert state to dictionary for storage."""
@@ -123,13 +108,6 @@ class SocEstimationState:
             "idle_drain_rate_pct_per_hour": self.idle_drain_rate_pct_per_hour,
             "learned_correction_factor": self.learned_correction_factor,
             "target_soc": self.target_soc,
-            "last_deep_refresh": (
-                self.last_deep_refresh.isoformat() if self.last_deep_refresh else None
-            ),
-            "deep_refreshes_this_session": self.deep_refreshes_this_session,
-            "deep_refresh_times": [t.isoformat() for t in self.deep_refresh_times],
-            "soc_at_last_deep_refresh": self.soc_at_last_deep_refresh,
-            "deep_refreshes_without_progress": self.deep_refreshes_without_progress,
         }
 
     @classmethod
@@ -222,29 +200,24 @@ class SocEstimationState:
             idle_drain_rate_pct_per_hour=float(drain_rate),
             learned_correction_factor=float(correction),
             target_soc=float(target_soc),
-            last_deep_refresh=_parse_aware_datetime(data.get("last_deep_refresh")),
-            deep_refreshes_this_session=_parse_count(
-                data.get("deep_refreshes_this_session")
-            ),
-            deep_refresh_times=[
-                t
-                for t in map(_parse_aware_datetime, data.get("deep_refresh_times") or [])
-                if t is not None
-            ][-MAX_DEEP_REFRESHES_PER_DAY:],
-            soc_at_last_deep_refresh=(
-                float(soc)
-                if isinstance(soc := data.get("soc_at_last_deep_refresh"), (int, float))
-                else None
-            ),
-            deep_refreshes_without_progress=_parse_count(
-                data.get("deep_refreshes_without_progress")
-            ),
         )
 
 
-def _parse_count(value: Any) -> int:
-    """Parse a non-negative counter, ignoring anything unusable."""
-    return value if isinstance(value, int) and value >= 0 else 0
+def legacy_wake_times(data: Any) -> list[datetime]:
+    """Return the wake-ups that versions 0.6.0b3 to b6 kept in the state.
+
+    They are handed to the wake guard once, so its limits know about them.
+    """
+    if not isinstance(data, dict):
+        return []
+    times = [
+        t
+        for t in map(_parse_aware_datetime, data.get("deep_refresh_times") or [])
+        if t is not None
+    ]
+    if not times and (last := _parse_aware_datetime(data.get("last_deep_refresh"))):
+        times = [last]
+    return sorted(times)
 
 
 def _parse_aware_datetime(value: Any) -> datetime | None:
@@ -356,7 +329,6 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
         self._state = SocEstimationState()
         self._unsub_timer: Callable[[], None] | None = None
         self._unsub_deep_refresh: Callable[[], None] | None = None
-        self._deep_refresh_failures: int = 0
 
     async def async_added_to_hass(self) -> None:
         """Restore state when added to hass."""
@@ -381,27 +353,24 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
                     )
                 except (KeyError, TypeError, ValueError) as err:
                     _LOGGER.warning("Failed to restore SOC estimation state: %s", err)
+                async_get_wake_guard(self.hass).import_legacy(
+                    self._vin,
+                    legacy_wake_times(last_state.attributes["estimation_state"]),
+                    self._state.is_charging,
+                )
 
         # Initialize with current vehicle state
         self._update_from_vehicle()
 
-        # Resume the deep refresh schedule when Home Assistant restarts during
-        # a charge, the charging state carries over so no transition is seen.
-        # With the recurring refresh disabled only the one at the start of the
-        # session is wanted, so a restart after it must not add another.
-        if self._state.is_charging and (
-            self.coordinator.charging_refresh_interval
-            or self._state.deep_refreshes_this_session == 0
-        ):
-            # Pick the schedule up where it left off, a restart must not move
-            # the next wake-up forward
-            delay = CHARGE_START_REFRESH_DELAY
-            last = self._state.last_deep_refresh
-            interval = self.coordinator.charging_refresh_interval
-            if last is not None and interval:
-                due = last + timedelta(minutes=interval)
-                delay = max(delay, due - datetime.now(timezone.utc))
-            self._schedule_deep_refresh(delay)
+        # The charging state carries over a restart, so no transition is seen.
+        # The session is picked up from the wake guard, which also keeps the
+        # schedule: the refresh below only fires when the guard says it is due.
+        guard = async_get_wake_guard(self.hass)
+        if self._state.is_charging:
+            guard.charging_started(self._vin)
+            self._schedule_deep_refresh(CHARGE_START_REFRESH_DELAY)
+        elif getattr(self.vehicle, "charging", None) is False:
+            guard.charging_stopped(self._vin)
 
         # Set up periodic timer for extrapolation updates
         self._unsub_timer = async_track_time_interval(
@@ -448,19 +417,26 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
             self.async_write_ha_state()
 
     async def _async_do_deep_refresh(self) -> None:
-        """Ask the vehicle to push fresh data."""
+        """Ask the vehicle to push fresh data.
+
+        The wake guard has recorded the refresh already and the record is
+        written to disk before the command goes out, so a crash right after
+        cannot make the next start forget it.
+        """
+        guard = async_get_wake_guard(self.hass)
+        await guard.async_flush()
         _LOGGER.info("Triggering deep refresh for %s", self._vin)
         try:
-            await self.coordinator.async_command(self._vin, COMMAND_DEEP_REFRESH)
-            self._deep_refresh_failures = 0
-            self._track_deep_refresh_progress()
+            await self.coordinator.async_command(
+                self._vin, COMMAND_DEEP_REFRESH, automatic=True
+            )
         except Exception as err:
-            self._deep_refresh_failures += 1
+            failures = guard.auto_refresh_failed(self._vin)
             _LOGGER.warning(
                 "Deep refresh failed for %s (%d/%d): %s",
                 self._vin,
-                self._deep_refresh_failures,
-                MAX_DEEP_REFRESH_FAILURES,
+                failures,
+                AUTO_REFRESH_MAX_FAILURES,
                 err,
             )
             # A refusal is still an answer, and a command the vehicle
@@ -472,19 +448,13 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
                 err, UconnectRequestError
             ):
                 await self.coordinator.async_request_refresh()
-
-    @callback
-    def _track_deep_refresh_progress(self) -> None:
-        """Count deep refreshes in a row that brought no gain in charge."""
-        soc = getattr(self.vehicle, "state_of_charge", None)
-        if soc is None:
-            return
-        previous = self._state.soc_at_last_deep_refresh
-        if previous is not None and soc <= previous:
-            self._state.deep_refreshes_without_progress += 1
         else:
-            self._state.deep_refreshes_without_progress = 0
-        self._state.soc_at_last_deep_refresh = soc
+            vehicle = self.vehicle
+            guard.auto_refresh_done(
+                self._vin,
+                getattr(vehicle, "state_of_charge", None),
+                getattr(vehicle, "timestamp_ev_info", None),
+            )
         self.async_write_ha_state()
 
     def _can_deep_refresh(self) -> bool:
@@ -505,6 +475,41 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
 
         return COMMAND_DEEP_REFRESH.name in vehicle.supported_commands
 
+    def _refresh_blocker(self) -> str | None:
+        """Return why the vehicle must not be woken now, None if it may.
+
+        Judged on what the cloud reports right now, never on the state this
+        sensor carried over: a charge that ended while Home Assistant was down,
+        or a poll that failed, must not lead to a wake-up.
+        """
+        coordinator = self.coordinator
+        if coordinator.auth_failed:
+            return "the login was rejected"
+        # Cached data covers a failed poll or two, but whether the vehicle
+        # still charges is only known from a poll that worked
+        if not coordinator.last_update_success or coordinator.consecutive_failures:
+            return "the last update failed"
+
+        vehicle = coordinator.client.get_vehicles().get(self._vin)
+        if vehicle is None:
+            return "the vehicle is not in the account"
+        if getattr(vehicle, "charging", None) is not True:
+            return "the vehicle is not reported as charging"
+        if getattr(vehicle, "plugged_in", None) is False:
+            return "the vehicle is reported as unplugged"
+
+        soc = getattr(vehicle, "state_of_charge", None)
+        if soc is None:
+            return "the state of charge is unknown"
+        if soc >= 100:
+            return "the battery is full"
+
+        uploaded = getattr(vehicle, "timestamp_ev_info", None)
+        if uploaded is not None and datetime.now(timezone.utc) - uploaded > EV_DATA_MAX_AGE:
+            return "the last charge data from the vehicle is too old"
+
+        return None
+
     @callback
     def _cancel_deep_refresh(self) -> None:
         """Cancel a pending deep refresh."""
@@ -514,7 +519,12 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
 
     @callback
     def _schedule_deep_refresh(self, delay: timedelta) -> None:
-        """Schedule a deep refresh after the given delay."""
+        """Look at a deep refresh after the given delay.
+
+        Firing does not mean waking the vehicle: the conditions are checked
+        against the current data first, then the wake guard decides, and it
+        says how long to wait when it is not yet time.
+        """
 
         if not self._can_deep_refresh():
             return
@@ -524,53 +534,41 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
             self._unsub_deep_refresh = None
             if not self._state.is_charging:
                 return
-            if self._deep_refresh_failures >= MAX_DEEP_REFRESH_FAILURES:
-                _LOGGER.warning(
-                    "Giving up on deep refresh for %s after %d consecutive "
-                    "failures, will try again on the next charging session",
-                    self._vin,
-                    self._deep_refresh_failures,
-                )
+
+            if (blocker := self._refresh_blocker()) is not None:
+                _LOGGER.debug("No deep refresh for %s now: %s", self._vin, blocker)
+                self._schedule_deep_refresh(DEEP_REFRESH_RECHECK)
                 return
-            if (
-                self._state.deep_refreshes_without_progress
-                >= MAX_DEEP_REFRESHES_WITHOUT_PROGRESS
-            ):
-                _LOGGER.info(
-                    "Not waking %s again this session, the state of charge did "
-                    "not rise over the last %d deep refreshes",
-                    self._vin,
-                    self._state.deep_refreshes_without_progress,
-                )
-                return
-            now = datetime.now(timezone.utc)
-            last = self._state.last_deep_refresh
-            if last is not None and now - last < MIN_DEEP_REFRESH_SPACING:
-                # Too soon after the last wake-up: wait until the spacing has
-                # passed instead
-                self._schedule_deep_refresh(MIN_DEEP_REFRESH_SPACING - (now - last))
-                return
-            times = [
-                t for t in self._state.deep_refresh_times if now - t < DEEP_REFRESH_WINDOW
-            ]
-            self._state.deep_refresh_times = times
-            if len(times) >= MAX_DEEP_REFRESHES_PER_DAY:
-                _LOGGER.info(
-                    "Not waking %s, %d deep refreshes in the last 24 hours already",
-                    self._vin,
-                    len(times),
-                )
-                # Try again once the oldest one has left the window
-                self._schedule_deep_refresh(times[0] + DEEP_REFRESH_WINDOW - now)
-                return
-            self._state.last_deep_refresh = now
-            self._state.deep_refreshes_this_session += 1
-            self._state.deep_refresh_times.append(now)
-            # Persist the wake-up right away, a restart must not forget it
-            self.async_write_ha_state()
+
             interval = self.coordinator.charging_refresh_interval
-            if interval:
-                self._schedule_deep_refresh(timedelta(minutes=interval))
+            decision = async_get_wake_guard(self.hass).begin_auto_refresh(
+                self._vin,
+                COMMAND_DEEP_REFRESH.name,
+                timedelta(minutes=interval) if interval else None,
+            )
+
+            if decision.decision is Decision.WAIT:
+                _LOGGER.debug(
+                    "Deep refresh for %s in %s: %s",
+                    self._vin,
+                    decision.wait,
+                    decision.reason,
+                )
+                self._schedule_deep_refresh(decision.wait)
+                return
+
+            if decision.decision is Decision.SESSION_DONE:
+                _LOGGER.info(
+                    "No more deep refreshes for %s this charge: %s",
+                    self._vin,
+                    decision.reason,
+                )
+                self.async_write_ha_state()
+                return
+
+            # Looked at again once the interval has passed, the guard makes
+            # sure it is not earlier
+            self._schedule_deep_refresh(timedelta(minutes=interval))
             # Tied to the config entry so an unload cancels a refresh in flight
             self.coordinator.config_entry.async_create_background_task(
                 self.hass,
@@ -582,27 +580,23 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
         self._unsub_deep_refresh = async_call_later(self.hass, delay, _fire)
 
     @callback
-    def resume_deep_refresh(self) -> None:
-        """Pick the deep refresh back up after the options changed.
+    def resume_deep_refresh(self, pin_changed: bool = False) -> None:
+        """Pick the deep refresh up again after the options changed.
 
-        The schedule keeps itself alive from one refresh to the next, so a
-        charge that started with the interval disabled, or without a PIN to
-        authenticate the command, has nothing left to re-arm it and would
-        otherwise wait for the next session.
+        Turning it off cancels the pending one. Turning it on, or a new PIN,
+        which is what failing refreshes usually failed over, schedules the
+        next look, the guard keeps it from coming too early.
         """
 
-        if (
-            self._state.is_charging
-            and self._unsub_deep_refresh is None
-            and self.coordinator.charging_refresh_interval
-        ):
-            # The options may be what the refreshes were failing over, a PIN
-            # the vehicle rejected being the obvious one, so the count of
-            # earlier failures should not bar the retry
-            self._deep_refresh_failures = 0
-            self._schedule_deep_refresh(
-                timedelta(minutes=self.coordinator.charging_refresh_interval)
-            )
+        if pin_changed:
+            async_get_wake_guard(self.hass).reset_failures(self._vin)
+
+        if not self.coordinator.charging_refresh_interval:
+            self._cancel_deep_refresh()
+            return
+
+        if self._state.is_charging and self._unsub_deep_refresh is None:
+            self._schedule_deep_refresh(CHARGE_START_REFRESH_DELAY)
 
     @callback
     def _handle_coordinator_update(self) -> None:
@@ -613,7 +607,15 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
     def _update_from_vehicle(self) -> None:
         """Update estimation state from vehicle data."""
         current_soc = getattr(self.vehicle, "state_of_charge", None)
-        is_charging = getattr(self.vehicle, "charging", False) or False
+        # A status without the charging flag says nothing about it, and
+        # reading that as "not charging" would end and restart the session
+        # each time the flag goes missing
+        reported_charging = getattr(self.vehicle, "charging", None)
+        is_charging = (
+            self._state.is_charging
+            if reported_charging is None
+            else bool(reported_charging)
+        )
         ignition_on = getattr(self.vehicle, "ignition_on", False) or False
         time_to_full = vehicle_time_to_full(self.vehicle)
 
@@ -821,14 +823,16 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
         # has settled on a time-to-full for the connected charger. Refreshing
         # at the very moment the charging flag appears returns the estimate
         # the vehicle held before the charger was negotiated
-        if self._state.is_charging and not was_charging:
-            self._deep_refresh_failures = 0
-            self._state.deep_refreshes_this_session = 0
-            self._state.deep_refreshes_without_progress = 0
-            self._state.soc_at_last_deep_refresh = None
-            self._schedule_deep_refresh(CHARGE_START_REFRESH_DELAY)
-        elif was_charging and not self._state.is_charging:
-            self._cancel_deep_refresh()
+        # The wake guard decides whether this is a new charging session or the
+        # same one resuming after a short break
+        if self.hass is not None:
+            guard = async_get_wake_guard(self.hass)
+            if self._state.is_charging and not was_charging:
+                guard.charging_started(self._vin)
+                self._schedule_deep_refresh(CHARGE_START_REFRESH_DELAY)
+            elif was_charging and not self._state.is_charging:
+                guard.charging_stopped(self._vin)
+                self._cancel_deep_refresh()
 
     def _learn_correction_factor(
         self,
@@ -1063,18 +1067,17 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
             ),
             "correction_factor": round(self._state.learned_correction_factor, 2),
             "target_soc": self._state.target_soc,
-            "last_deep_refresh": (
-                self._state.last_deep_refresh.isoformat()
-                if self._state.last_deep_refresh
-                else None
-            ),
-            "deep_refreshes_this_session": self._state.deep_refreshes_this_session,
-            "deep_refreshes_last_24h": sum(
-                1
-                for t in self._state.deep_refresh_times
-                if datetime.now(timezone.utc) - t < DEEP_REFRESH_WINDOW
-            ),
         }
+        if self.hass is not None:
+            guard = async_get_wake_guard(self.hass)
+            last = guard.last_auto_refresh(self._vin)
+            session = guard.session(self._vin)
+            attrs |= {
+                "last_deep_refresh": last.isoformat() if last else None,
+                "deep_refreshes_this_session": session.auto_refreshes,
+                "deep_refreshes_last_24h": guard.auto_refreshes_last_day(self._vin),
+                "deep_refreshes_without_progress": session.without_progress,
+            }
         # Include estimation state for restore
         attrs["estimation_state"] = self._state.to_dict()
         return attrs

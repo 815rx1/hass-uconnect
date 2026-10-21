@@ -10,6 +10,7 @@ from homeassistant.const import CONF_PASSWORD, CONF_PIN, CONF_USERNAME
 from homeassistant.core import HomeAssistant
 
 from . import UconnectConfigEntry
+from .wake_guard import async_get_wake_guard
 
 # Keys are redacted wherever they appear, also deep inside the raw payloads
 TO_REDACT = {
@@ -48,7 +49,10 @@ async def async_get_config_entry_diagnostics(
 
     coordinator = entry.runtime_data
     client = coordinator.client
-    last_status: dict[str, dict] = getattr(client, "_last_status", {})
+    last_status = getattr(client, "_last_status", None)
+    if not isinstance(last_status, dict):
+        last_status = {}
+    guard = async_get_wake_guard(hass)
 
     vehicles = []
     for index, (vin, vehicle) in enumerate(client.vehicles.items(), start=1):
@@ -66,6 +70,17 @@ async def async_get_config_entry_diagnostics(
                 "stolen_vehicle_status": async_redact_data(
                     coordinator.svla_data.get(vin, {}), TO_REDACT
                 ),
+                # When and why the vehicle was woken, to check the limits
+                "wake_ups": [
+                    {
+                        "at": w.at.isoformat(),
+                        "command": w.command,
+                        "automatic": w.automatic,
+                        "confirmed": w.confirmed,
+                    }
+                    for w in guard.wakes(vin)
+                ],
+                "charge_session": dataclasses.asdict(guard.session(vin)),
             }
         )
 
@@ -81,6 +96,8 @@ async def async_get_config_entry_diagnostics(
             "update_interval": str(coordinator.update_interval),
             "charging_refresh_interval_min": coordinator.charging_refresh_interval,
             "pin_set": bool(client.api.pin),
+            "auth_failed": coordinator.auth_failed,
+            "unlock_requires_pin": coordinator.unlock_requires_pin,
         },
         "vehicles": vehicles,
     }

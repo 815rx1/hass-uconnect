@@ -124,6 +124,12 @@ DEVICE_SCHEMA = vol.Schema({vol.Optional(ATTR_DEVICE_ID): cv.string})
 
 COMMAND_SCHEMA = DEVICE_SCHEMA
 
+# Unlocking takes the Uconnect PIN as its code, see the coordinator
+UNLOCK_SCHEMA = DEVICE_SCHEMA.extend({vol.Optional("code"): cv.string})
+UNLOCK_SERVICES = frozenset(
+    {SERVICE_DOORS_UNLOCK, SERVICE_TRUNK_UNLOCK, SERVICE_LIFTGATE_UNLOCK}
+)
+
 SET_CHARGE_SCHEDULE_SCHEMA = DEVICE_SCHEMA.extend(
     {vol.Required("schedule"): dict}
 )
@@ -162,7 +168,7 @@ def async_setup_services(hass: HomeAssistant) -> None:
             raise ServiceValidationError(
                 f"Action {call.service} is not supported by vehicle {vin}"
             )
-        await coordinator.async_command(vin, cmd)
+        await coordinator.async_command(vin, cmd, code=call.data.get("code"))
 
     async def async_set_charge_schedule(call: ServiceCall) -> None:
         coordinator, vin = _resolve_target(hass, call)
@@ -198,7 +204,10 @@ def async_setup_services(hass: HomeAssistant) -> None:
 
     for service in SUPPORTED_SERVICES:
         hass.services.async_register(
-            DOMAIN, service, async_call_command, schema=COMMAND_SCHEMA
+            DOMAIN,
+            service,
+            async_call_command,
+            schema=UNLOCK_SCHEMA if service in UNLOCK_SERVICES else COMMAND_SCHEMA,
         )
     hass.services.async_register(
         DOMAIN,
@@ -219,7 +228,11 @@ def _resolve_target(
 ) -> tuple[UconnectDataUpdateCoordinator, str]:
     """Return the coordinator and VIN an action call is meant for.
 
-    Without a device the call is only unambiguous for a single vehicle.
+    Without a device the call is only unambiguous for a single vehicle. The
+    vehicles are counted over every one Home Assistant knows, of entries that
+    are loaded or not, and also one missing from the last update: otherwise a
+    car that is briefly not reported, or an account that failed to load,
+    would make the remaining car the target of an unlock meant for another.
     """
 
     loaded = [
@@ -232,16 +245,36 @@ def _resolve_target(
 
     device_id = call.data.get(ATTR_DEVICE_ID)
     if device_id is None:
-        vehicles = [
-            (entry.runtime_data, vin)
-            for entry in loaded
-            for vin in entry.runtime_data.client.vehicles
-        ]
-        if len(vehicles) != 1:
-            raise ServiceValidationError(
-                "Select the vehicle, the account has more than one"
+        device_registry = dr.async_get(hass)
+        known = {
+            ident
+            for entry in hass.config_entries.async_entries(DOMAIN)
+            for device in dr.async_entries_for_config_entry(
+                device_registry, entry.entry_id
             )
-        return vehicles[0]
+            for domain, ident in device.identifiers
+            if domain == DOMAIN
+        } | {vin for entry in loaded for vin in entry.runtime_data.client.vehicles}
+
+        if not known:
+            raise ServiceValidationError("No Uconnect vehicle is available")
+        if len(known) > 1:
+            raise ServiceValidationError(
+                "There is more than one Uconnect vehicle, select one with device_id"
+            )
+
+        vin = next(iter(known))
+        coordinator = next(
+            (
+                entry.runtime_data
+                for entry in loaded
+                if vin in entry.runtime_data.client.vehicles
+            ),
+            None,
+        )
+        if coordinator is None:
+            raise ServiceValidationError(f"Vehicle {vin} is currently not available")
+        return coordinator, vin
 
     device = dr.async_get(hass).async_get(device_id)
     if device is None:

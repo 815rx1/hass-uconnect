@@ -7,6 +7,7 @@ from homeassistant.helpers.entity import DeviceInfo
 
 from .pyuconnect.client import Vehicle
 
+from .charge_schedule import supports_emea_schedules
 from .const import DOMAIN
 from .coordinator import UconnectDataUpdateCoordinator
 
@@ -29,7 +30,9 @@ def was_added(hass: HomeAssistant, platform: str, vin: str, key: str) -> bool:
 def schedule_slot_count(hass: HomeAssistant, vehicle: Vehicle) -> int:
     """Return how many charge schedule slots to create entities for."""
 
-    reported = len(getattr(vehicle, "charge_schedules", None) or [])
+    reported = (
+        len(vehicle.charge_schedules) if supports_emea_schedules(None, vehicle) else 0
+    )
     registered = sum(
         1
         for slot in range(1, 4)

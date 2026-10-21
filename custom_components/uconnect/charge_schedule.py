@@ -27,13 +27,15 @@ WEEKDAYS: tuple[str, ...] = (
 def supports_emea_schedules(client: Client, vehicle: Vehicle) -> bool:
     """Return whether the vehicle reports inline schedules the client can write.
 
-    Library versions without EMEA schedule support have neither the vehicle
-    attribute nor the client method, so nothing is set up for them.
+    They are written through the CPPLUS service. A vehicle that lists its
+    services without it uses another schedule endpoint, writing there could
+    only fail.
     """
 
-    return bool(getattr(vehicle, "charge_schedules", None)) and hasattr(
-        client, "set_charge_schedule_emea"
-    )
+    if not getattr(vehicle, "charge_schedules", None):
+        return False
+    services = getattr(vehicle, "enabled_services", None) or []
+    return not services or "CPPLUS" in services
 
 
 def parse_time(value: str | None) -> time | None:
