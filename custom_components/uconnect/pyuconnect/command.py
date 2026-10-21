@@ -3,7 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
-@dataclass
+# Frozen: the commands are shared by the whole library, nothing may change
+# what one of them sends
+@dataclass(frozen=True)
 class Command:
     name: str
     url: str = "remote"

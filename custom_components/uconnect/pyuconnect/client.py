@@ -1,8 +1,8 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, replace
 from dataclasses_json import dataclass_json
 from typing import Any, Dict
 from datetime import datetime, timedelta
-from time import sleep
+from time import monotonic, sleep
 import logging
 
 from requests.exceptions import HTTPError, RequestException
@@ -61,6 +61,42 @@ def sg_eq_str(dct: Any, expect: str, *keys: str) -> bool:
         return False
 
     return v.lower() == expect.lower()
+
+
+def sg_str(dct: Any, *keys: str) -> str | None:
+    """Gets a nested value as the string the API sent, without conversion.
+
+    sg converts numeric looking strings, which turns a nickname like "500"
+    into a number.
+    """
+
+    if not isinstance(dct, dict):
+        return None
+
+    for key in keys:
+        if not isinstance(dct, dict) or key not in dct:
+            return None
+        dct = dct[key]
+
+    if not isinstance(dct, str) or dct in ("", "null"):
+        return None
+
+    return dct
+
+
+def sg_state(dct: Any, expect: str, *keys: str) -> bool | None:
+    """Compares a nested state string, treating a missing or NA state as unknown.
+
+    The remote status reports parts a vehicle does not have, like the rear
+    doors of a three door car, as NA. Comparing that to LOCKED would report
+    them as unlocked.
+    """
+
+    v = sg_str(dct, *keys)
+    if v is None or v.upper() == "NA":
+        return None
+
+    return v.upper() == expect.upper()
 
 
 CHARGING_LEVELS = {
@@ -189,6 +225,8 @@ class Vehicle:
     # Status
     ignition_on: bool | None = None
     trunk_locked: bool | None = None
+    liftgate_locked: bool | None = None
+    hvac_on: bool | None = None
 
     odometer: float | None = None
     odometer_unit: str | None = None
@@ -297,11 +335,12 @@ def _update_vehicle(v: Vehicle, p: dict) -> Vehicle:
     v.distance_to_service_unit = sg(
         vi, "distanceToService", "distanceToService", "unit"
     )
-    v.distance_to_empty = sg(batt, "distanceToEmpty", "value") or sg(
-        vi, "fuel", "distanceToEmpty", "value"
+    # A range of 0 is a value, it must not fall through to the fuel range
+    v.distance_to_empty = _first(
+        sg(batt, "distanceToEmpty", "value"), sg(vi, "fuel", "distanceToEmpty", "value")
     )
-    v.distance_to_empty_unit = sg(batt, "distanceToEmpty", "unit") or sg(
-        vi, "fuel", "distanceToEmpty", "unit"
+    v.distance_to_empty_unit = _first(
+        sg(batt, "distanceToEmpty", "unit"), sg(vi, "fuel", "distanceToEmpty", "unit")
     )
     v.range_gas = sg(batt, "gasRange")
     v.range_gas_unit = v.distance_to_empty_unit
@@ -323,7 +362,11 @@ def _update_vehicle(v: Vehicle, p: dict) -> Vehicle:
     # endpoint; we only parse the inline EMEA "schedules" list here.
     sched_raw = sg(ev, "schedules")
     if isinstance(sched_raw, list):
-        v.charge_schedules = [ChargeSchedule.from_api(x) for x in sched_raw]
+        if all(isinstance(x, dict) for x in sched_raw):
+            v.charge_schedules = [ChargeSchedule.from_api(x) for x in sched_raw]
+        else:
+            _LOGGER.debug("Ignoring charge schedules that are not all objects")
+            v.charge_schedules = []
 
     v.time_to_fully_charge_l3 = sg(batt, "timeToFullyChargeL3")
     v.time_to_fully_charge_l2 = sg(batt, "timeToFullyChargeL2")
@@ -337,11 +380,27 @@ def _update_vehicle(v: Vehicle, p: dict) -> Vehicle:
     if v.time_to_fully_charge_l1 is not None and v.time_to_fully_charge_l1 < 0:
         v.time_to_fully_charge_l1 = None
 
-    v.odometer = sg(vi, "odometer", "odometer", "value")
-    v.odometer_unit = sg(vi, "odometer", "odometer", "unit")
+    odometer = sg(vi, "odometer", "odometer", "value")
+    odometer_unit = sg(vi, "odometer", "odometer", "unit")
+    # An odometer never goes back. Home Assistant reads a lower value of a
+    # total increasing sensor as a meter reset, so a single bad reading would
+    # add the whole distance to the long-term statistics once it recovers.
+    if (
+        isinstance(odometer, (int, float))
+        and isinstance(v.odometer, (int, float))
+        and odometer_unit == v.odometer_unit
+        and odometer < v.odometer
+    ):
+        _LOGGER.debug(
+            "Ignoring odometer reading %s below the last one %s", odometer, v.odometer
+        )
+    else:
+        v.odometer = odometer
+        v.odometer_unit = odometer_unit
 
-    if isinstance(vi, dict) and "tyrePressure" in vi:
-        tp = {x["type"]: x for x in vi["tyrePressure"]}
+    tyres = vi.get("tyrePressure") if isinstance(vi, dict) else None
+    if isinstance(tyres, list):
+        tp = {x.get("type"): x for x in tyres if isinstance(x, dict)}
 
         v.wheel_front_left_pressure = sg(tp, "FL", "pressure", "value")
         v.wheel_front_left_pressure_unit = sg(tp, "FL", "pressure", "unit")
@@ -375,6 +434,12 @@ def _update_vehicle(v: Vehicle, p: dict) -> Vehicle:
     return v
 
 
+def _first(*values: Any) -> Any:
+    """Returns the first value that is not None"""
+
+    return next((x for x in values if x is not None), None)
+
+
 def _ms_timestamp(value: Any) -> datetime | None:
     """Converts a millisecond epoch timestamp, ignoring anything else"""
 
@@ -388,19 +453,47 @@ def _ms_timestamp(value: Any) -> datetime | None:
 # when a response leaves them out, so a partial answer does not clear them
 _STATUS_BLOCKS = ("vehicleInfo", "evInfo")
 
+# A block is carried over for at most this long. A vehicle that stopped
+# reporting it for good must not show its last values forever.
+STATUS_BLOCK_MAX_AGE = 24 * 3600
 
-def _merge_status(previous: dict | None, current: dict) -> dict:
-    """Fills status blocks missing from current with those of previous"""
 
-    if not previous:
-        return current
+def _has_block(payload: Any, block: str) -> bool:
+    value = payload.get(block) if isinstance(payload, dict) else None
+    return isinstance(value, dict) and bool(value)
+
+
+def _merge_status(
+    previous: dict | None,
+    current: dict,
+    fresh_at: dict[str, float] | None = None,
+    now: float | None = None,
+) -> dict:
+    """Fills status blocks missing from current with those of previous.
+
+    fresh_at holds when each block last came with a response and is updated
+    here; a block older than STATUS_BLOCK_MAX_AGE is no longer carried over.
+    """
+
+    fresh_at = fresh_at if fresh_at is not None else {}
+    now = now if now is not None else monotonic()
 
     merged = dict(current)
     for block in _STATUS_BLOCKS:
-        if not isinstance(merged.get(block), dict) and isinstance(previous.get(block), dict):
+        if _has_block(current, block):
+            fresh_at[block] = now
+        elif (
+            previous
+            and _has_block(previous, block)
+            and now - fresh_at.get(block, now) < STATUS_BLOCK_MAX_AGE
+        ):
             merged[block] = previous[block]
 
     return merged
+
+
+TERMINAL_SUCCESS = ("success", "succeeded", "completed", "complete")
+TERMINAL_FAILURE = ("failure", "failed", "error", "rejected")
 
 
 class Client:
@@ -427,6 +520,7 @@ class Client:
         )
         self.vehicles: Dict[str, Vehicle] = {}
         self._last_status: Dict[str, dict] = {}
+        self._block_fresh_at: Dict[str, Dict[str, float]] = {}
 
     def set_debug(self, debug: bool):
         """Sets debug logging on/off"""
@@ -446,13 +540,26 @@ class Client:
 
         vehicles = self.api.list_vehicles()
 
+        listed = {x["vin"] for x in vehicles if isinstance(x, dict) and x.get("vin")}
+        # A vehicle that left the account is dropped, its entities turn
+        # unavailable. An empty list is taken as a hiccup rather than an
+        # account without vehicles.
+        if listed:
+            for vin in [v for v in self.vehicles if v not in listed]:
+                _LOGGER.info("Vehicle %s is no longer in the account", vin)
+                del self.vehicles[vin]
+                self._last_status.pop(vin, None)
+                self._block_fresh_at.pop(vin, None)
+
         for x in vehicles:
+            if not isinstance(x, dict) or not x.get("vin"):
+                continue
             vin = x["vin"]
 
             if vin not in self.vehicles:
                 vehicle = Vehicle(
                     vin=vin,
-                    nickname=sg(x, "nickname"),
+                    nickname=sg_str(x, "nickname"),
                     make=sg(x, "make"),
                     model=sg(x, "modelDescription"),
                     year=sg(x, "tsoModelYear"),
@@ -462,9 +569,26 @@ class Client:
             else:
                 vehicle = self.vehicles[vin]
 
+            vehicle.nickname = sg_str(x, "nickname")
             vehicle.sdp = sg(x, "sdp")
             vehicle.image_url = sg(x, "vehicleImageURL")
             vehicle.fuel_type = sg(x, "fuelType")
+
+            # Taken from the list first, so a status call failing below does
+            # not leave the vehicle without its commands
+            services = x.get("services")
+            enabled_services = [
+                v["service"]
+                for v in (services if isinstance(services, list) else [])
+                if isinstance(v, dict)
+                and v.get("service")
+                and sg(v, "vehicleCapable")
+                and sg(v, "serviceEnabled")
+            ]
+            vehicle.enabled_services = enabled_services
+            vehicle.supported_commands = [
+                v for v in enabled_services if v in COMMANDS_BY_NAME
+            ]
 
             try:
                 info = self.api.get_vehicle(vin)
@@ -472,10 +596,12 @@ class Client:
                 # An empty answer comes back when both status endpoints fail,
                 # which also happens now and then to vehicles that do support
                 # them. Keep the last good values instead of clearing them all.
-                if isinstance(info, dict) and any(
-                    isinstance(info.get(b), dict) for b in _STATUS_BLOCKS
-                ):
-                    info = _merge_status(self._last_status.get(vin), info)
+                if any(_has_block(info, b) for b in _STATUS_BLOCKS):
+                    info = _merge_status(
+                        self._last_status.get(vin),
+                        info,
+                        self._block_fresh_at.setdefault(vin, {}),
+                    )
                     self._last_status[vin] = info
                     _update_vehicle(vehicle, info)
                 else:
@@ -518,54 +644,42 @@ class Client:
             try:
                 s = self.api.get_vehicle_status(vin)
 
+                if not isinstance(s, dict):
+                    raise ValueError("remote status is not an object")
+
                 if "doors" in s:
-                    vehicle.door_driver_locked = sg_eq(
+                    vehicle.door_driver_locked = sg_state(
                         s, "LOCKED", "doors", "driver", "status"
                     )
-                    vehicle.door_passenger_locked = sg_eq(
+                    vehicle.door_passenger_locked = sg_state(
                         s, "LOCKED", "doors", "passenger", "status"
                     )
-                    vehicle.door_rear_left_locked = sg_eq(
+                    vehicle.door_rear_left_locked = sg_state(
                         s, "LOCKED", "doors", "leftRear", "status"
                     )
-                    vehicle.door_rear_right_locked = sg_eq(
+                    vehicle.door_rear_right_locked = sg_state(
                         s, "LOCKED", "doors", "rightRear", "status"
                     )
 
                 if "windows" in s:
-                    vehicle.window_driver_closed = sg_eq(
+                    vehicle.window_driver_closed = sg_state(
                         s, "CLOSED", "windows", "driver", "status"
                     )
-                    vehicle.window_passenger_closed = sg_eq(
+                    vehicle.window_passenger_closed = sg_state(
                         s, "CLOSED", "windows", "passenger", "status"
                     )
 
                 if "engine" in s:
-                    vehicle.ignition_on = sg_eq(s, "ON", "engine", "status")
+                    vehicle.ignition_on = sg_state(s, "ON", "engine", "status")
 
-                vehicle.trunk_locked = sg_eq(s, "LOCKED", "trunk", "status")
-                vehicle.ev_running = sg_eq(s, "ON", "evRunning", "status")
+                vehicle.trunk_locked = sg_state(s, "LOCKED", "trunk", "status")
+                vehicle.liftgate_locked = sg_state(s, "LOCKED", "liftGate", "status")
+                vehicle.ev_running = sg_state(s, "ON", "evRunning", "status")
+                vehicle.hvac_on = sg_state(s, "ON", "hvac", "status")
 
-                vehicle.timestamp_status = (
-                    datetime.fromtimestamp(s["timestamp"] / 1000).astimezone()
-                    if "timestamp" in s
-                    else None
-                )
-            except Exception:
-                pass
-
-            enabled_services = []
-            if "services" in x:
-                enabled_services = [
-                    v["service"]
-                    for v in x["services"]
-                    if sg(v, "vehicleCapable") and sg(v, "serviceEnabled")
-                ]
-
-            vehicle.enabled_services = enabled_services
-            vehicle.supported_commands = [
-                v for v in enabled_services if v in COMMANDS_BY_NAME
-            ]
+                vehicle.timestamp_status = _ms_timestamp(sg(s, "timestamp"))
+            except Exception as err:
+                _LOGGER.debug("Remote status not available for %s: %s", vin, err)
 
     def get_vehicles(self):
         """Returns all vehicles data. Must execute refresh method before."""
@@ -579,11 +693,9 @@ class Client:
             return {}
 
         return {
-            x["correlationId"]: sg_eq_str(
-                x, "success", "notification", "data", "status"
-            )
+            x["correlationId"]: (sg_str(x, "notification", "data", "status") or "").lower()
             for x in r["notifications"]["items"]
-            if "correlationId" in x
+            if isinstance(x, dict) and "correlationId" in x
         }
 
     def _poll_correlation_id(
@@ -593,11 +705,13 @@ class Client:
         timeout: timedelta = timedelta(seconds=60),
         interval: timedelta = timedelta(seconds=2),
     ) -> bool:
-        start = datetime.now()
+        # Monotonic, so a clock change during the poll neither stretches it,
+        # holding the client for an hour, nor cuts it short
+        deadline = monotonic() + timeout.total_seconds()
         last_error: Exception | None = None
         attempt = 0
 
-        while datetime.now() - start < timeout:
+        while monotonic() < deadline:
             # Most commands finish within seconds, slow ones take up to a
             # minute, so the wait grows to keep the request count down
             sleep(min(interval.seconds + attempt, 5))
@@ -612,10 +726,10 @@ class Client:
                 if isinstance(result, str):
                     result = result.lower()
 
-                    if result in ("success", "succeeded", "completed", "complete"):
+                    if result in TERMINAL_SUCCESS:
                         return True
 
-                    if result in ("failure", "failed", "error", "rejected"):
+                    if result in TERMINAL_FAILURE:
                         return False
 
             except (ConnectionError, TimeoutError, ValueError, RequestException) as err:
@@ -636,8 +750,11 @@ class Client:
                     last_error = err
                     continue
 
-                if id in r:
-                    return r[id]
+                # A notification can also report the command as still running
+                if r.get(id) in TERMINAL_SUCCESS:
+                    return True
+                if r.get(id) in TERMINAL_FAILURE:
+                    return False
 
         raise Exception(
             f"unable to obtain execution status: timed out "
@@ -750,6 +867,85 @@ class Client:
         if verify:
             return self._poll_correlation_id(vin, id)
         return id
+
+    def plan_charge_schedule_emea(
+        self, vin: str, slot: int, changes: dict[str, Any]
+    ) -> list[dict] | None:
+        """Work out the schedule list that changes one slot, None if unchanged.
+
+        The current schedules are read from the vehicle status right before,
+        not taken from the last poll: the backend replaces the whole list, so
+        writing from older data would undo changes made in the app since. Keys
+        the library does not know are kept as they are. This only reads, it
+        does not wake the vehicle.
+
+        changes may hold enable, start_time, end_time, charge_to_full,
+        cabin_priority and days, a list of weekday names.
+        """
+
+        info = self.api.get_vehicle(vin)
+        ev = info.get("evInfo") if isinstance(info, dict) else None
+        raw = ev.get("schedules") if isinstance(ev, dict) else None
+        if not isinstance(raw, list) or not all(isinstance(x, dict) for x in raw):
+            raise ValueError(
+                "the current charge schedules could not be read, nothing was changed"
+            )
+        if not 0 <= slot < len(raw):
+            raise ValueError(f"charge schedule {slot + 1} does not exist")
+
+        current = ChargeSchedule.from_api(raw[slot])
+        values = {
+            k: changes[k]
+            for k in ("enable", "start_time", "end_time", "charge_to_full", "cabin_priority")
+            if k in changes
+        }
+        if "days" in changes:
+            values["days"] = ScheduledDays(
+                **{f.name: f.name in changes["days"] for f in fields(ScheduledDays)}
+            )
+        updated = replace(current, **values)
+
+        # A slot that was never used has the type NONE, which the vehicle
+        # ignores even when enabled
+        if updated.enable and str(updated.schedule_type or "").upper() in ("", "NONE"):
+            updated = replace(updated, schedule_type="CHARGE")
+
+        if updated == current:
+            _LOGGER.debug("Charge schedule %d of %s unchanged, not sent", slot + 1, vin)
+            return None
+
+        schedules = [dict(x) for x in raw]
+        schedules[slot] = {**raw[slot], **updated.to_api()}
+        return schedules
+
+    def send_charge_schedules_emea(
+        self, vin: str, schedules: list[dict], verify: bool = True
+    ):
+        """Send a complete EMEA schedule list, as planned above.
+
+        Returns the poll result if verify is set, else the correlation id.
+        """
+
+        id = self.api.set_charge_schedule_emea(vin, schedules)
+        result = self._poll_correlation_id(vin, id) if verify else id
+
+        # Shown right away, the next status the cloud returns may still be
+        # the old one for a while
+        vehicle = self.vehicles.get(vin)
+        if vehicle is not None and result:
+            vehicle.charge_schedules = [ChargeSchedule.from_api(x) for x in schedules]
+
+        return result
+
+    def update_charge_schedule_emea(
+        self, vin: str, slot: int, changes: dict[str, Any], verify: bool = True
+    ):
+        """Plan and send a change of one slot. True when there is nothing to send."""
+
+        schedules = self.plan_charge_schedule_emea(vin, slot, changes)
+        if schedules is None:
+            return True
+        return self.send_charge_schedules_emea(vin, schedules, verify)
 
     def set_charging_level(
         self, vin: str, level: ChargingLevel, max_soc: str | None = None

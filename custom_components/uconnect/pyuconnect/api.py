@@ -29,9 +29,35 @@ AUTH_ERROR_CODES = {401030, 403042}
 # lifetime the backend gives it runs out
 PIN_TOKEN_MARGIN = 15
 
+# After a failed login the next one waits this long, doubling with every
+# further failure up to the maximum. Logging in again on every poll while the
+# login service is failing or rate limiting can get the account locked.
+LOGIN_BACKOFF_START = 60
+LOGIN_BACKOFF_MAX = 30 * 60
+
+# Credentials the backend rejects before they expire are renewed at most this
+# often. An endpoint answering 401 for good would otherwise cost a full login
+# on every request.
+TOKEN_REJECTED_RELOGIN_INTERVAL = 10 * 60
+
 
 class AuthenticationError(Exception):
     """The login was rejected because of invalid credentials"""
+
+
+class LoginBackoffError(Exception):
+    """No login was attempted because the last ones failed shortly before"""
+
+
+def _login_error(r: dict) -> str:
+    """Describes a failed login response without anything account related."""
+
+    if not isinstance(r, dict):
+        return "unexpected response"
+    return (
+        f"errorCode {r.get('errorCode')}, statusCode {r.get('statusCode')}: "
+        f"{r.get('errorMessage') or r.get('statusReason') or 'no message'}"
+    )
 
 
 def _parse_expiration(value) -> datetime:
@@ -137,6 +163,16 @@ class API:
         # PIN authentication token and the monotonic time it is valid until
         self._pin_token: tuple[str, float] | None = None
 
+        # Login protection, see LOGIN_BACKOFF_START. The credentials, once
+        # rejected, are not tried again: a new API object gets the new ones.
+        self._login_failures = 0
+        self._next_login_attempt = 0.0
+        self._credentials_rejected: str | None = None
+        self._last_rejected_relogin: float | None = None
+        # Set for calls made on request: a person locking the car waits for
+        # nothing, only background polling is held back by the backoff
+        self.bypass_login_backoff = False
+
         self.sess = _TimeoutSession(timeout)
         self.sess.headers.update({"User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -202,11 +238,11 @@ class API:
         )
 
         r.raise_for_status()
-        _LOGGER.debug(f"Login: accounts.webSdkBootstrap: {r.text}")
         r = r.json()
+        _LOGGER.debug("Login: accounts.webSdkBootstrap: statusCode %s", r.get("statusCode"))
 
-        if r["statusCode"] != 200:
-            raise Exception(f"bootstrap failed: {r}")
+        if r.get("statusCode") != 200:
+            raise Exception(f"bootstrap failed: {_login_error(r)}")
 
         r = self.sess.request(
             method="POST",
@@ -222,13 +258,15 @@ class API:
         )
 
         r.raise_for_status()
-        _LOGGER.debug(f"Login: accounts.login: {r.text}")
         r = r.json()
+        # The response carries the session and the profile, so only the
+        # outcome is logged
+        _LOGGER.debug("Login: accounts.login: statusCode %s", r.get("statusCode"))
 
-        if r["statusCode"] != 200:
+        if r.get("statusCode") != 200:
             if r.get("errorCode") in AUTH_ERROR_CODES:
-                raise AuthenticationError(f"account login failed: {r}")
-            raise Exception(f"account login failed: {r}")
+                raise AuthenticationError(f"account login failed: {_login_error(r)}")
+            raise Exception(f"account login failed: {_login_error(r)}")
 
         self.uid = r["UID"]
         login_token = r["sessionInfo"]["login_token"]
@@ -245,11 +283,11 @@ class API:
         )
 
         r.raise_for_status()
-        _LOGGER.debug(f"Login: accounts.getJWT: {r.text}")
         r = r.json()
+        _LOGGER.debug("Login: accounts.getJWT: statusCode %s", r.get("statusCode"))
 
-        if r["statusCode"] != 200:
-            raise Exception(f"unable to obtain JWT: {r}")
+        if r.get("statusCode") != 200 or not r.get("id_token"):
+            raise Exception(f"unable to obtain JWT: {_login_error(r)}")
 
         r = self.sess.request(
             method="POST",
@@ -260,13 +298,15 @@ class API:
         )
 
         r.raise_for_status()
-        _LOGGER.debug(f"Login: obtain token: {r.text}")
         r = r.json()
+        _LOGGER.debug("Login: obtain token: keys %s", sorted(r) if isinstance(r, dict) else None)
 
         token = r.get("Token", None)
         identity_id = r.get("IdentityId", None)
         if token is None or identity_id is None:
-            raise Exception(f"unable to obtain identity & token: {r}")
+            raise Exception(
+                f"unable to obtain identity & token: keys {sorted(r) if isinstance(r, dict) else r}"
+            )
 
         creds = self._get_cognito_credentials(identity_id, token)
 
@@ -325,12 +365,36 @@ class API:
             if not self._token_expired():
                 return
 
+            # Trying rejected credentials again only brings the account
+            # closer to a lockout
+            if self._credentials_rejected is not None:
+                raise AuthenticationError(
+                    f"the credentials were rejected: {self._credentials_rejected}"
+                )
+
+            wait = self._next_login_attempt - time.monotonic()
+            if wait > 0 and not self.bypass_login_backoff:
+                raise LoginBackoffError(
+                    f"login paused for another {int(wait) + 1} s after "
+                    f"{self._login_failures} failed attempts"
+                )
+
             try:
                 self.login()
-            except AuthenticationError:
+            except AuthenticationError as e:
+                self._credentials_rejected = str(e)
                 raise
             except Exception as e:
+                self._login_failures += 1
+                delay = min(
+                    LOGIN_BACKOFF_START * 2 ** (self._login_failures - 1),
+                    LOGIN_BACKOFF_MAX,
+                )
+                self._next_login_attempt = time.monotonic() + delay
                 raise Exception(f"unable to login: {e}") from e
+
+            self._login_failures = 0
+            self._next_login_attempt = 0.0
 
     def _invalidate_token(self):
         """Forces a fresh login on the next request"""
@@ -364,9 +428,20 @@ class API:
                 self._pin_token = None
 
             if attempt == 0 and not self.dev_mode and _is_token_rejected(r):
+                now = time.monotonic()
+                last = self._last_rejected_relogin
+                if last is not None and now - last < TOKEN_REJECTED_RELOGIN_INTERVAL:
+                    _LOGGER.debug(
+                        "Credentials rejected (HTTP %s) again shortly after a "
+                        "fresh login, not logging in again yet",
+                        r.status_code,
+                    )
+                    return r
+
                 _LOGGER.info(
                     "Credentials rejected (HTTP %s), logging in again", r.status_code
                 )
+                self._last_rejected_relogin = now
                 self._invalidate_token()
                 continue
 
@@ -762,11 +837,13 @@ class API:
         )
 
         r.raise_for_status()
-        _LOGGER.debug(f"pin auth: {r.text}")
         r = r.json()
+        _LOGGER.debug("pin auth: token %s", "received" if r.get("token") else "missing")
 
         if "token" not in r:
-            raise Exception(f"authentication failed: no token found: {r}")
+            raise Exception(
+                f"authentication failed: no token found: keys {sorted(r) if isinstance(r, dict) else r}"
+            )
 
         # The expiry is the token's lifetime in milliseconds. Without one the
         # token is used once, as before.
