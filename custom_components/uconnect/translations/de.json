@@ -49,7 +49,7 @@
                 "data": {
                     "scan_interval": "Abfrageintervall (Min.)",
                     "pin": "PIN",
-                    "charging_refresh_interval": "Deep Refresh während des Ladens (Min., 0 = kein automatisches Wecken, mindestens 15)",
+                    "charging_refresh_interval": "Deep Refresh während des Ladens (Min., 0 = nur beim Ladestart, mindestens 15)",
                     "add_command_entities": "Befehls-Entitäten hinzufügen (Button/Schloss/Schalter)",
                     "unlock_requires_pin": "Uconnect-PIN zum Entriegeln verlangen"
                 }

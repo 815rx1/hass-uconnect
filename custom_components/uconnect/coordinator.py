@@ -155,9 +155,10 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
     def _read_charging_refresh_interval(config_entry: ConfigEntry) -> int:
         """Return the deep refresh interval while charging, in minutes.
 
-        Zero turns the automatic refresh off entirely. Shorter intervals are
-        raised to the floor because each deep refresh wakes the vehicle and
-        holds an executor thread for as long as the command status poll takes.
+        Zero leaves only the refresh at the start of a charge. Shorter
+        intervals are raised to the floor because each deep refresh wakes the
+        vehicle and holds an executor thread for as long as the command status
+        poll takes.
         """
 
         minutes = config_entry.options.get(

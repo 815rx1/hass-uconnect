@@ -92,13 +92,39 @@ async def test_plain_polling_never_wakes_the_vehicle(
     assert mock_client.refresh.call_count > 200
 
 
-async def test_interval_zero_never_wakes(hass, freezer, config_entry, mock_client, vehicle):
+async def test_interval_zero_refreshes_once_per_charge(
+    hass, freezer, config_entry, mock_client, vehicle
+):
     charging_car(mock_client, vehicle)
     await setup(hass, config_entry, 0)
 
     await run_for(hass, freezer, 12 * 60, every=3)
+    assert deep_refreshes(mock_client) == 1
 
+
+async def test_refresh_when_a_charge_begins(
+    hass, freezer, config_entry, mock_client, vehicle
+):
+    vehicle.charging = False
+    await setup(hass, config_entry, 0)
+    # Past the startup grace, parked
+    await run_for(hass, freezer, 30, every=2)
     assert deep_refreshes(mock_client) == 0
+
+    # Plugged in: the next poll sees the charge, three minutes later the
+    # vehicle is asked for fresh data
+    charging_car(mock_client, vehicle)
+    await config_entry.runtime_data.async_refresh()
+    await run_for(hass, freezer, 2)
+    assert deep_refreshes(mock_client) == 0
+    await run_for(hass, freezer, 2)
+    assert deep_refreshes(mock_client) == 1
+
+    # Charge over: nothing more
+    vehicle.charging = False
+    await config_entry.runtime_data.async_refresh()
+    await run_for(hass, freezer, 6 * 60, every=3)
+    assert deep_refreshes(mock_client) == 1
 
 
 async def test_charging_day_stays_within_daily_limit(
@@ -210,10 +236,12 @@ async def test_flapping_charge_with_interval_zero(
 
     for i in range(4 * 12):
         vehicle.charging = i % 2 == 0
+        vehicle.timestamp_ev_info = dt_util.utcnow()
         await coordinator.async_refresh()
         await run_for(hass, freezer, 5)
 
-    assert deep_refreshes(mock_client) == 0
+    # One charge with short breaks, one refresh
+    assert deep_refreshes(mock_client) == 1
 
 
 async def test_restart_keeps_the_regular_schedule(
@@ -302,12 +330,13 @@ async def test_legacy_wake_history_is_taken_over(
     assert deep_refreshes(mock_client) == 1
 
 
-async def test_turning_refresh_off_cancels_the_pending_one(
+async def test_interval_set_to_zero_mid_charge(
     hass, freezer, config_entry, mock_client, vehicle
 ):
     charging_car(mock_client, vehicle)
     await setup(hass, config_entry, 30)
-    await run_for(hass, freezer, 10)
+    await run_for(hass, freezer, 20)
+    assert deep_refreshes(mock_client) == 1
 
     hass.config_entries.async_update_entry(
         config_entry, options={**config_entry.options, "charging_refresh_interval": 0}
@@ -315,7 +344,28 @@ async def test_turning_refresh_off_cancels_the_pending_one(
     await hass.async_block_till_done()
     await run_for(hass, freezer, 6 * 60, every=3)
 
-    assert deep_refreshes(mock_client) == 0
+    # The one at the start was all
+    assert deep_refreshes(mock_client) == 1
+
+
+async def test_shorter_interval_does_not_bring_the_next_one_forward(
+    hass, freezer, config_entry, mock_client, vehicle
+):
+    charging_car(mock_client, vehicle)
+    await setup(hass, config_entry, 60)
+    await run_for(hass, freezer, 20)
+    assert deep_refreshes(mock_client) == 1
+
+    # Changed to 15 minutes five minutes after the refresh: the next one
+    # still waits for the 15 minute spacing, not less
+    hass.config_entries.async_update_entry(
+        config_entry, options={**config_entry.options, "charging_refresh_interval": 15}
+    )
+    await hass.async_block_till_done()
+    await run_for(hass, freezer, 9)
+    assert deep_refreshes(mock_client) == 1
+    await run_for(hass, freezer, 3)
+    assert deep_refreshes(mock_client) == 2
 
 
 async def test_failures_end_the_session_also_across_reloads(

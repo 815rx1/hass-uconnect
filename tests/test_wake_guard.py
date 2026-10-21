@@ -46,12 +46,18 @@ def begin(guard: WakeGuard, minute: float, interval=INTERVAL):
     return guard.begin_auto_refresh(VIN, "DEEPREFRESH", interval, at(minute))
 
 
-async def test_turned_off_never_wakes(hass):
+async def test_without_interval_only_the_start_refresh(hass):
     guard = await new_guard(hass)
     guard.charging_started(VIN, at(0))
-    for minute in range(0, 24 * 60, 15):
+    assert begin(guard, 3, None).decision is Decision.ALLOWED
+    for minute in range(18, 24 * 60, 15):
         assert begin(guard, minute, None).decision is Decision.SESSION_DONE
-    assert guard.auto_refreshes_last_day(VIN, at(24 * 60)) == 0
+    assert guard.auto_refreshes_last_day(VIN, at(24 * 60)) == 1
+
+    # The next charge gets its own
+    guard.charging_stopped(VIN, at(24 * 60))
+    assert guard.charging_started(VIN, at(25 * 60)) is True
+    assert begin(guard, 25 * 60 + 3, None).decision is Decision.ALLOWED
 
 
 async def test_startup_grace(hass):

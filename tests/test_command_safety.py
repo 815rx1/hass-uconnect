@@ -233,6 +233,24 @@ async def test_known_state_is_not_sent_again(hass, config_entry, mock_client, ve
     assert sent(mock_client) == ["REOFF"]
 
 
+async def test_charging_level_already_set_is_not_sent(hass, config_entry, mock_client):
+    await setup(hass, config_entry)
+    select = entity_id(hass, "select", "charging_level_preference")
+    assert hass.states.get(select).state == "LEVEL_THREE"
+
+    await hass.services.async_call(
+        "select", "select_option", {"entity_id": select, "option": "LEVEL_THREE"},
+        blocking=True,
+    )
+    mock_client.set_charging_level_verify.assert_not_called()
+
+    await hass.services.async_call(
+        "select", "select_option", {"entity_id": select, "option": "LEVEL_FIVE"},
+        blocking=True,
+    )
+    mock_client.set_charging_level_verify.assert_called_once()
+
+
 async def test_entity_categories(hass, config_entry, mock_client, vehicle):
     vehicle.supported_commands += ["ROLIGHTS", "CNOW"]
     await setup(hass, config_entry)

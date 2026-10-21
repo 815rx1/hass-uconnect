@@ -567,8 +567,10 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
                 return
 
             # Looked at again once the interval has passed, the guard makes
-            # sure it is not earlier
-            self._schedule_deep_refresh(timedelta(minutes=interval))
+            # sure it is not earlier. Without an interval the refresh at the
+            # start of the charge was the only one.
+            if interval:
+                self._schedule_deep_refresh(timedelta(minutes=interval))
             # Tied to the config entry so an unload cancels a refresh in flight
             self.coordinator.config_entry.async_create_background_task(
                 self.hass,
@@ -583,19 +585,18 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
     def resume_deep_refresh(self, pin_changed: bool = False) -> None:
         """Pick the deep refresh up again after the options changed.
 
-        Turning it off cancels the pending one. Turning it on, or a new PIN,
-        which is what failing refreshes usually failed over, schedules the
-        next look, the guard keeps it from coming too early.
+        The next look is scheduled anew, the guard decides from the new
+        interval whether and when it may wake the vehicle: a refresh pending
+        under a shorter interval no longer comes early, and with the interval
+        set to 0 none follows the one at the start of the charge. A new PIN,
+        which is what failing refreshes usually failed over, lets them try
+        again.
         """
 
         if pin_changed:
             async_get_wake_guard(self.hass).reset_failures(self._vin)
 
-        if not self.coordinator.charging_refresh_interval:
-            self._cancel_deep_refresh()
-            return
-
-        if self._state.is_charging and self._unsub_deep_refresh is None:
+        if self._state.is_charging:
             self._schedule_deep_refresh(CHARGE_START_REFRESH_DELAY)
 
     @callback

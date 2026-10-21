@@ -438,8 +438,10 @@ class WakeGuard:
         """Decide on an automatic refresh and record it if it may go ahead.
 
         interval is the configured time between refreshes while charging, None
-        when automatic refreshes are turned off. It is enforced here, per
-        vehicle, so that entries handling the same vehicle share one schedule.
+        when only the refresh at the start of a charge is wanted. A charging
+        vehicle may be woken, so that first refresh always happens, within the
+        limits below. The interval is enforced here, per vehicle, so that
+        entries handling the same vehicle share one schedule.
         Checking and recording happen in one go in the event loop, so two
         callers cannot both get through.
         """
@@ -447,9 +449,10 @@ class WakeGuard:
         entry = self._vehicle(vin, now)
         session = entry.session
 
-        if interval is None:
+        if interval is None and session.auto_refreshes >= 1:
             return AutoRefreshDecision(
-                Decision.SESSION_DONE, reason="automatic refreshes are turned off"
+                Decision.SESSION_DONE,
+                reason="only the refresh at the start of a charge is enabled",
             )
 
         if session.failures >= AUTO_REFRESH_MAX_FAILURES:
@@ -483,7 +486,7 @@ class WakeGuard:
                     reason="the vehicle was woken less than 15 minutes ago",
                 )
 
-        if session.started is not None:
+        if interval is not None and session.started is not None:
             in_session = [
                 w for w in entry.wakes if w.automatic and w.at >= session.started
             ]

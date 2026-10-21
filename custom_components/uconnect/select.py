@@ -98,6 +98,14 @@ class UconnectSelectSetChargingLevel(SelectEntity, UconnectEntity):
         return preference
 
     async def async_select_option(self, option: str) -> None:
+        # An automation setting the level on a schedule would otherwise wake
+        # the vehicle each time for nothing
+        if option == self.current_option:
+            _LOGGER.debug(
+                "Charging level of %s is already %s, not sent", self.vehicle.vin, option
+            )
+            return
+
         try:
             await self.coordinator.async_set_charging_level(self.vehicle.vin, option)
         except Exception as err:
