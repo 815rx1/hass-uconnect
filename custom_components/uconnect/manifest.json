@@ -2,6 +2,7 @@
     "domain": "uconnect",
     "name": "Uconnect",
     "after_dependencies": [
+        "frontend",
         "http",
         "lovelace"
     ],
@@ -20,5 +21,5 @@
         "requests-auth-aws-sigv4>=0.7",
         "dataclasses-json>=0.6.7"
     ],
-    "version": "0.6.0b5"
+    "version": "0.6.0b6"
 }
