@@ -34,7 +34,12 @@ from .pyuconnect.command import (
 from .charge_schedule import enabled_days
 from .const import DOMAIN, CONF_ADD_COMMAND_ENTITIES
 from .coordinator import UconnectDataUpdateCoordinator
-from .entity import UconnectEntity, schedule_slot_count, was_added
+from .entity import (
+    UconnectCommandEntity,
+    UconnectEntity,
+    schedule_slot_count,
+    was_added,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -133,7 +138,7 @@ async def async_setup_entry(
     async_add_entities(entities)
 
 
-class UconnectSwitch(SwitchEntity, UconnectEntity):
+class UconnectSwitch(SwitchEntity, UconnectCommandEntity):
     """A remote command as a switch.
 
     Kept out of bulk actions: as configuration entities they are not reached
@@ -151,7 +156,7 @@ class UconnectSwitch(SwitchEntity, UconnectEntity):
         description: UconnectSwitchEntityDescription,
         vehicle: Vehicle,
     ):
-        UconnectEntity.__init__(self, coordinator, vehicle)
+        UconnectCommandEntity.__init__(self, coordinator, vehicle)
 
         self.entity_description: UconnectSwitchEntityDescription = description
         self._attr_name = (
@@ -168,7 +173,7 @@ class UconnectSwitch(SwitchEntity, UconnectEntity):
 
     @property
     def is_on(self):
-        if self.entity_description.is_on is not None:
+        if self.entity_description.is_on is not None and self.data_current:
             return self.entity_description.is_on(self.vehicle)
 
         return None

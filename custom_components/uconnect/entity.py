@@ -87,3 +87,26 @@ class UconnectEntity(CoordinatorEntity):
             model=_text(vehicle.model),
             name=f"{vehicle.make} {vehicle.nickname or vehicle.model}",
         )
+
+
+class UconnectCommandEntity(UconnectEntity):
+    """An entity that sends a command, available while commands can go out.
+
+    Home Assistant skips an unavailable entity without a word, even one named
+    in an action. Commands do not depend on the status poll, so a cloud status
+    outage would otherwise silently drop an automation locking the car at
+    night. The state it shows is unknown while the data is out of date.
+    """
+
+    @property
+    def available(self) -> bool:
+        coordinator = self.coordinator
+        return (
+            not coordinator.auth_failed
+            and self._vin in coordinator.client.get_vehicles()
+        )
+
+    @property
+    def data_current(self) -> bool:
+        """Whether the last poll worked, so the state shown is current."""
+        return self.coordinator.last_update_success

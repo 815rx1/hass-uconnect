@@ -90,7 +90,8 @@ def test_na_states_are_unknown_not_unlocked():
     assert v.window_passenger_closed is None
     assert v.trunk_locked is None
     assert v.liftgate_locked is True
-    assert v.ignition_on is None
+    # Taken from the EV status, which an engine reported as NA leaves alone
+    assert v.ignition_on is False
     assert v.hvac_on is True
 
 
@@ -596,3 +597,180 @@ def test_backoff_is_kept_for_a_new_client():
     with pytest.raises(Exception, match="unable to login"):
         fixed._refresh_token_if_needed()
     fixed.login.assert_called_once()
+
+
+# --- Data robustness ----------------------------------------------------
+
+
+def test_lock_states_expire_without_a_fresh_report():
+    from custom_components.uconnect.pyuconnect.client import REMOTE_STATE_MAX_AGE
+
+    status = load_fixture("status_500e.json")
+    client = make_client([copy.deepcopy(status) for _ in range(3)])
+    clock = [1000.0]
+    with patch.object(client_module, "monotonic", lambda: clock[0]):
+        client.refresh()
+        assert client.vehicles[VIN].door_driver_locked is True
+
+        # The remote status fails from now on: the last state stays a while
+        client.api.get_vehicle_status.side_effect = requests.exceptions.ReadTimeout("x")
+        clock[0] += REMOTE_STATE_MAX_AGE - 10
+        client.refresh()
+        assert client.vehicles[VIN].door_driver_locked is True
+
+        # but not for days
+        clock[0] += 20
+        client.refresh()
+        assert client.vehicles[VIN].door_driver_locked is None
+
+
+def test_bad_timestamps_do_not_break_the_refresh():
+    from custom_components.uconnect.pyuconnect.client import _ms_timestamp
+
+    assert _ms_timestamp(1e20) is None
+    assert _ms_timestamp(-5) is None
+    # Seconds are read as seconds, not as a moment in 1970
+    assert _ms_timestamp(1_760_000_000).year == 2025
+    assert _ms_timestamp(1_760_000_000_000).year == 2025
+
+
+def test_odometer_left_out_keeps_the_last_reading():
+    status = load_fixture("status_500e.json")
+    reading = status["vehicleInfo"]["odometer"]["odometer"]["value"]
+    without = copy.deepcopy(status)
+    del without["vehicleInfo"]["odometer"]
+    zero = copy.deepcopy(status)
+    zero["vehicleInfo"]["odometer"]["odometer"]["value"] = "0"
+    upper = copy.deepcopy(status)
+    upper["vehicleInfo"]["odometer"]["odometer"]["unit"] = str(
+        status["vehicleInfo"]["odometer"]["odometer"]["unit"]
+    ).upper()
+    upper["vehicleInfo"]["odometer"]["odometer"]["value"] = "1"
+
+    client = make_client([status, without, zero, upper])
+    for _ in range(4):
+        client.refresh()
+        assert client.vehicles[VIN].odometer == pytest.approx(float(reading))
+
+
+def test_flags_sent_as_strings():
+    from custom_components.uconnect.pyuconnect.client import ChargeSchedule
+
+    slot = ChargeSchedule.from_api(
+        {
+            "enableScheduleType": "false",
+            "chargeToFull": "true",
+            "scheduledDays": {"monday": "false", "tuesday": True},
+        }
+    )
+    assert slot.enable is False
+    assert slot.charge_to_full is True
+    assert slot.days.monday is False and slot.days.tuesday is True
+
+
+def test_position_at_zero_is_ignored():
+    client = make_client([load_fixture("status_500e.json")] * 2)
+    client.refresh()
+    good = client.vehicles[VIN].location
+    client.api.get_vehicle_location.return_value = {"latitude": 0, "longitude": 0}
+    client.refresh()
+    assert client.vehicles[VIN].location == good
+
+
+def test_command_status_timeout_is_final():
+    client = Client("user@example.com", "pw", "1234", FIAT_EU)
+    client.api = MagicMock()
+    client.api.get_remote_operation_status.return_value = {"status": "TIMEOUT"}
+    with patch("custom_components.uconnect.pyuconnect.client.sleep"):
+        assert client._poll_correlation_id(VIN, "corr") is False
+    assert client.api.get_remote_operation_status.call_count == 1
+
+
+def test_empty_notifications_do_not_break_the_poll():
+    client = Client("user@example.com", "pw", "1234", FIAT_EU)
+    client.api = MagicMock()
+    client.api.get_vehicle_notifications.return_value = {"notifications": None}
+    assert client._get_commands_statuses(VIN) == {}
+    client.api.get_vehicle_notifications.return_value = {"notifications": {"items": None}}
+    assert client._get_commands_statuses(VIN) == {}
+
+
+def test_newer_command_variants_are_used_directly():
+    item = copy.deepcopy(LIST_ITEM)
+    item["services"] = [
+        {"service": "DEEPREFRESH2", "vehicleCapable": True, "serviceEnabled": True},
+        {"service": "CNOW2", "vehicleCapable": True, "serviceEnabled": True},
+    ]
+    client = make_client([load_fixture("status_500e.json")], vehicles=[item])
+    client.refresh()
+    vehicle = client.vehicles[VIN]
+    # Offered like the older commands
+    assert "DEEPREFRESH" in vehicle.supported_commands
+    assert "CNOW" in vehicle.supported_commands
+
+    from custom_components.uconnect.pyuconnect.command import (
+        COMMAND_CHARGE,
+        COMMAND_DEEP_REFRESH,
+    )
+
+    client.command(VIN, COMMAND_DEEP_REFRESH)
+    client.command(VIN, COMMAND_CHARGE)
+    sent = [c.args[1].name for c in client.api.command.call_args_list]
+    assert sent == ["DEEPREFRESH2", "START_CHARGE"]
+
+
+# --- Confirmed changes while the cloud lags ---------------------------------
+
+
+def lagging_client():
+    status = load_fixture("status_500e.json")
+    client = make_client([])
+    # The cloud keeps answering with the status from before the change
+    client.api.get_vehicle.side_effect = lambda vin: copy.deepcopy(status)
+    client.api.set_charge_schedule_emea.return_value = "corr"
+    client.api.set_charging_level.return_value = "corr"
+    client.api.get_remote_operation_status.return_value = {"status": "SUCCESS"}
+    client.refresh()
+    return client, status
+
+
+def test_confirmed_schedule_change_is_kept_while_the_cloud_lags():
+    client, _ = lagging_client()
+    with patch("custom_components.uconnect.pyuconnect.client.sleep"):
+        plan = client.plan_charge_schedule_emea(VIN, 0, {"start_time": "02:30"})
+        assert client.send_charge_schedules_emea(VIN, plan) is True
+
+        client.refresh()
+        assert client.vehicles[VIN].charge_schedules[0].start_time == "02:30"
+
+        # The next change builds on the first, it does not undo it
+        plan = client.plan_charge_schedule_emea(VIN, 0, {"end_time": "06:30"})
+    assert (plan[0]["startTime"], plan[0]["endTime"]) == ("02:30", "06:30")
+
+
+def test_newer_upload_replaces_the_change():
+    client, status = lagging_client()
+    with patch("custom_components.uconnect.pyuconnect.client.sleep"):
+        plan = client.plan_charge_schedule_emea(VIN, 0, {"start_time": "02:30"})
+        client.send_charge_schedules_emea(VIN, plan)
+
+    # Changed in the app afterwards: the vehicle uploaded after the write
+    later = copy.deepcopy(status)
+    later["evInfo"]["timestamp"] = int(
+        (datetime.now(timezone.utc) + timedelta(minutes=1)).timestamp() * 1000
+    )
+    later["evInfo"]["schedules"][0]["startTime"] = "04:00"
+    client.api.get_vehicle.side_effect = lambda vin: copy.deepcopy(later)
+    client.refresh()
+    assert client.vehicles[VIN].charge_schedules[0].start_time == "04:00"
+
+
+def test_confirmed_charging_level_is_kept_while_the_cloud_lags():
+    from custom_components.uconnect.pyuconnect.api import CHARGING_LEVEL_FIVE
+
+    client, _ = lagging_client()
+    before = client.vehicles[VIN].charging_level_preference
+    with patch("custom_components.uconnect.pyuconnect.client.sleep"):
+        assert client.set_charging_level_verify(VIN, CHARGING_LEVEL_FIVE) is True
+    client.refresh()
+    assert client.vehicles[VIN].charging_level_preference == 5 != before

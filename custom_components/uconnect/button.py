@@ -27,7 +27,7 @@ from .pyuconnect.command import (
 
 from .const import DOMAIN, CONF_ADD_COMMAND_ENTITIES
 from .coordinator import UconnectDataUpdateCoordinator
-from .entity import UconnectEntity, was_added
+from .entity import UconnectCommandEntity, UconnectEntity, was_added
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -113,14 +113,14 @@ async def async_setup_entry(
     async_add_entities(entities)
 
 
-class UconnectButton(ButtonEntity, UconnectEntity):
+class UconnectButton(ButtonEntity, UconnectCommandEntity):
     def __init__(
         self,
         coordinator: UconnectDataUpdateCoordinator,
         description: UconnectButtonEntityDescription,
         vehicle: Vehicle,
     ):
-        UconnectEntity.__init__(self, coordinator, vehicle)
+        UconnectCommandEntity.__init__(self, coordinator, vehicle)
 
         self.entity_description: UconnectButtonEntityDescription = description
         self._attr_name = (

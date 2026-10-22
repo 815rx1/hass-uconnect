@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field, fields, replace
 from dataclasses_json import dataclass_json
 from typing import Any, Dict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from time import monotonic, sleep
 import logging
 
@@ -9,7 +9,14 @@ from requests.exceptions import HTTPError, RequestException
 
 from .api import API, ChargingLevel, DEFAULT_TIMEOUT
 from .brands import Brand
-from .command import Command, COMMANDS_BY_NAME
+from .command import (
+    COMMAND_CHARGE,
+    COMMAND_CHARGE_V4,
+    COMMAND_DEEP_REFRESH,
+    COMMAND_DEEP_REFRESH_V2,
+    Command,
+    COMMANDS_BY_NAME,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -82,6 +89,43 @@ def sg_str(dct: Any, *keys: str) -> str | None:
         return None
 
     return dct
+
+
+def _bool(value: Any) -> bool | None:
+    """Reads a flag sent as a JSON boolean or, now and then, as a string.
+
+    bool() would read the string "false" as true, which for a schedule slot
+    being written back means switching on what was off.
+    """
+
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("true", "1", "yes", "on"):
+            return True
+        if text in ("false", "0", "no", "off"):
+            return False
+        return None
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    return None
+
+
+def sg_bool(dct: Any, *keys: str) -> bool | None:
+    """Gets a nested flag, None when it is missing or not a flag"""
+
+    for key in keys:
+        if not isinstance(dct, dict) or key not in dct:
+            return None
+        dct = dct[key]
+
+    return _bool(dct)
+
+
+def _flag(d: dict, key: str, default: bool) -> bool:
+    value = _bool(d.get(key))
+    return default if value is None else value
 
 
 def sg_state(dct: Any, expect: str, *keys: str) -> bool | None:
@@ -164,23 +208,25 @@ class ChargeSchedule:
 
     @staticmethod
     def from_api(d: dict) -> "ChargeSchedule":
-        days = d.get("scheduledDays") or {}
+        days = d.get("scheduledDays")
+        if not isinstance(days, dict):
+            days = {}
         return ChargeSchedule(
-            enable=bool(d.get("enableScheduleType", False)),
+            enable=_flag(d, "enableScheduleType", False),
             start_time=d.get("startTime", "00:00"),
             end_time=d.get("endTime", "00:00"),
             days=ScheduledDays(
-                monday=bool(days.get("monday", False)),
-                tuesday=bool(days.get("tuesday", False)),
-                wednesday=bool(days.get("wednesday", False)),
-                thursday=bool(days.get("thursday", False)),
-                friday=bool(days.get("friday", False)),
-                saturday=bool(days.get("saturday", False)),
-                sunday=bool(days.get("sunday", False)),
+                monday=_flag(days, "monday", False),
+                tuesday=_flag(days, "tuesday", False),
+                wednesday=_flag(days, "wednesday", False),
+                thursday=_flag(days, "thursday", False),
+                friday=_flag(days, "friday", False),
+                saturday=_flag(days, "saturday", False),
+                sunday=_flag(days, "sunday", False),
             ),
-            charge_to_full=bool(d.get("chargeToFull", False)),
-            cabin_priority=bool(d.get("cabinPriority", False)),
-            repeat_schedule=bool(d.get("repeatSchedule", True)),
+            charge_to_full=_flag(d, "chargeToFull", False),
+            cabin_priority=_flag(d, "cabinPriority", False),
+            repeat_schedule=_flag(d, "repeatSchedule", True),
             schedule_type=d.get("scheduleType", "CHARGE"),
         )
 
@@ -327,7 +373,7 @@ def _update_vehicle(v: Vehicle, p: dict) -> Vehicle:
     else:
         v.charging_level_preference = CHARGING_LEVELS.get(_pref_raw, None)
 
-    v.plugged_in = sg(batt, "plugInStatus")
+    v.plugged_in = sg_bool(batt, "plugInStatus")
     v.state_of_charge = sg(batt, "stateOfCharge")
 
     v.days_to_service = sg(vi, "daysToService")
@@ -347,15 +393,15 @@ def _update_vehicle(v: Vehicle, p: dict) -> Vehicle:
     v.range_total = sg(batt, "totalRange")
     v.range_total_unit = v.distance_to_empty_unit
 
-    v.fuel_low = sg(vi, "fuel", "isFuelLevelLow")
+    v.fuel_low = sg_bool(vi, "fuel", "isFuelLevelLow")
     v.fuel_amount = sg(vi, "fuel", "fuelAmountLevel")
     v.oil_level = sg(vi, "oilLevel", "oilLevel")
 
     v.ignition_on = sg_eq(ev, "ON", "ignitionStatus")
 
     csai = sg(ev, "chargeScheduleAdditionalInfo")
-    v.ev_head_seat = sg(csai, "headSeat")
-    v.ev_cabin_cond = sg(csai, "cabinCond")
+    v.ev_head_seat = sg_bool(csai, "headSeat")
+    v.ev_cabin_cond = sg_bool(csai, "cabinCond")
 
     # EMEA charge schedules live inline in the v3 status. Newer NA firmware
     # instead exposes evInfo.chargeSchedules (different layout) and the v4
@@ -385,10 +431,12 @@ def _update_vehicle(v: Vehicle, p: dict) -> Vehicle:
     # An odometer never goes back. Home Assistant reads a lower value of a
     # total increasing sensor as a meter reset, so a single bad reading would
     # add the whole distance to the long-term statistics once it recovers.
-    if (
-        isinstance(odometer, (int, float))
-        and isinstance(v.odometer, (int, float))
-        and odometer_unit == v.odometer_unit
+    # A reading left out keeps the last one, so a 0 after it is still caught.
+    if not isinstance(odometer, (int, float)) or isinstance(odometer, bool):
+        pass
+    elif (
+        isinstance(v.odometer, (int, float))
+        and str(odometer_unit or "").lower() == str(v.odometer_unit or "").lower()
         and odometer < v.odometer
     ):
         _LOGGER.debug(
@@ -404,19 +452,19 @@ def _update_vehicle(v: Vehicle, p: dict) -> Vehicle:
 
         v.wheel_front_left_pressure = sg(tp, "FL", "pressure", "value")
         v.wheel_front_left_pressure_unit = sg(tp, "FL", "pressure", "unit")
-        v.wheel_front_left_pressure_warning = sg(tp, "FL", "warning")
+        v.wheel_front_left_pressure_warning = sg_bool(tp, "FL", "warning")
 
         v.wheel_front_right_pressure = sg(tp, "FR", "pressure", "value")
         v.wheel_front_right_pressure_unit = sg(tp, "FR", "pressure", "unit")
-        v.wheel_front_right_pressure_warning = sg(tp, "FR", "warning")
+        v.wheel_front_right_pressure_warning = sg_bool(tp, "FR", "warning")
 
         v.wheel_rear_left_pressure = sg(tp, "RL", "pressure", "value")
         v.wheel_rear_left_pressure_unit = sg(tp, "RL", "pressure", "unit")
-        v.wheel_rear_left_pressure_warning = sg(tp, "RL", "warning")
+        v.wheel_rear_left_pressure_warning = sg_bool(tp, "RL", "warning")
 
         v.wheel_rear_right_pressure = sg(tp, "RR", "pressure", "value")
         v.wheel_rear_right_pressure_unit = sg(tp, "RR", "pressure", "unit")
-        v.wheel_rear_right_pressure_warning = sg(tp, "RR", "warning")
+        v.wheel_rear_right_pressure_warning = sg_bool(tp, "RR", "warning")
 
     trips = sg(vi, "tripsInfo", "trips")
     trips = {t.get("name"): t for t in trips if isinstance(t, dict)} if isinstance(trips, list) else {}
@@ -441,12 +489,20 @@ def _first(*values: Any) -> Any:
 
 
 def _ms_timestamp(value: Any) -> datetime | None:
-    """Converts a millisecond epoch timestamp, ignoring anything else"""
+    """Converts a millisecond epoch timestamp, ignoring anything else.
+
+    One out of range value must not fail the whole refresh, and a value in
+    seconds is read as such rather than as a moment in 1970.
+    """
 
     if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
         return None
 
-    return datetime.fromtimestamp(value / 1000).astimezone()
+    seconds = value if value < 1e11 else value / 1000
+    try:
+        return datetime.fromtimestamp(seconds).astimezone()
+    except (OverflowError, OSError, ValueError):
+        return None
 
 
 # Blocks of the status payload that are carried over from the last good one
@@ -493,7 +549,27 @@ def _merge_status(
 
 
 TERMINAL_SUCCESS = ("success", "succeeded", "completed", "complete")
-TERMINAL_FAILURE = ("failure", "failed", "error", "rejected")
+TERMINAL_FAILURE = ("failure", "failed", "error", "rejected", "timeout")
+
+# Lock and window states the remote status stopped reporting are kept for at
+# most this long. Shown as locked for days while the status call fails, a lock
+# would be trusted.
+REMOTE_STATE_MAX_AGE = 24 * 3600
+
+# A change the vehicle confirmed is shown, and the next one planned from it,
+# until the cloud reports it or anything newer. The status the cloud returns
+# can lag behind, and a second change planned from the old list would undo
+# the first.
+WRITE_OVERRIDE_MAX_AGE = 3600
+REMOTE_STATE_GROUPS = {
+    "doors": (
+        "door_driver_locked",
+        "door_passenger_locked",
+        "door_rear_left_locked",
+        "door_rear_right_locked",
+    ),
+    "windows": ("window_driver_closed", "window_passenger_closed"),
+}
 
 
 class Client:
@@ -521,6 +597,11 @@ class Client:
         self.vehicles: Dict[str, Vehicle] = {}
         self._last_status: Dict[str, dict] = {}
         self._block_fresh_at: Dict[str, Dict[str, float]] = {}
+        # When the remote status last reported each group of states
+        self._remote_fresh_at: Dict[str, Dict[str, float]] = {}
+        # Confirmed changes the cloud may not show yet, see
+        # WRITE_OVERRIDE_MAX_AGE: value, when it was written and monotonic
+        self._written: Dict[str, Dict[str, tuple[Any, datetime, float]]] = {}
 
     def set_debug(self, debug: bool):
         """Sets debug logging on/off"""
@@ -550,6 +631,8 @@ class Client:
                 del self.vehicles[vin]
                 self._last_status.pop(vin, None)
                 self._block_fresh_at.pop(vin, None)
+                self._remote_fresh_at.pop(vin, None)
+                self._written.pop(vin, None)
 
         for x in vehicles:
             if not isinstance(x, dict) or not x.get("vin"):
@@ -588,9 +671,13 @@ class Client:
                 and sg(v, "serviceEnabled")
             ]
             vehicle.enabled_services = enabled_services
-            vehicle.supported_commands = [
-                v for v in enabled_services if v in COMMANDS_BY_NAME
-            ]
+            supported = [v for v in enabled_services if v in COMMANDS_BY_NAME]
+            # Vehicles listing only the newer variant of a command still
+            # offer the command, which then goes out as that variant
+            for alias, command in (("DEEPREFRESH2", "DEEPREFRESH"), ("CNOW2", "CNOW")):
+                if alias in enabled_services and command not in supported:
+                    supported.append(command)
+            vehicle.supported_commands = supported
 
             try:
                 info = self.api.get_vehicle(vin)
@@ -606,6 +693,7 @@ class Client:
                     )
                     self._last_status[vin] = info
                     _update_vehicle(vehicle, info)
+                    self._apply_written(vin, vehicle, info)
                 else:
                     _LOGGER.debug("No status data for %s, keeping the last values", vin)
             except HTTPError as err:
@@ -630,8 +718,13 @@ class Client:
                     else None
                 )
 
-                # A position without coordinates would replace a good one
-                if sg(loc, "latitude") is not None and sg(loc, "longitude") is not None:
+                # A position without coordinates, or at 0/0, would replace a
+                # good one
+                latitude, longitude = sg(loc, "latitude"), sg(loc, "longitude")
+                if latitude is not None and longitude is not None and (
+                    latitude,
+                    longitude,
+                ) != (0, 0):
                     vehicle.location = Location(
                         longitude=sg(loc, "longitude"),
                         latitude=sg(loc, "latitude"),
@@ -671,8 +764,10 @@ class Client:
                         s, "CLOSED", "windows", "passenger", "status"
                     )
 
-                if "engine" in s:
-                    vehicle.ignition_on = sg_state(s, "ON", "engine", "status")
+                # The ignition of an EV is read from its EV status, which an
+                # engine reported as NA must not overwrite
+                if (engine := sg_state(s, "ON", "engine", "status")) is not None:
+                    vehicle.ignition_on = engine
 
                 vehicle.trunk_locked = sg_state(s, "LOCKED", "trunk", "status")
                 vehicle.liftgate_locked = sg_state(s, "LOCKED", "liftGate", "status")
@@ -680,8 +775,65 @@ class Client:
                 vehicle.hvac_on = sg_state(s, "ON", "hvac", "status")
 
                 vehicle.timestamp_status = _ms_timestamp(sg(s, "timestamp"))
+                reported = {group for group in REMOTE_STATE_GROUPS if group in s}
             except Exception as err:
                 _LOGGER.debug("Remote status not available for %s: %s", vin, err)
+                reported = set()
+
+            now = monotonic()
+            fresh = self._remote_fresh_at.setdefault(vin, {})
+            for group, attrs in REMOTE_STATE_GROUPS.items():
+                if group in reported:
+                    fresh[group] = now
+                elif group in fresh and now - fresh[group] > REMOTE_STATE_MAX_AGE:
+                    for attr in attrs:
+                        setattr(vehicle, attr, None)
+
+    def _remember(self, vin: str, what: str, value: Any) -> None:
+        self._written.setdefault(vin, {})[what] = (
+            value,
+            datetime.now(timezone.utc),
+            monotonic(),
+        )
+
+    def _written_value(
+        self, vin: str, what: str, reported: Any, uploaded: datetime | None
+    ) -> Any:
+        """The value written for what, as long as the cloud lags behind it.
+
+        Dropped once the cloud reports it, once the vehicle uploaded anything
+        after the write, which may be a change made in the app, or after an
+        hour at most.
+        """
+
+        written = self._written.get(vin, {}).get(what)
+        if written is None:
+            return None
+
+        value, at, since = written
+        if (
+            reported == value
+            or (uploaded is not None and uploaded > at)
+            or monotonic() - since > WRITE_OVERRIDE_MAX_AGE
+        ):
+            del self._written[vin][what]
+            return None
+        return value
+
+    def _apply_written(self, vin: str, vehicle: "Vehicle", info: dict) -> None:
+        ev = info.get("evInfo") if isinstance(info, dict) else None
+        uploaded = _ms_timestamp(sg(ev, "timestamp"))
+        raw = ev.get("schedules") if isinstance(ev, dict) else None
+
+        schedules = self._written_value(vin, "schedules", raw, uploaded)
+        if schedules is not None:
+            vehicle.charge_schedules = [ChargeSchedule.from_api(x) for x in schedules]
+
+        level = self._written_value(
+            vin, "level", vehicle.charging_level_preference, uploaded
+        )
+        if level is not None:
+            vehicle.charging_level_preference = level
 
     def get_vehicles(self):
         """Returns all vehicles data. Must execute refresh method before."""
@@ -691,12 +843,14 @@ class Client:
     def _get_commands_statuses(self, vin: str) -> dict:
         r = self.api.get_vehicle_notifications(vin)
 
-        if "notifications" not in r or "items" not in r["notifications"]:
+        notifications = r.get("notifications") if isinstance(r, dict) else None
+        items = notifications.get("items") if isinstance(notifications, dict) else None
+        if not isinstance(items, list):
             return {}
 
         return {
             x["correlationId"]: (sg_str(x, "notification", "data", "status") or "").lower()
-            for x in r["notifications"]["items"]
+            for x in items
             if isinstance(x, dict) and "correlationId" in x
         }
 
@@ -771,7 +925,22 @@ class Client:
     def command(self, vin: str, cmd: Command):
         """Execute a given command against a car with a given VIN"""
 
-        return self.api.command(vin, cmd)
+        return self.api.command(vin, self._resolve(vin, cmd))
+
+    def _resolve(self, vin: str, cmd: Command) -> Command:
+        """Picks the variant of a command the vehicle lists, as the apps do.
+
+        Sent as the older variant first, such a command only goes out after
+        that one was refused.
+        """
+
+        vehicle = self.vehicles.get(vin)
+        services = getattr(vehicle, "enabled_services", None) or []
+        if cmd == COMMAND_DEEP_REFRESH and "DEEPREFRESH2" in services:
+            return COMMAND_DEEP_REFRESH_V2
+        if cmd == COMMAND_CHARGE and "CNOW2" in services:
+            return COMMAND_CHARGE_V4
+        return cmd
 
     def command_verify(
         self,
@@ -892,6 +1061,12 @@ class Client:
             raise ValueError(
                 "the current charge schedules could not be read, nothing was changed"
             )
+        # A change confirmed moments ago that the cloud does not show yet
+        written = self._written_value(
+            vin, "schedules", raw, _ms_timestamp(sg(ev, "timestamp"))
+        )
+        if written is not None and len(written) == len(raw):
+            raw = written
         if not 0 <= slot < len(raw):
             raise ValueError(f"charge schedule {slot + 1} does not exist")
 
@@ -933,9 +1108,13 @@ class Client:
 
         # Shown right away, the next status the cloud returns may still be
         # the old one for a while
-        vehicle = self.vehicles.get(vin)
-        if vehicle is not None and result:
-            vehicle.charge_schedules = [ChargeSchedule.from_api(x) for x in schedules]
+        if result:
+            self._remember(vin, "schedules", [dict(x) for x in schedules])
+            vehicle = self.vehicles.get(vin)
+            if vehicle is not None:
+                vehicle.charge_schedules = [
+                    ChargeSchedule.from_api(x) for x in schedules
+                ]
 
         return result
 
@@ -962,4 +1141,13 @@ class Client:
         """Set the charging level on the vehicle with a given VIN and poll for the status"""
 
         id = self.api.set_charging_level(vin, level, max_soc=max_soc)
-        return self._poll_correlation_id(vin, id)
+        result = self._poll_correlation_id(vin, id)
+
+        # Shown right away, the cloud reports the old level for a while
+        preference = CHARGING_LEVELS.get(level.name)
+        if result and preference is not None:
+            self._remember(vin, "level", preference)
+            if (vehicle := self.vehicles.get(vin)) is not None:
+                vehicle.charging_level_preference = preference
+
+        return result

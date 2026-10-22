@@ -491,3 +491,23 @@ async def test_daily_limit(hass, freezer, config_entry, mock_client):
     # Locking still goes out
     await hass.services.async_call(DOMAIN, "doors_lock", {}, blocking=True)
     assert sent(mock_client)[-1] == "RDL"
+
+
+async def test_locking_works_while_the_status_cannot_be_read(
+    hass, config_entry, mock_client
+):
+    await setup(hass, config_entry)
+    lock = entity_id(hass, "lock", "lock_doors")
+    coordinator = config_entry.runtime_data
+
+    # The status poll fails until the entities would turn unavailable
+    mock_client.refresh.side_effect = Exception("status down")
+    for _ in range(3):
+        await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    assert not coordinator.last_update_success
+    # The state is not known, the lock can still be used
+    assert hass.states.get(lock).state == "unknown"
+
+    await hass.services.async_call("lock", "lock", {"entity_id": lock}, blocking=True)
+    assert sent(mock_client) == ["RDL"]

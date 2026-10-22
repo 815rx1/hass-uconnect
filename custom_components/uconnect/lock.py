@@ -24,7 +24,7 @@ from .pyuconnect.command import (
 
 from .const import DOMAIN, CONF_ADD_COMMAND_ENTITIES
 from .coordinator import UconnectDataUpdateCoordinator
-from .entity import UconnectEntity, was_added
+from .entity import UconnectCommandEntity, was_added
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -129,14 +129,14 @@ async def async_setup_entry(
     async_add_entities(entities)
 
 
-class UconnectLock(LockEntity, UconnectEntity):
+class UconnectLock(LockEntity, UconnectCommandEntity):
     def __init__(
         self,
         coordinator: UconnectDataUpdateCoordinator,
         description: UconnectLockEntityDescription,
         vehicle: Vehicle,
     ):
-        UconnectEntity.__init__(self, coordinator, vehicle)
+        UconnectCommandEntity.__init__(self, coordinator, vehicle)
 
         self.entity_description: UconnectLockEntityDescription = description
         self._attr_unique_id = f"{DOMAIN}_{vehicle.vin}_{description.key}"
@@ -157,6 +157,8 @@ class UconnectLock(LockEntity, UconnectEntity):
 
     @property
     def is_locked(self):
+        if not self.data_current:
+            return None
         return self.entity_description.is_locked(self.vehicle)
 
     @property
