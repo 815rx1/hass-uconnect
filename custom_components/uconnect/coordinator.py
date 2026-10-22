@@ -76,6 +76,14 @@ def is_auth_error(err: BaseException) -> bool:
     return isinstance(err, AuthenticationError)
 
 
+def _refused_before_queued(err: BaseException) -> bool:
+    """Whether the cloud refused a command outright, with a 4xx answer."""
+
+    response = getattr(err, "response", None)
+    status = getattr(response, "status_code", None)
+    return isinstance(status, int) and 400 <= status < 500
+
+
 class UconnectRequestError(HomeAssistantError):
     """A vehicle action could not be sent or its outcome is unknown.
 
@@ -577,6 +585,11 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
         except Exception as err:
             if is_auth_error(err):
                 self.auth_failed = True
+            # Refused by the cloud before it was queued, e.g. a deep refresh
+            # of a 500e that is not plugged in: it never reached the vehicle,
+            # so it holds back no later command
+            if record is not None and _refused_before_queued(err):
+                async_get_wake_guard(self.hass).forget(vin, record)
             raise UconnectRequestError(f"{what} failed: {err}") from err
 
         await self._async_finish_action(what, record, result)

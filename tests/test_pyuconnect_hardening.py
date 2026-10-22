@@ -788,3 +788,37 @@ def test_placeholders_in_numbers_are_unknown():
     assert v.state_of_charge is None
     assert v.time_to_fully_charge_l2 is None
     assert v.battery_voltage is None
+
+
+def test_confirmed_lock_is_shown_until_the_vehicle_reports():
+    from custom_components.uconnect.pyuconnect.command import (
+        COMMAND_DOORS_LOCK,
+        COMMAND_DOORS_UNLOCK,
+    )
+
+    unlocked = copy.deepcopy(REMOTE_STATUS)
+    for name, door in unlocked["doors"].items():
+        if name != "leftRear":
+            door["status"] = "UNLOCKED"
+    client = make_client([load_fixture("status_500e.json")] * 4, remote=unlocked)
+    client.refresh()
+    assert client.vehicles[VIN].door_driver_locked is False
+
+    client.api.command.return_value = "corr"
+    client.api.get_remote_operation_status.return_value = {"status": "SUCCESS"}
+    with patch("custom_components.uconnect.pyuconnect.client.sleep"):
+        assert client.command_verify(VIN, COMMAND_DOORS_LOCK) is True
+
+    # The cloud still reports the state from before the lock
+    client.refresh()
+    v = client.vehicles[VIN]
+    assert v.door_driver_locked is True and v.door_passenger_locked is True
+    # A door the vehicle does not report stays unknown
+    assert v.door_rear_left_locked is None
+
+    # Unlocked by key later: the vehicle uploads, and that is shown
+    later = copy.deepcopy(unlocked)
+    later["timestamp"] = int(datetime.now(timezone.utc).timestamp() * 1000) + 60000
+    client.api.get_vehicle_status.return_value = later
+    client.refresh()
+    assert client.vehicles[VIN].door_driver_locked is False

@@ -511,3 +511,23 @@ async def test_locking_works_while_the_status_cannot_be_read(
 
     await hass.services.async_call("lock", "lock", {"entity_id": lock}, blocking=True)
     assert sent(mock_client) == ["RDL"]
+
+
+async def test_command_refused_by_the_cloud_holds_nothing_back(
+    hass, config_entry, mock_client
+):
+    import requests
+
+    await setup(hass, config_entry)
+    refused = requests.Response()
+    refused.status_code = 400
+    mock_client.command_verify.side_effect = requests.HTTPError("400", response=refused)
+    with pytest.raises(Exception):
+        await hass.services.async_call(DOMAIN, "deep_refresh", {}, blocking=True)
+    # It never reached the vehicle: no wake-up, no cooldown
+    assert hass.data[DOMAIN]["_wake_guard"].wakes(VIN) == []
+
+    mock_client.command_verify.side_effect = None
+    mock_client.command_verify.return_value = True
+    await hass.services.async_call(DOMAIN, "deep_refresh", {}, blocking=True)
+    assert sent(mock_client)[-1] == "DEEPREFRESH"

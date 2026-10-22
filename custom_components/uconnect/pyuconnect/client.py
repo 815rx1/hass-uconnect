@@ -569,12 +569,6 @@ TERMINAL_FAILURE = ("failure", "failed", "error", "rejected", "timeout")
 # most this long. Shown as locked for days while the status call fails, a lock
 # would be trusted.
 REMOTE_STATE_MAX_AGE = 24 * 3600
-
-# A change the vehicle confirmed is shown, and the next one planned from it,
-# until the cloud reports it or anything newer. The status the cloud returns
-# can lag behind, and a second change planned from the old list would undo
-# the first.
-WRITE_OVERRIDE_MAX_AGE = 3600
 REMOTE_STATE_GROUPS = {
     "doors": (
         "door_driver_locked",
@@ -583,6 +577,26 @@ REMOTE_STATE_GROUPS = {
         "door_rear_right_locked",
     ),
     "windows": ("window_driver_closed", "window_passenger_closed"),
+}
+
+# A change the vehicle confirmed is shown, and the next one planned from it,
+# until the cloud reports it or anything newer. The status the cloud returns
+# can lag behind, and a second change planned from the old list would undo
+# the first.
+WRITE_OVERRIDE_MAX_AGE = 3600
+
+# Lock commands and the states they set. The vehicle often uploads no new
+# status after a remote lock, so the cloud keeps reporting the state from
+# before for hours. The state confirmed is shown until the vehicle uploads a
+# newer one, which it does when it is unlocked by key, for a day at most.
+LOCK_OVERRIDE_MAX_AGE = 24 * 3600
+LOCK_COMMAND_STATES: dict[str, tuple[tuple[str, ...], bool]] = {
+    "RDL": (REMOTE_STATE_GROUPS["doors"], True),
+    "RDU": (REMOTE_STATE_GROUPS["doors"], False),
+    "ROTRUNKLOCK": (("trunk_locked",), True),
+    "ROTRUNKUNLOCK": (("trunk_locked",), False),
+    "ROLIFTGATELOCK": (("liftgate_locked",), True),
+    "ROLIFTGATEUNLOCK": (("liftgate_locked",), False),
 }
 
 
@@ -803,6 +817,8 @@ class Client:
                     for attr in attrs:
                         setattr(vehicle, attr, None)
 
+            self._apply_written_locks(vin, vehicle)
+
     def _remember(self, vin: str, what: str, value: Any) -> None:
         self._written.setdefault(vin, {})[what] = (
             value,
@@ -811,7 +827,12 @@ class Client:
         )
 
     def _written_value(
-        self, vin: str, what: str, reported: Any, uploaded: datetime | None
+        self,
+        vin: str,
+        what: str,
+        reported: Any,
+        uploaded: datetime | None,
+        max_age: float = WRITE_OVERRIDE_MAX_AGE,
     ) -> Any:
         """The value written for what, as long as the cloud lags behind it.
 
@@ -828,7 +849,7 @@ class Client:
         if (
             reported == value
             or (uploaded is not None and uploaded > at)
-            or monotonic() - since > WRITE_OVERRIDE_MAX_AGE
+            or monotonic() - since > max_age
         ):
             del self._written[vin][what]
             return None
@@ -848,6 +869,34 @@ class Client:
         )
         if level is not None:
             vehicle.charging_level_preference = level
+
+    def _remember_lock(self, vin: str, command: str) -> None:
+        """Shows a lock state the vehicle confirmed until it reports one."""
+
+        attrs, locked = LOCK_COMMAND_STATES[command]
+        vehicle = self.vehicles.get(vin)
+        if vehicle is None:
+            return
+        # Parts the vehicle does not report stay unknown
+        known = [a for a in attrs if getattr(vehicle, a, None) is not None] or list(attrs[:1])
+        for attr in known:
+            setattr(vehicle, attr, locked)
+        self._remember(vin, f"lock:{','.join(attrs)}", {a: locked for a in known})
+
+    def _apply_written_locks(self, vin: str, vehicle: "Vehicle") -> None:
+        uploaded = getattr(vehicle, "timestamp_status", None)
+        for attrs, _ in {v[0]: v for v in LOCK_COMMAND_STATES.values()}.values():
+            what = f"lock:{','.join(attrs)}"
+            if what not in self._written.get(vin, {}):
+                continue
+            states = self._written[vin][what][0]
+            reported = {a: getattr(vehicle, a, None) for a in states}
+            written = self._written_value(
+                vin, what, reported, uploaded, LOCK_OVERRIDE_MAX_AGE
+            )
+            if written is not None:
+                for attr, value in written.items():
+                    setattr(vehicle, attr, value)
 
     def get_vehicles(self):
         """Returns all vehicles data. Must execute refresh method before."""
@@ -964,7 +1013,10 @@ class Client:
         """Execute a given command against a car with a given VIN and poll for the status"""
 
         id = self.command(vin, cmd)
-        return self._poll_correlation_id(vin, id)
+        result = self._poll_correlation_id(vin, id)
+        if result and cmd.name in LOCK_COMMAND_STATES:
+            self._remember_lock(vin, cmd.name)
+        return result
 
     def get_stolen_vehicle_status(self, vin: str) -> dict:
         """Get stolen vehicle locator (SVLA) status for a vehicle with a given VIN"""
