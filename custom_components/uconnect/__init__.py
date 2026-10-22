@@ -70,14 +70,18 @@ CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
-    """Load the wake-up history and register the actions.
+    """Load the wake-up history, register the actions and the card.
 
-    Both exist independently of the entries: the history is per vehicle, and
-    actions must validate in automations even while an entry is not loaded.
+    They exist independently of the entries: the history is per vehicle,
+    actions must validate in automations even while an entry is not loaded,
+    and dashboards need the card then too.
     """
 
     await async_setup_wake_guard(hass)
     async_setup_services(hass)
+    # Also here, so dashboards find the card while an entry waits for the
+    # cloud to answer at startup
+    await async_setup_frontend_cards(hass)
     return True
 
 

@@ -317,3 +317,13 @@ async def test_diagnostics_of_an_entry_that_is_not_loaded(hass, config_entry):
     result = await async_get_config_entry_diagnostics(hass, config_entry)
     assert result["coordinator"] is None
     assert result["entry"]["data"]["password"] == "**REDACTED**"
+
+
+async def test_card_is_served_while_the_entry_waits_for_the_cloud(
+    hass, config_entry, mock_client
+):
+    mock_client.refresh.side_effect = Exception("cloud down")
+    config_entry.add_to_hass(hass)
+    assert not await hass.config_entries.async_setup(config_entry.entry_id)
+    assert config_entry.state is ConfigEntryState.SETUP_RETRY
+    assert hass.data[DOMAIN][frontend_cards._DATA_KEY] is True

@@ -120,8 +120,11 @@ async def async_setup_frontend_cards(hass: HomeAssistant) -> None:
                 _STATIC_RELATIVE_PATH,
             )
         else:
+            # Not cached for a month: an updated card has to reach the
+            # browsers with a normal reload, under the same URL as before so
+            # the resource stays the one of every version
             await hass.http.async_register_static_paths(
-                [StaticPathConfig(_STATIC_BASE_URL, str(_STATIC_RELATIVE_PATH), True)]
+                [StaticPathConfig(_STATIC_BASE_URL, str(_STATIC_RELATIVE_PATH), False)]
             )
             _LOGGER.debug("Registered static path %s", _STATIC_BASE_URL)
     except Exception as err:
