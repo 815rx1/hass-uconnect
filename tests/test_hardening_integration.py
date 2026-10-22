@@ -286,7 +286,7 @@ async def test_display_precision_and_state_classes(hass, setup_integration):
 
 
 async def test_numeric_model_reaches_the_device_registry_as_text(
-    hass, config_entry, mock_client, vehicle
+    hass, config_entry, mock_client, vehicle, caplog
 ):
     from homeassistant.helpers import device_registry as dr
 
@@ -296,6 +296,8 @@ async def test_numeric_model_reaches_the_device_registry_as_text(
     await hass.async_block_till_done()
     device = dr.async_entries_for_config_entry(dr.async_get(hass), config_entry.entry_id)[0]
     assert device.model == "1500"
+    # Home Assistant converts it itself for now, but warns that it stops
+    assert "non-string" not in caplog.text
 
 
 async def test_liftgate_sensor(hass, config_entry, mock_client, vehicle):

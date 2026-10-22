@@ -52,6 +52,19 @@ def sg(dct: Any, *keys: str) -> Any:
     return convert(dct)
 
 
+def sg_num(dct: Any, *keys: str) -> int | float | None:
+    """Gets a nested number, None for anything else such as "NA".
+
+    A placeholder kept as text would make a numeric sensor fail to write its
+    state, and the battery estimate fail to compare it.
+    """
+
+    v = sg(dct, *keys)
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return v
+    return None
+
+
 def sg_eq(dct: Any, expect: Any, *keys: str) -> bool | None:
     v = sg(dct, *keys)
 
@@ -360,8 +373,8 @@ def _update_vehicle(v: Vehicle, p: dict) -> Vehicle:
     ev = sg(p, "evInfo")
     batt = sg(ev, "battery")
 
-    v.battery_voltage = sg(vi, "batteryInfo", "batteryVoltage", "value")
-    v.battery_state_of_charge = sg(vi, "batteryInfo", "batteryStateOfCharge")
+    v.battery_voltage = sg_num(vi, "batteryInfo", "batteryVoltage", "value")
+    v.battery_state_of_charge = sg_num(vi, "batteryInfo", "batteryStateOfCharge")
     v.charging = sg_eq(batt, "CHARGING", "chargingStatus")
     v.charging_level = CHARGING_LEVELS.get(sg(batt, "chargingLevel"), None)
     # chargePowerPreference is reported as a word-form string (EMEA:
@@ -374,28 +387,29 @@ def _update_vehicle(v: Vehicle, p: dict) -> Vehicle:
         v.charging_level_preference = CHARGING_LEVELS.get(_pref_raw, None)
 
     v.plugged_in = sg_bool(batt, "plugInStatus")
-    v.state_of_charge = sg(batt, "stateOfCharge")
+    v.state_of_charge = sg_num(batt, "stateOfCharge")
 
-    v.days_to_service = sg(vi, "daysToService")
-    v.distance_to_service = sg(vi, "distanceToService", "distanceToService", "value")
+    v.days_to_service = sg_num(vi, "daysToService")
+    v.distance_to_service = sg_num(vi, "distanceToService", "distanceToService", "value")
     v.distance_to_service_unit = sg(
         vi, "distanceToService", "distanceToService", "unit"
     )
     # A range of 0 is a value, it must not fall through to the fuel range
     v.distance_to_empty = _first(
-        sg(batt, "distanceToEmpty", "value"), sg(vi, "fuel", "distanceToEmpty", "value")
+        sg_num(batt, "distanceToEmpty", "value"),
+        sg_num(vi, "fuel", "distanceToEmpty", "value"),
     )
     v.distance_to_empty_unit = _first(
         sg(batt, "distanceToEmpty", "unit"), sg(vi, "fuel", "distanceToEmpty", "unit")
     )
-    v.range_gas = sg(batt, "gasRange")
+    v.range_gas = sg_num(batt, "gasRange")
     v.range_gas_unit = v.distance_to_empty_unit
-    v.range_total = sg(batt, "totalRange")
+    v.range_total = sg_num(batt, "totalRange")
     v.range_total_unit = v.distance_to_empty_unit
 
     v.fuel_low = sg_bool(vi, "fuel", "isFuelLevelLow")
-    v.fuel_amount = sg(vi, "fuel", "fuelAmountLevel")
-    v.oil_level = sg(vi, "oilLevel", "oilLevel")
+    v.fuel_amount = sg_num(vi, "fuel", "fuelAmountLevel")
+    v.oil_level = sg_num(vi, "oilLevel", "oilLevel")
 
     v.ignition_on = sg_eq(ev, "ON", "ignitionStatus")
 
@@ -414,9 +428,9 @@ def _update_vehicle(v: Vehicle, p: dict) -> Vehicle:
             _LOGGER.debug("Ignoring charge schedules that are not all objects")
             v.charge_schedules = []
 
-    v.time_to_fully_charge_l3 = sg(batt, "timeToFullyChargeL3")
-    v.time_to_fully_charge_l2 = sg(batt, "timeToFullyChargeL2")
-    v.time_to_fully_charge_l1 = sg(batt, "timeToFullyChargeL1")
+    v.time_to_fully_charge_l3 = sg_num(batt, "timeToFullyChargeL3")
+    v.time_to_fully_charge_l2 = sg_num(batt, "timeToFullyChargeL2")
+    v.time_to_fully_charge_l1 = sg_num(batt, "timeToFullyChargeL1")
 
     # Some vehicles report -1
     if v.time_to_fully_charge_l3 is not None and v.time_to_fully_charge_l3 < 0:
@@ -426,7 +440,7 @@ def _update_vehicle(v: Vehicle, p: dict) -> Vehicle:
     if v.time_to_fully_charge_l1 is not None and v.time_to_fully_charge_l1 < 0:
         v.time_to_fully_charge_l1 = None
 
-    odometer = sg(vi, "odometer", "odometer", "value")
+    odometer = sg_num(vi, "odometer", "odometer", "value")
     odometer_unit = sg(vi, "odometer", "odometer", "unit")
     # An odometer never goes back. Home Assistant reads a lower value of a
     # total increasing sensor as a meter reset, so a single bad reading would
@@ -450,30 +464,30 @@ def _update_vehicle(v: Vehicle, p: dict) -> Vehicle:
     if isinstance(tyres, list):
         tp = {x.get("type"): x for x in tyres if isinstance(x, dict)}
 
-        v.wheel_front_left_pressure = sg(tp, "FL", "pressure", "value")
+        v.wheel_front_left_pressure = sg_num(tp, "FL", "pressure", "value")
         v.wheel_front_left_pressure_unit = sg(tp, "FL", "pressure", "unit")
         v.wheel_front_left_pressure_warning = sg_bool(tp, "FL", "warning")
 
-        v.wheel_front_right_pressure = sg(tp, "FR", "pressure", "value")
+        v.wheel_front_right_pressure = sg_num(tp, "FR", "pressure", "value")
         v.wheel_front_right_pressure_unit = sg(tp, "FR", "pressure", "unit")
         v.wheel_front_right_pressure_warning = sg_bool(tp, "FR", "warning")
 
-        v.wheel_rear_left_pressure = sg(tp, "RL", "pressure", "value")
+        v.wheel_rear_left_pressure = sg_num(tp, "RL", "pressure", "value")
         v.wheel_rear_left_pressure_unit = sg(tp, "RL", "pressure", "unit")
         v.wheel_rear_left_pressure_warning = sg_bool(tp, "RL", "warning")
 
-        v.wheel_rear_right_pressure = sg(tp, "RR", "pressure", "value")
+        v.wheel_rear_right_pressure = sg_num(tp, "RR", "pressure", "value")
         v.wheel_rear_right_pressure_unit = sg(tp, "RR", "pressure", "unit")
         v.wheel_rear_right_pressure_warning = sg_bool(tp, "RR", "warning")
 
     trips = sg(vi, "tripsInfo", "trips")
     trips = {t.get("name"): t for t in trips if isinstance(t, dict)} if isinstance(trips, list) else {}
-    v.trip_a_distance = sg(trips, "TripA", "totalDistance", "value")
+    v.trip_a_distance = sg_num(trips, "TripA", "totalDistance", "value")
     v.trip_a_distance_unit = sg(trips, "TripA", "totalDistance", "unit")
-    v.trip_b_distance = sg(trips, "TripB", "totalDistance", "value")
+    v.trip_b_distance = sg_num(trips, "TripB", "totalDistance", "value")
     v.trip_b_distance_unit = sg(trips, "TripB", "totalDistance", "unit")
 
-    v.battery_soh = sg(vi, "hVBatSOH")
+    v.battery_soh = sg_num(vi, "hVBatSOH")
 
     v.timestamp_info = _ms_timestamp(sg(p, "timestamp"))
     v.timestamp_vehicle_info = _ms_timestamp(sg(vi, "timestamp"))

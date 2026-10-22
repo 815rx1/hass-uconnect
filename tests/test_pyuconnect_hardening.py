@@ -569,9 +569,10 @@ def test_pin_that_cannot_be_right_is_not_sent():
 def test_command_queued_is_never_sent_twice():
     # An answer that queued the command is no rejected token, whatever it says
     queued = response(
-        200, {"responseStatus": "pending", "correlationId": "a", "note": "expired_token"}
+        200, {"responseStatus": "pending", "correlationId": "a", "name": "EXPIRED_TOKEN"}
     )
     assert not _is_token_rejected(queued)
+    assert not _is_token_rejected(response(200, {"note": "expired_token"}))
     assert _is_token_rejected(response(200, {"name": "EXPIRED_TOKEN"}))
 
 
@@ -774,3 +775,16 @@ def test_confirmed_charging_level_is_kept_while_the_cloud_lags():
         assert client.set_charging_level_verify(VIN, CHARGING_LEVEL_FIVE) is True
     client.refresh()
     assert client.vehicles[VIN].charging_level_preference == 5 != before
+
+
+def test_placeholders_in_numbers_are_unknown():
+    status = load_fixture("status_500e.json")
+    status["evInfo"]["battery"]["stateOfCharge"] = "NA"
+    status["evInfo"]["battery"]["timeToFullyChargeL2"] = "N/A"
+    status["vehicleInfo"]["batteryInfo"]["batteryVoltage"]["value"] = "--"
+    client = make_client([status])
+    client.refresh()
+    v = client.vehicles[VIN]
+    assert v.state_of_charge is None
+    assert v.time_to_fully_charge_l2 is None
+    assert v.battery_voltage is None
