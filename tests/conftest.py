@@ -19,6 +19,7 @@ from custom_components.uconnect.const import (
     CONF_DISABLE_TLS_VERIFICATION,
     DOMAIN,
 )
+from custom_components.uconnect.pyuconnect.api import _LOGIN_BACKOFFS
 from custom_components.uconnect.pyuconnect.brands import FIAT_EU
 from custom_components.uconnect.pyuconnect.client import (
     Client,
@@ -43,6 +44,14 @@ if sys.platform == "win32":
 def auto_enable_custom_integrations(enable_custom_integrations):
     """Enable loading the integration from custom_components."""
     yield
+
+
+@pytest.fixture(autouse=True)
+def fresh_login_backoff():
+    """The login backoff outlives API objects, but not a test."""
+    _LOGIN_BACKOFFS.clear()
+    yield
+    _LOGIN_BACKOFFS.clear()
 
 
 def load_fixture(name: str) -> dict:
@@ -91,6 +100,7 @@ def mock_client(vehicle, cloud_status):
     client = MagicMock()
     client.api.sess = requests.Session()
     client.api.pin = "1234"
+    client.api.pin_rejected = False
     client.vehicles = {VIN: vehicle}
     client.get_vehicles.return_value = client.vehicles
     client.get_vehicle_health_report.return_value = {}

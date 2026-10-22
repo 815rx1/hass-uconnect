@@ -19,7 +19,7 @@ from homeassistant.components.sensor import (
 )
 from homeassistant.const import PERCENTAGE
 from homeassistant.core import callback
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers.event import (
     async_call_later,
     async_track_time_interval,
@@ -30,8 +30,13 @@ from .pyuconnect.client import Vehicle
 from .pyuconnect.command import COMMAND_DEEP_REFRESH
 
 from .const import DOMAIN
-from .coordinator import UconnectDataUpdateCoordinator, UconnectRequestError
-from .wake_guard import AUTO_REFRESH_MAX_FAILURES, Decision, async_get_wake_guard
+from .coordinator import PinRejected, UconnectDataUpdateCoordinator, UconnectRequestError
+from .wake_guard import (
+    AUTO_REFRESH_MAX_FAILURES,
+    Decision,
+    WakeRecord,
+    async_get_wake_guard,
+)
 from .entity import UconnectEntity
 
 _LOGGER = logging.getLogger(__name__)
@@ -66,6 +71,12 @@ DEEP_REFRESH_RECHECK = timedelta(minutes=15)
 # Charge data the vehicle uploaded longer ago than this is not taken as proof
 # that it is still charging
 EV_DATA_MAX_AGE = timedelta(hours=12)
+# The first refresh of a charge needs charge data this fresh. The vehicle
+# uploads when a charge begins, so a charge that really began has it; one
+# reported long ago may have ended without the end reaching the cloud, and
+# waking the vehicle for it would be for nothing. Later refreshes renew the
+# data themselves.
+FIRST_REFRESH_MAX_DATA_AGE = timedelta(minutes=60)
 
 
 @dataclass
@@ -416,7 +427,7 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
         ):
             self.async_write_ha_state()
 
-    async def _async_do_deep_refresh(self) -> None:
+    async def _async_do_deep_refresh(self, record: WakeRecord | None) -> None:
         """Ask the vehicle to push fresh data.
 
         The wake guard has recorded the refresh already and the record is
@@ -430,6 +441,15 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
             await self.coordinator.async_command(
                 self._vin, COMMAND_DEEP_REFRESH, automatic=True
             )
+        except ServiceValidationError as err:
+            # Refused before anything reached the vehicle, so it does not
+            # count. A rejected PIN ends the refreshes of this charge until it
+            # is changed, which lets them start over.
+            if record is not None:
+                guard.forget(self._vin, record)
+            if isinstance(err, PinRejected):
+                guard.stop_session(self._vin)
+            _LOGGER.warning("Deep refresh for %s not sent: %s", self._vin, err)
         except Exception as err:
             failures = guard.auto_refresh_failed(self._vin)
             _LOGGER.warning(
@@ -505,8 +525,16 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
             return "the battery is full"
 
         uploaded = getattr(vehicle, "timestamp_ev_info", None)
-        if uploaded is not None and datetime.now(timezone.utc) - uploaded > EV_DATA_MAX_AGE:
+        if uploaded is None:
+            return "the vehicle reports no time for its charge data"
+        age = datetime.now(timezone.utc) - uploaded
+        if age > EV_DATA_MAX_AGE:
             return "the last charge data from the vehicle is too old"
+        if (
+            age > FIRST_REFRESH_MAX_DATA_AGE
+            and async_get_wake_guard(self.hass).session(self._vin).auto_refreshes == 0
+        ):
+            return "the charge was reported too long ago to be sure it still goes on"
 
         return None
 
@@ -523,16 +551,22 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
 
         Firing does not mean waking the vehicle: the conditions are checked
         against the current data first, then the wake guard decides, and it
-        says how long to wait when it is not yet time.
+        says how long to wait when it is not yet time. A look that finds the
+        refresh impossible for now, say with the vehicle briefly missing from
+        the account, looks again later rather than giving up on the charge.
         """
-
-        if not self._can_deep_refresh():
-            return
 
         @callback
         def _fire(_now: datetime) -> None:
             self._unsub_deep_refresh = None
             if not self._state.is_charging:
+                return
+
+            if not self._can_deep_refresh():
+                _LOGGER.debug(
+                    "No deep refresh for %s now: no PIN, or not offered", self._vin
+                )
+                self._schedule_deep_refresh(DEEP_REFRESH_RECHECK)
                 return
 
             if (blocker := self._refresh_blocker()) is not None:
@@ -574,7 +608,7 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
             # Tied to the config entry so an unload cancels a refresh in flight
             self.coordinator.config_entry.async_create_background_task(
                 self.hass,
-                self._async_do_deep_refresh(),
+                self._async_do_deep_refresh(decision.record),
                 f"uconnect deep refresh {self._vin}",
             )
 

@@ -19,6 +19,7 @@ from custom_components.uconnect.wake_guard import (
     SESSION_MERGE_WINDOW,
     STARTUP_GRACE,
     STORAGE_KEY,
+    AlreadyDone,
     Blocked,
     Decision,
     WakeGuard,
@@ -214,18 +215,31 @@ async def test_automatic_refresh_counts_for_the_manual_cooldown(hass):
 
 async def test_repeated_confirmed_command(hass):
     guard = await new_guard(hass)
-    record = guard.record_command(VIN, "RDL", at(0))
+    record = guard.record_command(VIN, "RDU", at(0))
 
     # Not confirmed yet, a retry is fine
-    guard.check_manual_command(VIN, "RDL", at(0.5))
+    guard.check_manual_command(VIN, "RDU", at(0.5))
 
     guard.command_confirmed(record)
-    with pytest.raises(Blocked) as err:
-        guard.check_manual_command(VIN, "RDL", at(0.5))
-    assert err.value.key == "repeated_command"
-    # A different command, or the same one a minute later, goes out
-    guard.check_manual_command(VIN, "RDU", at(0.5))
-    guard.check_manual_command(VIN, "RDL", at(1.1))
+    with pytest.raises(AlreadyDone):
+        guard.check_manual_command(VIN, "RDU", at(0.5))
+    # The same one a minute later goes out
+    guard.check_manual_command(VIN, "RDU", at(1.1))
+
+    # So does it after the opposite was sent in between
+    guard.command_confirmed(guard.record_command(VIN, "RDL", at(0.6)))
+    guard.check_manual_command(VIN, "RDU", at(0.7))
+
+
+async def test_locking_and_switching_off_always_go_out(hass):
+    guard = await new_guard(hass)
+    for command, opposite in (("RDL", "RDU"), ("REOFF", "REON"), ("ROHVACOFF", "ROHVACON")):
+        guard.command_confirmed(guard.record_command(VIN, command, at(0)))
+        # Even right after the vehicle confirmed it: the state shown may be out
+        # of date, and the vehicle must not stay unlocked or running
+        guard.check_manual_command(VIN, command, at(0.1))
+        guard.command_confirmed(guard.record_command(VIN, opposite, at(0.2)))
+        guard.check_manual_command(VIN, command, at(0.3))
 
 
 async def test_hourly_limit_stops_a_loop(hass):
@@ -234,9 +248,38 @@ async def test_hourly_limit_stops_a_loop(hass):
         guard.check_manual_command(VIN, "HBLF", at(i))
         guard.record_command(VIN, "HBLF", at(i))
     with pytest.raises(Blocked) as err:
-        guard.check_manual_command(VIN, "RDL", at(MANUAL_MAX_PER_HOUR))
+        guard.check_manual_command(VIN, "RDU", at(MANUAL_MAX_PER_HOUR))
     assert err.value.key == "hourly_limit"
-    guard.check_manual_command(VIN, "RDL", at(61))
+    guard.check_manual_command(VIN, "RDU", at(61))
+
+
+async def test_hourly_limit_lets_locking_through(hass):
+    guard = await new_guard(hass)
+    guard.record_command(VIN, "RDU", at(0))
+    for i in range(1, MANUAL_MAX_PER_HOUR):
+        guard.record_command(VIN, "HBLF", at(i))
+
+    # Locking after the unlock goes out despite the limit
+    guard.check_manual_command(VIN, "RDL", at(MANUAL_MAX_PER_HOUR))
+    guard.record_command(VIN, "RDL", at(MANUAL_MAX_PER_HOUR))
+
+    # Locking again and again is a loop, which the limit holds back
+    with pytest.raises(Blocked) as err:
+        guard.check_manual_command(VIN, "RDL", at(MANUAL_MAX_PER_HOUR + 1))
+    assert err.value.key == "hourly_limit"
+
+
+async def test_clock_set_back_does_not_hold_commands_back(hass):
+    guard = await new_guard(hass)
+    # Recorded while the clock was three hours ahead
+    guard.command_confirmed(guard.record_command(VIN, "RDU", at(180)))
+    guard.record_command(VIN, "DEEPREFRESH", at(180))
+    for _ in range(MANUAL_MAX_PER_HOUR):
+        guard.record_command(VIN, "HBLF", at(180))
+
+    guard.check_manual_command(VIN, "RDU", at(0))
+    guard.check_manual_command(VIN, "DEEPREFRESH", at(0))
+    guard.check_manual_command(VIN, "HBLF", at(0))
 
 
 async def test_history_survives_a_restart(hass, hass_storage):

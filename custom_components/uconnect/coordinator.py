@@ -7,15 +7,16 @@ from collections.abc import Callable
 from datetime import datetime, timedelta
 import hmac
 import logging
+import math
 import time
-from typing import Any, TypeVar
+from typing import Any, NoReturn, TypeVar
 
 from .pyuconnect import Client
 from .pyuconnect.command import Command
 from .pyuconnect.api import CHARGING_LEVELS_BY_NAME
 from .pyuconnect.brands import BRANDS as BRANDS_BY_NAME
 
-from .pyuconnect.api import AuthenticationError
+from .pyuconnect.api import AuthenticationError, PinRejectedError
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
@@ -54,7 +55,7 @@ from .const import (
     UNLOCK_MAX_WRONG_CODES,
     DOMAIN,
 )
-from .wake_guard import Blocked, async_get_wake_guard
+from .wake_guard import AlreadyDone, Blocked, async_get_wake_guard
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -82,6 +83,21 @@ class UconnectRequestError(HomeAssistantError):
     refused, the cloud may still carry this action out, and no refresh has
     followed it yet.
     """
+
+
+class PinRejected(ServiceValidationError):
+    """The backend rejected the PIN, nothing reached the vehicle.
+
+    The library does not send the PIN again until it is changed, as further
+    wrong attempts can lock it, also for the official app.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "The Uconnect PIN was rejected. Correct it in the integration options.",
+            translation_domain=DOMAIN,
+            translation_key="pin_rejected",
+        )
 
 
 class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
@@ -190,16 +206,23 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
         if not self.unlock_requires_pin:
             return
 
-        if time.monotonic() < self._unlock_refused_until:
+        # Without a PIN there is nothing to compare with, and no command could
+        # be sent anyway. That is no wrong code, so it does not count as one.
+        pin = str(self.client.api.pin or "")
+        if not pin:
+            self._raise_pin_missing()
+
+        if (remaining := self._unlock_refused_until - time.monotonic()) > 0:
             raise ServiceValidationError(
                 "Unlocking is paused after several wrong codes.",
                 translation_domain=DOMAIN,
                 translation_key="unlock_locked_out",
                 translation_placeholders={
-                    "minutes": str(int(UNLOCK_LOCKOUT.total_seconds() // 60))
+                    "minutes": str(max(math.ceil(remaining / 60), 1))
                 },
             )
 
+        code = "" if code is None else str(code).strip()
         if not code:
             raise ServiceValidationError(
                 "Unlocking needs the Uconnect PIN as the code.",
@@ -207,8 +230,7 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
                 translation_key="unlock_code_required",
             )
 
-        pin = str(self.client.api.pin or "")
-        if not pin or not hmac.compare_digest(str(code).encode(), pin.encode()):
+        if not hmac.compare_digest(code.encode(), pin.encode()):
             self._wrong_codes += 1
             if self._wrong_codes >= UNLOCK_MAX_WRONG_CODES:
                 self._wrong_codes = 0
@@ -264,8 +286,11 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
 
             self.consecutive_failures += 1
 
-            # Without any vehicle there is nothing cached to fall back to
-            if not self.client.vehicles:
+            # Without a poll that worked there is nothing cached to fall back
+            # to. A vehicle can be in the list already: the client adds it
+            # before its status is fetched, and setting up with that half of
+            # the data would leave out most entities until a reload.
+            if not self.client.vehicles or self.last_successful_update is None:
                 raise UpdateFailed(f"Initial data fetch failed: {err}") from err
 
             # A single failed poll is common with this cloud, so the cached
@@ -399,7 +424,8 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
             if schedules is None:
                 return
 
-            record = await self._async_record_manual(vin, SCHEDULE_COMMAND)
+            if (record := await self._async_record_manual(vin, SCHEDULE_COMMAND)) is None:
+                return
             try:
                 result = await self._async_run_locked(
                     self.client.send_charge_schedules_emea,
@@ -408,6 +434,9 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
                     True,
                     on_request=True,
                 )
+            except PinRejectedError as err:
+                async_get_wake_guard(self.hass).forget(vin, record)
+                raise PinRejected from err
             except Exception as err:
                 raise UconnectRequestError(f"{what} failed: {err}") from err
 
@@ -465,21 +494,35 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
                 "before sending commands."
             )
         if not self.client.api.pin:
-            raise ServiceValidationError(
-                "Commands need the Uconnect PIN, set it in the integration options."
-            )
+            self._raise_pin_missing()
+        if self.client.api.pin_rejected:
+            raise PinRejected
         if vin not in self.client.vehicles:
             raise ServiceValidationError(f"Vehicle {vin} is currently not available")
+
+    @staticmethod
+    def _raise_pin_missing() -> NoReturn:
+        raise ServiceValidationError(
+            "Commands need the Uconnect PIN, set it in the integration options.",
+            translation_domain=DOMAIN,
+            translation_key="pin_missing",
+        )
 
     async def _async_record_manual(self, vin: str, command: str):
         """Check a command sent on request against the guard and record it.
 
-        The record is on disk before the command goes out.
+        Returns None, and nothing is to be sent, when the vehicle confirmed the
+        same command moments ago: the vehicle is in that state already, and
+        reporting an error would stop the automation that sent it. The record
+        is on disk before the command goes out.
         """
 
         guard = async_get_wake_guard(self.hass)
         try:
             guard.check_manual_command(vin, command)
+        except AlreadyDone as err:
+            _LOGGER.info("%s not sent again: %s", command, err)
+            return None
         except Blocked as err:
             raise ServiceValidationError(
                 f"{command} not sent: {err}",
@@ -517,12 +560,20 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
         """
 
         self._check_can_send(vin)
-        record = None if automatic else await self._async_record_manual(vin, command)
+        record = None
+        if not automatic:
+            if (record := await self._async_record_manual(vin, command)) is None:
+                return
 
         try:
             result = await self.async_run(func, *args, on_request=not automatic)
         except HomeAssistantError:
             raise
+        except PinRejectedError as err:
+            # Only the PIN went out, the vehicle was not reached
+            if record is not None:
+                async_get_wake_guard(self.hass).forget(vin, record)
+            raise PinRejected from err
         except Exception as err:
             if is_auth_error(err):
                 self.auth_failed = True

@@ -187,10 +187,16 @@ class UconnectSwitch(SwitchEntity, UconnectEntity):
         await self._async_send(self.entity_description.command_on, "turn on")
 
     async def async_turn_off(self, **kwargs):
+        # Charging cannot be stopped remotely. Raising here would stop a
+        # script that turns off all switches before it reaches its next step,
+        # such as arming an alarm, so it is only logged.
         if self.entity_description.command_off is None:
-            raise ServiceValidationError(
-                f"{self.entity_description.name} cannot be turned off"
+            _LOGGER.warning(
+                "%s cannot be turned off remotely, nothing was sent",
+                self.entity_description.name,
             )
+            self.async_write_ha_state()
+            return
 
         # Unlike turning on, turning off is always sent: a state that is out
         # of date must not leave an engine or the climate running

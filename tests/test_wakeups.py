@@ -494,3 +494,105 @@ async def test_remembered_charge_alone_does_not_wake(
     await config_entry.runtime_data.async_refresh()
     await run_for(hass, freezer, 20, every=2)
     assert deep_refreshes(mock_client) >= 1
+
+
+# --- The first refresh of a charge -------------------------------------
+
+
+@pytest.mark.parametrize("interval", [0, 30])
+async def test_charge_reported_long_ago_does_not_wake(
+    hass, freezer, config_entry, mock_client, vehicle, interval
+):
+    # The cloud says charging, but the vehicle last said so two hours ago:
+    # the charge may have ended without the end reaching the cloud
+    charging_car(mock_client, vehicle)
+    vehicle.timestamp_ev_info = dt_util.utcnow() - timedelta(hours=2)
+    await setup(hass, config_entry, interval)
+
+    await run_for(hass, freezer, 6 * 60, every=3)
+    assert deep_refreshes(mock_client) == 0
+
+
+async def test_charge_reported_recently_is_refreshed(
+    hass, freezer, config_entry, mock_client, vehicle
+):
+    charging_car(mock_client, vehicle)
+    vehicle.timestamp_ev_info = dt_util.utcnow() - timedelta(minutes=30)
+    await setup(hass, config_entry, 0)
+
+    await run_for(hass, freezer, 60, every=3)
+    assert deep_refreshes(mock_client) == 1
+
+
+async def test_no_wake_without_a_time_for_the_charge_data(
+    hass, freezer, config_entry, mock_client, vehicle
+):
+    charging_car(mock_client, vehicle)
+    vehicle.timestamp_ev_info = None
+    await setup(hass, config_entry, 30)
+
+    await run_for(hass, freezer, 3 * 60, every=3)
+    assert deep_refreshes(mock_client) == 0
+
+
+async def test_vehicle_missing_for_a_moment_is_refreshed_later(
+    hass, freezer, config_entry, mock_client, vehicle
+):
+    charging_car(mock_client, vehicle)
+    await setup(hass, config_entry, 0)
+
+    # Not in the account list when the refresh is due
+    mock_client.vehicles.clear()
+    await run_for(hass, freezer, 20)
+    assert deep_refreshes(mock_client) == 0
+
+    mock_client.vehicles[VIN] = vehicle
+    vehicle.timestamp_ev_info = dt_util.utcnow()
+    await config_entry.runtime_data.async_refresh()
+    await run_for(hass, freezer, 20)
+    assert deep_refreshes(mock_client) == 1
+
+
+async def test_refresh_by_hand_at_the_start_is_the_start_refresh(
+    hass, freezer, config_entry, mock_client, vehicle
+):
+    vehicle.charging = False
+    await setup(hass, config_entry, 0)
+    await run_for(hass, freezer, 30, every=2)
+
+    # Plugged in, and a deep refresh by hand shows the charge
+    def command(vin, cmd):
+        if cmd.name == "DEEPREFRESH":
+            charging_car(mock_client, vehicle)
+        return True
+
+    mock_client.command_verify.side_effect = command
+    await hass.services.async_call(DOMAIN, "deep_refresh", {}, blocking=True)
+    assert deep_refreshes(mock_client) == 1
+
+    await run_for(hass, freezer, 3 * 60, every=3)
+    assert deep_refreshes(mock_client) == 1
+
+
+async def test_rejected_pin_keeps_the_start_refresh_for_later(
+    hass, freezer, config_entry, mock_client, vehicle
+):
+    from custom_components.uconnect.pyuconnect.api import PinRejectedError
+
+    charging_car(mock_client, vehicle)
+    mock_client.command_verify.side_effect = PinRejectedError("the PIN was rejected")
+    await setup(hass, config_entry, 0)
+    await run_for(hass, freezer, 60, every=3)
+    # One try, which only reached the PIN check, and none after it
+    assert mock_client.command_verify.call_count == 1
+    guard = hass.data[DOMAIN]["_wake_guard"]
+    assert guard.wakes(VIN) == []
+
+    # With the PIN corrected the refresh at the start still comes
+    charging_car(mock_client, vehicle)
+    hass.config_entries.async_update_entry(
+        config_entry, options={**config_entry.options, "pin": "5678"}
+    )
+    await hass.async_block_till_done()
+    await run_for(hass, freezer, 20)
+    assert deep_refreshes(mock_client) == 2

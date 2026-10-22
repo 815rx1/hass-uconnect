@@ -372,11 +372,17 @@
         "refresh_daily_limit": {
             "message": "Not sent: the daily limit for refreshes requested by hand is reached. Try again in {minutes} min."
         },
-        "repeated_command": {
-            "message": "Not sent: {command} was confirmed by the vehicle less than a minute ago."
-        },
         "hourly_limit": {
             "message": "Not sent: more commands than a person sends within an hour, which looks like an automation stuck in a loop. Try again in {minutes} min."
+        },
+        "daily_limit": {
+            "message": "Not sent: more commands than a person sends within a day, which looks like an automation stuck in a loop. Try again in {minutes} min."
+        },
+        "pin_rejected": {
+            "message": "The Uconnect PIN was rejected. Correct it in the integration options. It is not sent again until then, as more wrong attempts can lock it, also in the official app."
+        },
+        "pin_missing": {
+            "message": "Commands need the Uconnect PIN. Set it in the integration options."
         },
         "unlock_code_required": {
             "message": "Unlocking needs the Uconnect PIN as the code. The requirement can be turned off in the integration options."

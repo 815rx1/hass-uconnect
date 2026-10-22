@@ -17,7 +17,10 @@ from custom_components.uconnect.pyuconnect.api import (
     LOGIN_BACKOFF_START,
     AuthenticationError,
     LoginBackoffError,
+    PinRejectedError,
+    _is_token_rejected,
 )
+from custom_components.uconnect.pyuconnect.command import COMMAND_DOORS_LOCK
 from custom_components.uconnect.pyuconnect.brands import FIAT_EU
 from custom_components.uconnect.pyuconnect.client import (
     STATUS_BLOCK_MAX_AGE,
@@ -28,7 +31,7 @@ from custom_components.uconnect.pyuconnect.client import (
 )
 
 from .conftest import VIN, load_fixture
-from .test_pyuconnect import response
+from .test_pyuconnect import logged_in_api, response
 
 LIST_ITEM = {
     "vin": VIN,
@@ -439,3 +442,157 @@ def test_sent_schedules_are_shown_right_away():
     assert client.vehicles[VIN].charge_schedules[2].enable is True
     sent = client.api.set_charge_schedule_emea.call_args.args[1]
     assert json.dumps(sent) == json.dumps(planned)
+
+
+# --- Secrets stay out of errors and logs --------------------------------
+
+
+def login_handler(fail_call: str, failure):
+    """Route the login to canned answers, failing the given Gigya call."""
+
+    def handler(self, method, url, **kw):
+        if url.endswith("/" + fail_call):
+            if isinstance(failure, Exception):
+                raise failure
+            return response(failure, {"error": "x"})
+        if url.endswith("/accounts.webSdkBootstrap"):
+            return response(body={"statusCode": 200})
+        if url.endswith("/accounts.login"):
+            return response(
+                body={"statusCode": 200, "UID": "uid1", "sessionInfo": {"login_token": "LTOKEN"}}
+            )
+        raise AssertionError(url)
+
+    return handler
+
+
+@pytest.mark.parametrize(
+    ("call", "failure"),
+    [
+        ("accounts.login", 503),
+        ("accounts.login", 403),
+        ("accounts.login", requests.exceptions.ConnectTimeout(
+            "HTTPSConnectionPool: /accounts.login?loginID=user%40example.com&password=Sup3rSecret"
+        )),
+        ("accounts.getJWT", 500),
+    ],
+)
+def test_login_errors_carry_no_secrets(call, failure):
+    api = API("user@example.com", "Sup3rSecret", "1234", FIAT_EU)
+    with patch.object(
+        requests.Session, "request", autospec=True, side_effect=login_handler(call, failure)
+    ):
+        with pytest.raises(Exception) as err:
+            api._refresh_token_if_needed()
+
+    seen = []
+    error = err.value
+    while error is not None:
+        seen.append(str(error))
+        error = error.__cause__ or (None if error.__suppress_context__ else error.__context__)
+    text = " ".join(seen)
+    assert call in text
+    for secret in ("Sup3rSecret", "user@example.com", "user%40example.com", "LTOKEN"):
+        assert secret not in text
+
+
+def test_http_errors_leave_out_account_and_vehicle():
+    api = logged_in_api()
+    failed = response(500, {"debugMsg": "boom"})
+    failed.url = f"https://channels.example.invalid/v1/accounts/uid1/vehicles/{VIN}/remote/status"
+    with patch.object(api.sess, "request", return_value=failed):
+        with pytest.raises(requests.HTTPError) as err:
+            api.get_vehicle_status(VIN)
+    assert "uid1" not in str(err.value) and VIN not in str(err.value)
+    assert "HTTP 500" in str(err.value)
+    # Callers still see the status
+    assert err.value.response.status_code == 500
+
+
+def test_debug_log_leaves_out_vin_position_and_account(caplog):
+    api = logged_in_api()
+    body = {"vin": VIN, "uid": "uid1", "latitude": 48.137, "longitude": "11.575", "soc": 80}
+    with patch.object(api.sess, "request", return_value=response(200, body)):
+        with caplog.at_level(logging.DEBUG, logger="custom_components.uconnect.pyuconnect.api"):
+            api.get_vehicle_location(VIN)
+    text = caplog.text
+    assert "get_vehicle_location" in text and "80" in text
+    for secret in (VIN, "uid1", "48.137", "11.575"):
+        assert secret not in text
+
+
+def test_signing_library_does_not_log_secrets():
+    assert logging.getLogger("requests_auth_aws_sigv4").getEffectiveLevel() >= logging.WARNING
+
+
+# --- The PIN ------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("status", "body"),
+    [(403, {"name": "INVALID_PIN"}), (423, {"name": "PIN_LOCKED"}), (401, {"message": "no"})],
+)
+def test_rejected_pin_is_not_sent_again(status, body):
+    api = logged_in_api()
+    api._last_rejected_relogin = 0.0
+    with patch(
+        "custom_components.uconnect.pyuconnect.api.time.monotonic", return_value=100.0
+    ), patch.object(api.sess, "request", return_value=response(status, body)) as req:
+        with pytest.raises(PinRejectedError):
+            api.command(VIN, COMMAND_DOORS_LOCK)
+        sent = req.call_count
+        # Nothing goes out any more, neither a command nor the PIN
+        with pytest.raises(PinRejectedError):
+            api.command(VIN, COMMAND_DOORS_LOCK)
+        assert req.call_count == sent
+
+    # A new PIN is tried again
+    api.set_pin("5678")
+    answers = [
+        response(200, {"token": "pin-1", "expiry": 300000}),
+        response(200, {"responseStatus": "pending", "correlationId": "a"}),
+    ]
+    with patch.object(api.sess, "request", side_effect=answers):
+        assert api.command(VIN, COMMAND_DOORS_LOCK) == "a"
+
+
+def test_pin_that_cannot_be_right_is_not_sent():
+    api = logged_in_api()
+    api.set_pin("12 34")
+    with patch.object(api.sess, "request") as req:
+        with pytest.raises(PinRejectedError):
+            api.command(VIN, COMMAND_DOORS_LOCK)
+    req.assert_not_called()
+
+
+def test_command_queued_is_never_sent_twice():
+    # An answer that queued the command is no rejected token, whatever it says
+    queued = response(
+        200, {"responseStatus": "pending", "correlationId": "a", "note": "expired_token"}
+    )
+    assert not _is_token_rejected(queued)
+    assert _is_token_rejected(response(200, {"name": "EXPIRED_TOKEN"}))
+
+
+# --- The login backoff outlives the client -------------------------------
+
+
+def test_backoff_is_kept_for_a_new_client():
+    api = logged_out_api()
+    api.login = MagicMock(side_effect=Exception("down"))
+    with pytest.raises(Exception, match="unable to login"):
+        api._refresh_token_if_needed()
+
+    # Home Assistant retrying the setup creates a new client
+    retry = logged_out_api()
+    retry.login = MagicMock()
+    with pytest.raises(LoginBackoffError):
+        retry._refresh_token_if_needed()
+    retry.login.assert_not_called()
+
+    # A new password is tried at once
+    fixed = API("user@example.com", "new-pw", "1234", FIAT_EU)
+    fixed.login = MagicMock(side_effect=Exception("still down"))
+    with pytest.raises(Exception, match="unable to login"):
+        fixed._refresh_token_if_needed()
+    fixed.login.assert_called_once()

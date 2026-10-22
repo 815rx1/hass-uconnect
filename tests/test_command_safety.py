@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import dataclasses
+from datetime import timedelta
+import time
+from unittest.mock import patch
 
 import pytest
 from homeassistant.const import EntityCategory
@@ -14,6 +17,7 @@ from homeassistant.setup import async_setup_component
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.uconnect.const import CONF_UNLOCK_REQUIRES_PIN, DOMAIN
+from custom_components.uconnect.wake_guard import MANUAL_MAX_PER_HOUR
 from custom_components.uconnect.lock import doors_locked
 from custom_components.uconnect.pyuconnect.command import COMMAND_DOORS_LOCK
 
@@ -69,7 +73,7 @@ async def test_lock_needs_no_code(hass, config_entry, mock_client):
     assert sent(mock_client) == ["RDL"]
 
 
-async def test_wrong_codes_pause_unlocking(hass, config_entry, mock_client):
+async def test_wrong_codes_pause_unlocking(hass, freezer, config_entry, mock_client):
     await setup(hass, config_entry)
     lock = entity_id(hass, "lock", "lock_doors")
     for _ in range(5):
@@ -78,11 +82,45 @@ async def test_wrong_codes_pause_unlocking(hass, config_entry, mock_client):
                 "lock", "unlock", {"entity_id": lock, "code": "0000"}, blocking=True
             )
     # Even the right code is refused for a while now
-    with pytest.raises(ServiceValidationError):
+    with pytest.raises(ServiceValidationError) as err:
         await hass.services.async_call(
             "lock", "unlock", {"entity_id": lock, "code": PIN}, blocking=True
         )
+    assert err.value.translation_placeholders == {"minutes": "5"}
     assert "RDU" not in sent(mock_client)
+
+    # The message says how long is left
+    with patch(
+        "custom_components.uconnect.coordinator.time.monotonic",
+        return_value=time.monotonic() + 200,
+    ), pytest.raises(ServiceValidationError) as err:
+        await hass.services.async_call(
+            "lock", "unlock", {"entity_id": lock, "code": PIN}, blocking=True
+        )
+    assert err.value.translation_placeholders == {"minutes": "2"}
+
+
+async def test_code_with_spaces_and_as_number(hass, config_entry, mock_client):
+    await setup(hass, config_entry)
+    lock = entity_id(hass, "lock", "lock_doors")
+    await hass.services.async_call(DOMAIN, "doors_unlock", {"code": " 1234 "}, blocking=True)
+    await hass.services.async_call("lock", "lock", {"entity_id": lock}, blocking=True)
+    await hass.services.async_call(
+        "lock", "unlock", {"entity_id": lock, "code": 1234}, blocking=True
+    )
+    assert sent(mock_client) == ["RDU", "RDL", "RDU"]
+
+
+async def test_unlock_without_a_pin_set_is_no_wrong_code(hass, config_entry, mock_client):
+    mock_client.api.pin = ""
+    await setup(hass, config_entry)
+    for _ in range(6):
+        with pytest.raises(ServiceValidationError) as err:
+            await hass.services.async_call(
+                DOMAIN, "doors_unlock", {"code": PIN}, blocking=True
+            )
+        assert err.value.translation_key == "pin_missing"
+    assert sent(mock_client) == []
 
 
 async def test_unlock_all_locks_leaves_the_car_locked(hass, config_entry, mock_client):
@@ -343,12 +381,67 @@ async def test_vehicle_missing_from_the_update_is_not_replaced(
 # --- Repeats and loops --------------------------------------------------
 
 
-async def test_repeated_lock_right_after_confirmation(hass, config_entry, mock_client):
+async def test_locking_always_goes_out(hass, config_entry, mock_client):
     await setup(hass, config_entry)
-    await hass.services.async_call(DOMAIN, "doors_lock", {}, blocking=True)
-    with pytest.raises(ServiceValidationError):
-        await hass.services.async_call(DOMAIN, "doors_lock", {}, blocking=True)
-    assert sent(mock_client) == ["RDL"]
+    lock = entity_id(hass, "lock", "lock_doors")
+    await hass.services.async_call("lock", "lock", {"entity_id": lock}, blocking=True)
+    await hass.services.async_call(
+        "lock", "unlock", {"entity_id": lock, "code": PIN}, blocking=True
+    )
+    # Locked again right after: it must not stay unlocked
+    await hass.services.async_call("lock", "lock", {"entity_id": lock}, blocking=True)
+    await hass.services.async_call("lock", "lock", {"entity_id": lock}, blocking=True)
+    assert sent(mock_client) == ["RDL", "RDU", "RDL", "RDL"]
+
+
+async def test_repeated_unlock_is_skipped_quietly(hass, config_entry, mock_client):
+    await setup(hass, config_entry)
+    await hass.services.async_call(DOMAIN, "doors_unlock", {"code": PIN}, blocking=True)
+    # Confirmed moments ago: nothing to send, and no error that would stop
+    # the automation calling it
+    await hass.services.async_call(DOMAIN, "doors_unlock", {"code": PIN}, blocking=True)
+    assert sent(mock_client) == ["RDU"]
+
+
+async def test_engine_off_after_on(hass, config_entry, mock_client, vehicle):
+    vehicle.supported_commands += ["REON", "REOFF"]
+    vehicle.ignition_on = False
+    await setup(hass, config_entry)
+    engine = entity_id(hass, "switch", "switch_engine")
+    for service in ("turn_off", "turn_on", "turn_off"):
+        await hass.services.async_call(
+            "switch", service, {"entity_id": engine}, blocking=True
+        )
+    assert sent(mock_client) == ["REOFF", "REON", "REOFF"]
+
+
+async def test_turning_off_all_switches_does_not_stop_a_script(
+    hass, config_entry, mock_client, vehicle
+):
+    # Charging cannot be stopped remotely, which must not end the script
+    # before its next step
+    vehicle.supported_commands += ["CNOW"]
+    vehicle.charging = True
+    await setup(hass, config_entry)
+    await hass.services.async_call("switch", "turn_off", {"entity_id": "all"}, blocking=True)
+    assert "CNOW" not in sent(mock_client)
+
+
+async def test_limit_reported_through_the_select(hass, config_entry, mock_client):
+    await setup(hass, config_entry)
+    for _ in range(MANUAL_MAX_PER_HOUR):
+        await hass.services.async_call(DOMAIN, "lights_horn", {}, blocking=True)
+    with pytest.raises(ServiceValidationError) as err:
+        await hass.services.async_call(
+            "select",
+            "select_option",
+            {
+                "entity_id": entity_id(hass, "select", "charging_level_preference"),
+                "option": "LEVEL_FIVE",
+            },
+            blocking=True,
+        )
+    assert err.value.translation_key == "hourly_limit"
 
 
 async def test_unconfirmed_lock_can_be_retried(hass, config_entry, mock_client):
@@ -364,3 +457,37 @@ async def test_unconfirmed_lock_can_be_retried(hass, config_entry, mock_client):
 def test_commands_cannot_be_changed():
     with pytest.raises(dataclasses.FrozenInstanceError):
         COMMAND_DOORS_LOCK.name = "RDU"
+
+
+async def test_rejected_pin_is_reported_and_not_counted(hass, config_entry, mock_client):
+    from custom_components.uconnect.pyuconnect.api import PinRejectedError
+
+    await setup(hass, config_entry)
+    mock_client.command_verify.side_effect = PinRejectedError("rejected")
+    with pytest.raises(ServiceValidationError) as err:
+        await hass.services.async_call(DOMAIN, "doors_lock", {}, blocking=True)
+    assert err.value.translation_key == "pin_rejected"
+    # Nothing reached the vehicle, so nothing is counted as a wake-up
+    assert hass.data[DOMAIN]["_wake_guard"].wakes(VIN) == []
+
+    # Known rejected: refused without trying
+    mock_client.api.pin_rejected = True
+    mock_client.command_verify.reset_mock()
+    with pytest.raises(ServiceValidationError):
+        await hass.services.async_call(DOMAIN, "doors_lock", {}, blocking=True)
+    mock_client.command_verify.assert_not_called()
+
+
+async def test_daily_limit(hass, freezer, config_entry, mock_client):
+    from custom_components.uconnect.wake_guard import MANUAL_MAX_PER_DAY
+
+    await setup(hass, config_entry)
+    for _ in range(MANUAL_MAX_PER_DAY):
+        await hass.services.async_call(DOMAIN, "lights_horn", {}, blocking=True)
+        freezer.tick(timedelta(minutes=3))
+    with pytest.raises(ServiceValidationError) as err:
+        await hass.services.async_call(DOMAIN, "lights_horn", {}, blocking=True)
+    assert err.value.translation_key == "daily_limit"
+    # Locking still goes out
+    await hass.services.async_call(DOMAIN, "doors_lock", {}, blocking=True)
+    assert sent(mock_client)[-1] == "RDL"

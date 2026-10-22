@@ -108,6 +108,8 @@ class UconnectSelectSetChargingLevel(SelectEntity, UconnectEntity):
 
         try:
             await self.coordinator.async_set_charging_level(self.vehicle.vin, option)
+        except HomeAssistantError:
+            raise
         except Exception as err:
             _LOGGER.error("Failed to set charging level to %s: %s", option, err)
             raise HomeAssistantError(f"Failed to set charging level: {err}") from err

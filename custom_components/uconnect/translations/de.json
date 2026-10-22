@@ -372,11 +372,17 @@
         "refresh_daily_limit": {
             "message": "Nicht gesendet: Das Tageslimit für von Hand angeforderte Aktualisierungen ist erreicht. Versuche es in {minutes} Min. erneut."
         },
-        "repeated_command": {
-            "message": "Nicht gesendet: {command} wurde vom Fahrzeug vor weniger als einer Minute bestätigt."
-        },
         "hourly_limit": {
             "message": "Nicht gesendet: Mehr Befehle innerhalb einer Stunde, als ein Mensch sendet, das sieht nach einer Automation in einer Schleife aus. Versuche es in {minutes} Min. erneut."
+        },
+        "daily_limit": {
+            "message": "Nicht gesendet: Mehr Befehle innerhalb eines Tages, als ein Mensch sendet, das sieht nach einer Automation in einer Schleife aus. Versuche es in {minutes} Min. erneut."
+        },
+        "pin_rejected": {
+            "message": "Die Uconnect-PIN wurde abgelehnt. Korrigiere sie in den Optionen der Integration. Bis dahin wird sie nicht mehr gesendet, weil weitere Fehlversuche sie sperren können, auch in der offiziellen App."
+        },
+        "pin_missing": {
+            "message": "Befehle brauchen die Uconnect-PIN. Trage sie in den Optionen der Integration ein."
         },
         "unlock_code_required": {
             "message": "Zum Entriegeln wird die Uconnect-PIN als Code benötigt. Die Abfrage lässt sich in den Optionen der Integration abschalten."

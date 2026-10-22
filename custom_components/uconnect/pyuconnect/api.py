@@ -2,10 +2,13 @@ import requests
 import uuid
 import json
 import base64
+import hashlib
 import logging
+import re
 import threading
 import time
 import http.client as http_client
+from urllib.parse import urlsplit
 
 from dataclasses import dataclass
 from dataclasses_json import dataclass_json
@@ -17,6 +20,11 @@ from .command import Command
 from .brands import Brand
 
 _LOGGER = logging.getLogger(__name__)
+
+# The signing library logs the session token and the signed request bodies,
+# which carry the PIN, at debug level. A global debug log would otherwise put
+# them into bug reports.
+logging.getLogger("requests_auth_aws_sigv4").setLevel(logging.WARNING)
 
 # Connect and read timeout in seconds applied to every request
 DEFAULT_TIMEOUT = (10, 30)
@@ -47,6 +55,90 @@ class AuthenticationError(Exception):
 
 class LoginBackoffError(Exception):
     """No login was attempted because the last ones failed shortly before"""
+
+
+class PinRejectedError(Exception):
+    """The backend rejected the PIN.
+
+    It is not sent again until it is changed: every further attempt with a
+    wrong PIN brings the account closer to a PIN lock, which also blocks the
+    commands of the official app.
+    """
+
+
+class UconnectHTTPError(requests.exceptions.HTTPError):
+    """An HTTP error whose message leaves out the account and the vehicle"""
+
+
+# Markers in an answer that mean the AWS credentials were refused, as opposed
+# to the request itself
+_CREDENTIAL_MARKERS = (
+    "security token",
+    "signature expired",
+    "expired_token",
+    "token has expired",
+)
+
+_ACCOUNT_IN_PATH = re.compile(r"(/accounts/)[^/?#]+")
+_VEHICLE_IN_PATH = re.compile(r"(/vehicles/)[^/?#]+")
+_VIN = re.compile(r"\b[A-HJ-NPR-Z0-9]{17}\b")
+_COORDINATE = re.compile(
+    r'("(?:latitude|longitude|lat|lon|lng)"\s*:\s*)"?-?[0-9.]+"?', re.IGNORECASE
+)
+
+
+def _redacted_path(url: str | None) -> str:
+    path = urlsplit(url or "").path
+    path = _ACCOUNT_IN_PATH.sub(r"\1*", path)
+    return _VEHICLE_IN_PATH.sub(r"\1*", path)
+
+
+def _raise_for_status(r: requests.Response) -> None:
+    """Raises for an HTTP error status like requests does, but without the URL.
+
+    requests quotes the full URL, which holds the account ID and the VIN, and
+    that message ends up in the log and in errors shown in the frontend.
+    """
+
+    if r.status_code < 400:
+        return
+
+    method = r.request.method if r.request is not None else None
+    where = " ".join(x for x in (method, _redacted_path(r.url)) if x)
+    raise UconnectHTTPError(
+        f"HTTP {r.status_code} {r.reason or ''}".rstrip() + (f" on {where}" if where else ""),
+        response=r,
+    )
+
+
+def _redact(text: str, *secrets: str | None) -> str:
+    """Removes account details, VINs and coordinates from a logged answer"""
+
+    for secret in secrets:
+        if secret:
+            text = text.replace(secret, "*")
+    text = _VIN.sub("<vin>", text)
+    return _COORDINATE.sub(r"\1<redacted>", text)
+
+
+@dataclass
+class _LoginBackoff:
+    failures: int = 0
+    next_attempt: float = 0.0
+
+
+# The login backoff is kept per account and password beyond one API object:
+# Home Assistant creates a new client on every setup retry, which would
+# otherwise start the backoff from scratch and log in every few minutes. A new
+# password starts without backoff.
+_LOGIN_BACKOFFS: dict[str, _LoginBackoff] = {}
+
+
+def _login_backoff(login_url: str, email: str | None, password: str | None) -> _LoginBackoff:
+    key = hashlib.sha256(
+        f"{login_url}\n{(email or '').casefold()}\n{password or ''}".encode()
+    ).hexdigest()
+    return _LOGIN_BACKOFFS.setdefault(key, _LoginBackoff())
 
 
 def _login_error(r: dict) -> str:
@@ -84,14 +176,39 @@ def _is_token_rejected(r: requests.Response) -> bool:
     if r.status_code not in (200, 403) or len(r.content) > 4096:
         return False
 
-    text = r.text.lower()
     if r.status_code == 200:
-        return "expired_token" in text
+        # Only the error envelope, never an answer that queued a command,
+        # which would then be sent a second time
+        try:
+            body = r.json()
+        except ValueError:
+            return False
+        return (
+            isinstance(body, dict)
+            and str(body.get("name", "")).upper() == "EXPIRED_TOKEN"
+            and "correlationId" not in body
+        )
 
-    return any(
-        marker in text
-        for marker in ("security token", "signature expired", "expired_token", "token has expired")
-    )
+    text = r.text.lower()
+    return any(marker in text for marker in _CREDENTIAL_MARKERS)
+
+
+def _pin_rejected(r: requests.Response) -> bool:
+    """Tells whether the answer of the PIN authentication rejects the PIN.
+
+    The backend answers a wrong PIN with 403 INVALID_PIN, some accounts with
+    401, and a locked PIN with 423. A 401 that names the credentials is about
+    those, and was already retried with a fresh login.
+    """
+
+    if r.status_code == 423:
+        return True
+    text = r.text.lower() if len(r.content) <= 4096 else ""
+    if r.status_code == 403:
+        return "invalid_pin" in text
+    if r.status_code == 401:
+        return not any(marker in text for marker in _CREDENTIAL_MARKERS)
+    return False
 
 
 class _TimeoutSession(requests.Session):
@@ -162,11 +279,12 @@ class API:
 
         # PIN authentication token and the monotonic time it is valid until
         self._pin_token: tuple[str, float] | None = None
+        # The PIN the backend rejected, see PinRejectedError
+        self._pin_rejected: str | None = None
 
         # Login protection, see LOGIN_BACKOFF_START. The credentials, once
         # rejected, are not tried again: a new API object gets the new ones.
-        self._login_failures = 0
-        self._next_login_attempt = 0.0
+        self._backoff = _login_backoff(brand.login_url, email, password)
         self._credentials_rejected: str | None = None
         self._last_rejected_relogin: float | None = None
         # Set for calls made on request: a person locking the car waits for
@@ -223,31 +341,80 @@ class API:
     def set_tls_verification(self, verify: bool):
         self.sess.verify = verify
 
+    @property
+    def pin_rejected(self) -> bool:
+        """Whether the PIN set now was rejected, so it is not sent again"""
+        return self._pin_rejected is not None and self._pin_rejected == self.pin
+
+    @property
+    def _login_failures(self) -> int:
+        return self._backoff.failures
+
+    @property
+    def _next_login_attempt(self) -> float:
+        return self._backoff.next_attempt
+
     def set_pin(self, pin: str):
         if pin != self.pin:
             self._pin_token = None
+            self._pin_rejected = None
         self.pin = pin
+
+    def _log_response(self, what: str, r: requests.Response) -> None:
+        """Logs an answer at debug level without account details or position"""
+
+        if _LOGGER.isEnabledFor(logging.DEBUG):
+            _LOGGER.debug(
+                "%s: HTTP %s %s",
+                what,
+                r.status_code,
+                _redact(r.text[:4000], self.uid, self.email),
+            )
+
+    def _gigya(self, method: str, call: str, params: dict) -> dict:
+        """Calls the login service, keeping secrets out of any error raised.
+
+        The login sends the password and the session tokens as URL
+        parameters, and requests quotes the URL in its errors, which reach
+        the log and the frontend. The answer carries the session and the
+        profile, so only its outcome is logged.
+        """
+
+        try:
+            r = self.sess.request(
+                method=method, url=f"{self.brand.login_url}/{call}", params=params
+            )
+        except requests.exceptions.RequestException as err:
+            raise Exception(f"{call}: {type(err).__name__}") from None
+
+        if r.status_code >= 400:
+            raise Exception(f"{call}: HTTP {r.status_code}")
+
+        try:
+            body = r.json()
+        except ValueError:
+            raise Exception(f"{call}: the answer is not JSON") from None
+
+        if not isinstance(body, dict):
+            raise Exception(f"{call}: unexpected answer")
+
+        _LOGGER.debug("Login: %s: statusCode %s", call, body.get("statusCode"))
+        return body
 
     def login(self):
         """Logs into the Uconnect and caches the auth tokens"""
 
-        r = self.sess.request(
-            method="GET",
-            url=self.brand.login_url + "/accounts.webSdkBootstrap",
-            params={"apiKey": self.brand.login_api_key},
+        r = self._gigya(
+            "GET", "accounts.webSdkBootstrap", {"apiKey": self.brand.login_api_key}
         )
-
-        r.raise_for_status()
-        r = r.json()
-        _LOGGER.debug("Login: accounts.webSdkBootstrap: statusCode %s", r.get("statusCode"))
 
         if r.get("statusCode") != 200:
             raise Exception(f"bootstrap failed: {_login_error(r)}")
 
-        r = self.sess.request(
-            method="POST",
-            url=self.brand.login_url + "/accounts.login",
-            params=self._with_default_params(
+        r = self._gigya(
+            "POST",
+            "accounts.login",
+            self._with_default_params(
                 {
                     "loginID": self.email,
                     "password": self.password,
@@ -257,12 +424,6 @@ class API:
             ),
         )
 
-        r.raise_for_status()
-        r = r.json()
-        # The response carries the session and the profile, so only the
-        # outcome is logged
-        _LOGGER.debug("Login: accounts.login: statusCode %s", r.get("statusCode"))
-
         if r.get("statusCode") != 200:
             if r.get("errorCode") in AUTH_ERROR_CODES:
                 raise AuthenticationError(f"account login failed: {_login_error(r)}")
@@ -271,20 +432,16 @@ class API:
         self.uid = r["UID"]
         login_token = r["sessionInfo"]["login_token"]
 
-        r = self.sess.request(
-            method="POST",
-            url=self.brand.login_url + "/accounts.getJWT",
-            params=self._with_default_params(
+        r = self._gigya(
+            "POST",
+            "accounts.getJWT",
+            self._with_default_params(
                 {
                     "login_token": login_token,
                     "fields": "profile.firstName,profile.lastName,profile.email,country,locale,data.disclaimerCodeGSDP",
                 }
             ),
         )
-
-        r.raise_for_status()
-        r = r.json()
-        _LOGGER.debug("Login: accounts.getJWT: statusCode %s", r.get("statusCode"))
 
         if r.get("statusCode") != 200 or not r.get("id_token"):
             raise Exception(f"unable to obtain JWT: {_login_error(r)}")
@@ -297,7 +454,7 @@ class API:
             json={"gigya_token": r["id_token"]},
         )
 
-        r.raise_for_status()
+        _raise_for_status(r)
         r = r.json()
         _LOGGER.debug("Login: obtain token: keys %s", sorted(r) if isinstance(r, dict) else None)
 
@@ -344,7 +501,7 @@ class API:
             ),
         )
 
-        r.raise_for_status()
+        _raise_for_status(r)
         r = r.json()
 
         creds = r.get("Credentials", None)
@@ -372,11 +529,12 @@ class API:
                     f"the credentials were rejected: {self._credentials_rejected}"
                 )
 
-            wait = self._next_login_attempt - time.monotonic()
+            backoff = self._backoff
+            wait = backoff.next_attempt - time.monotonic()
             if wait > 0 and not self.bypass_login_backoff:
                 raise LoginBackoffError(
                     f"login paused for another {int(wait) + 1} s after "
-                    f"{self._login_failures} failed attempts"
+                    f"{backoff.failures} failed attempts"
                 )
 
             try:
@@ -385,16 +543,16 @@ class API:
                 self._credentials_rejected = str(e)
                 raise
             except Exception as e:
-                self._login_failures += 1
+                backoff.failures += 1
                 delay = min(
-                    LOGIN_BACKOFF_START * 2 ** (self._login_failures - 1),
+                    LOGIN_BACKOFF_START * 2 ** (backoff.failures - 1),
                     LOGIN_BACKOFF_MAX,
                 )
-                self._next_login_attempt = time.monotonic() + delay
+                backoff.next_attempt = time.monotonic() + delay
                 raise Exception(f"unable to login: {e}") from e
 
-            self._login_failures = 0
-            self._next_login_attempt = 0.0
+            backoff.failures = 0
+            backoff.next_attempt = 0.0
 
     def _invalidate_token(self):
         """Forces a fresh login on the next request"""
@@ -468,8 +626,8 @@ class API:
             params={"stage": "ALL", "sdp": "ALL", "brand": self.brand.brand_code},
         )
 
-        r.raise_for_status()
-        _LOGGER.debug(f"list_vehicles: {r.text}")
+        _raise_for_status(r)
+        self._log_response("list_vehicles", r)
         r = r.json()
 
         if "vehicles" not in r:
@@ -503,8 +661,8 @@ class API:
                     + f"/{api_version}/accounts/{self.uid}/vehicles/{vin}/status/",
                 )
 
-                r.raise_for_status()
-                _LOGGER.debug(f"get_vehicle ({vin}, {api_version}): {r.text}")
+                _raise_for_status(r)
+                self._log_response(f"get_vehicle {api_version}", r)
                 return r.json()
 
             except requests.exceptions.HTTPError as err:
@@ -552,8 +710,8 @@ class API:
             + f"/v1/accounts/{self.uid}/vehicles/{vin}/remote/status",
         )
 
-        r.raise_for_status()
-        _LOGGER.debug(f"get_vehicle_status ({vin}): {r.text}")
+        _raise_for_status(r)
+        self._log_response("get_vehicle_status", r)
         r = r.json()
 
         return r
@@ -573,8 +731,8 @@ class API:
             + f"/v1/accounts/{self.uid}/vehicles/{vin}/location/lastknown",
         )
 
-        r.raise_for_status()
-        _LOGGER.debug(f"get_vehicle_location ({vin}): {r.text}")
+        _raise_for_status(r)
+        self._log_response("get_vehicle_location", r)
         r = r.json()
 
         return r
@@ -593,8 +751,8 @@ class API:
             url=self.brand.api.url + f"/v1/accounts/{self.uid}/vehicles/{vin}/vhr/",
         )
 
-        r.raise_for_status()
-        _LOGGER.debug(f"get_vehicle_health_report ({vin}): {r.text}")
+        _raise_for_status(r)
+        self._log_response("get_vehicle_health_report", r)
         r = r.json()
 
         return r
@@ -614,8 +772,8 @@ class API:
             + f"/v1/accounts/{self.uid}/vehicles/{vin}/maintenance/history/",
         )
 
-        r.raise_for_status()
-        _LOGGER.debug(f"get_maintenance_history ({vin}): {r.text}")
+        _raise_for_status(r)
+        self._log_response("get_maintenance_history", r)
         r = r.json()
 
         return r
@@ -635,8 +793,8 @@ class API:
             + f"/v2/accounts/{self.uid}/vehicles/{vin}/ecocoaching/get-last-trip/",
         )
 
-        r.raise_for_status()
-        _LOGGER.debug(f"get_eco_coaching_last_trip ({vin}): {r.text}")
+        _raise_for_status(r)
+        self._log_response("get_eco_coaching_last_trip", r)
         r = r.json()
 
         return r
@@ -656,8 +814,8 @@ class API:
             + f"/v2/accounts/{self.uid}/vehicles/{vin}/ecocoaching/get-trips/",
         )
 
-        r.raise_for_status()
-        _LOGGER.debug(f"get_eco_coaching_trips ({vin}): {r.text}")
+        _raise_for_status(r)
+        self._log_response("get_eco_coaching_trips", r)
         r = r.json()
 
         return r
@@ -681,8 +839,8 @@ class API:
             json=data,
         )
 
-        r.raise_for_status()
-        _LOGGER.debug(f"get_vehicle_image ({vin}): {r.text}")
+        _raise_for_status(r)
+        self._log_response("get_vehicle_image", r)
         r = r.json()
 
         return r
@@ -704,8 +862,8 @@ class API:
             url=url,
         )
 
-        r.raise_for_status()
-        _LOGGER.debug(f"get_vehicle_notifications ({vin}): {r.text}")
+        _raise_for_status(r)
+        self._log_response("get_vehicle_notifications", r)
         r = r.json()
 
         return r
@@ -721,8 +879,8 @@ class API:
             + f"/v1/accounts/{self.uid}/vehicles/{vin}/svla/status/",
         )
 
-        r.raise_for_status()
-        _LOGGER.debug(f"get_stolen_vehicle_status ({vin}): {r.text}")
+        _raise_for_status(r)
+        self._log_response("get_stolen_vehicle_status", r)
         r = r.json()
 
         return r
@@ -738,8 +896,8 @@ class API:
             + f"/v1/accounts/{self.uid}/vehicles/{vin}/subscription/",
         )
 
-        r.raise_for_status()
-        _LOGGER.debug(f"get_vehicle_subscription ({vin}): {r.text}")
+        _raise_for_status(r)
+        self._log_response("get_vehicle_subscription", r)
         r = r.json()
 
         return r
@@ -756,8 +914,8 @@ class API:
             json={"nickname": nickname},
         )
 
-        r.raise_for_status()
-        _LOGGER.debug(f"set_vehicle_nickname ({vin} {nickname}): {r.text}")
+        _raise_for_status(r)
+        self._log_response("set_vehicle_nickname", r)
         r = r.json()
 
         return r
@@ -783,8 +941,8 @@ class API:
             json=data,
         )
 
-        r.raise_for_status()
-        _LOGGER.debug(f"update_location ({vin}): {r.text}")
+        _raise_for_status(r)
+        self._log_response("update_location", r)
         r = r.json()
 
         if "responseStatus" not in r or r["responseStatus"] != "pending":
@@ -804,8 +962,8 @@ class API:
             + f"/v1/accounts/{self.uid}/vehicles/{vin}/remote/{correlation_id}/status/",
         )
 
-        r.raise_for_status()
-        _LOGGER.debug(f"get_remote_operation_status ({vin} {correlation_id}): {r.text}")
+        _raise_for_status(r)
+        self._log_response("get_remote_operation_status", r)
         r = r.json()
 
         return r
@@ -822,6 +980,13 @@ class API:
         if cached is not None and time.monotonic() < cached[1]:
             return cached[0]
 
+        if self.pin_rejected:
+            raise PinRejectedError(
+                "the PIN was rejected and is not sent again until it is changed"
+            )
+        if not self.pin or not str(self.pin).isdigit():
+            raise PinRejectedError("the PIN must consist of digits only")
+
         data = {
             "pin": base64.b64encode(self.pin.encode()).decode(encoding="utf-8"),
         }
@@ -836,7 +1001,15 @@ class API:
             json=data,
         )
 
-        r.raise_for_status()
+        if _pin_rejected(r):
+            self._pin_rejected = self.pin
+            raise PinRejectedError(
+                "the PIN is locked, unlock it in the official app"
+                if r.status_code == 423
+                else f"the PIN was rejected (HTTP {r.status_code})"
+            )
+
+        _raise_for_status(r)
         r = r.json()
         _LOGGER.debug("pin auth: token %s", "received" if r.get("token") else "missing")
 
@@ -873,8 +1046,8 @@ class API:
             json=data,
         )
 
-        r.raise_for_status()
-        _LOGGER.debug(f"command execute ({vin} {cmd}): {r.text}")
+        _raise_for_status(r)
+        self._log_response("command execute", r)
         r = r.json()
 
         if "responseStatus" not in r or r["responseStatus"] != "pending":
@@ -925,8 +1098,8 @@ class API:
             + f"/v4/accounts/{self.uid}/vehicles/{vin}/ev/schedule/",
         )
 
-        r.raise_for_status()
-        _LOGGER.debug(f"get_charge_schedules ({vin}): {r.text}")
+        _raise_for_status(r)
+        self._log_response("get_charge_schedules", r)
         r = r.json()
 
         return r
@@ -948,8 +1121,8 @@ class API:
             json=data,
         )
 
-        r.raise_for_status()
-        _LOGGER.debug(f"set_charge_schedule ({vin}): {r.text}")
+        _raise_for_status(r)
+        self._log_response("set_charge_schedule", r)
         r = r.json()
 
         if "correlationId" not in r:
@@ -986,8 +1159,8 @@ class API:
             json=data,
         )
 
-        r.raise_for_status()
-        _LOGGER.debug(f"set_charge_schedule_emea ({vin}): {r.text}")
+        _raise_for_status(r)
+        self._log_response("set_charge_schedule_emea", r)
         r = r.json()
 
         if "correlationId" not in r:
@@ -1021,8 +1194,8 @@ class API:
             json=data,
         )
 
-        r.raise_for_status()
-        _LOGGER.debug(f"set charging level ({vin} {level.name}): {r.text}")
+        _raise_for_status(r)
+        self._log_response("set charging level", r)
         r = r.json()
 
         if "correlationId" not in r:

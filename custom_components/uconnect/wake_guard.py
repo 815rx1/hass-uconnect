@@ -15,11 +15,12 @@ around it:
   an old time: a wake-up dated in the future counts as just now, and one dated
   more than a day ahead is discarded so it cannot block refreshes for good
 
-Commands sent on request are recorded too. Locking and the like are never held
-back for timing, only repeated and runaway ones are: a refresh right after
-another, the same command again right after it was confirmed, or more commands
-in an hour than a person sends, which is what an automation stuck in a loop
-does.
+Commands sent on request are recorded too. They are never held back for
+timing, only repeated and runaway ones are: a refresh right after another, or
+more commands in an hour than a person sends, which is what an automation stuck
+in a loop does. The same command again right after the vehicle confirmed it is
+skipped, as it would change nothing. Locking and switching off are exempt from
+all of this unless they repeat themselves, as a loop would.
 """
 
 from __future__ import annotations
@@ -64,37 +65,61 @@ SESSION_MERGE_WINDOW = timedelta(minutes=30)
 # Refresh commands sent on request only fetch data. An automation triggered by
 # the data a refresh brings in would otherwise keep the vehicle awake.
 REFRESH_COMMANDS = frozenset({"DEEPREFRESH", "DEEPREFRESH2", "VF"})
+# The ones that bring in fresh charge data
+DEEP_REFRESH_COMMANDS = frozenset({"DEEPREFRESH", "DEEPREFRESH2"})
 MANUAL_REFRESH_COOLDOWN = timedelta(minutes=10)
 MANUAL_REFRESH_MAX_PER_DAY = 48
-# Commands that set a state. Sending one again right after it was confirmed
-# does nothing but wake the vehicle once more.
-STATE_COMMANDS = frozenset(
+# A deep refresh requested by hand this shortly before a charge was noticed
+# is what made it show up, so it serves as the refresh at its start
+MANUAL_START_REFRESH_WINDOW = timedelta(minutes=3)
+# Commands that set a state, grouped by what they set. Sending one again right
+# after the vehicle confirmed it does nothing but wake the vehicle once more,
+# unless a command of the same group was sent in between.
+COMMAND_GROUPS: dict[str, str] = {
+    "RDL": "doors",
+    "RDU": "doors",
+    "ROTRUNKLOCK": "trunk",
+    "ROTRUNKUNLOCK": "trunk",
+    "ROLIFTGATELOCK": "liftgate",
+    "ROLIFTGATEUNLOCK": "liftgate",
+    "REON": "engine",
+    "REOFF": "engine",
+    "ROPRECOND": "climate",
+    "ROPRECOND_OFF": "climate",
+    "ROHVACON": "climate",
+    "ROHVACOFF": "climate",
+    "ROCOMFORTON": "climate",
+    "ROCOMFORTOFF": "climate",
+    "CNOW": "charge",
+    "START_CHARGE": "charge",
+}
+STATE_COMMANDS = frozenset(COMMAND_GROUPS)
+# Commands that leave the vehicle locked or switched off. They are never held
+# back as a repeat, since the state shown may be out of date and a vehicle left
+# unlocked or running is worse than one more wake-up, and the hourly limit only
+# holds them back when they repeat themselves, as a loop would.
+SECURING_COMMANDS = frozenset(
     {
         "RDL",
-        "RDU",
         "ROTRUNKLOCK",
-        "ROTRUNKUNLOCK",
         "ROLIFTGATELOCK",
-        "ROLIFTGATEUNLOCK",
-        "REON",
         "REOFF",
-        "ROPRECOND",
         "ROPRECOND_OFF",
-        "ROHVACON",
         "ROHVACOFF",
-        "ROCOMFORTON",
         "ROCOMFORTOFF",
-        "CNOW",
     }
 )
 REPEAT_WINDOW = timedelta(seconds=60)
-# More commands sent on request than this within an hour is not a person
+# More commands sent on request than this within an hour, or a day, is not a
+# person but an automation stuck in a loop
 MANUAL_MAX_PER_HOUR = 30
+MANUAL_MAX_PER_DAY = 100
 
 HISTORY_WINDOW = timedelta(hours=24)
 # Timestamps further ahead than this can only come from a wrong clock
 FUTURE_TOLERANCE = timedelta(days=1)
-MAX_HISTORY = 200
+# Only bounds the file: the daily limits keep a day's history well below it
+MAX_HISTORY = 500
 
 
 class Decision(Enum):
@@ -110,6 +135,8 @@ class AutoRefreshDecision:
     decision: Decision
     wait: timedelta | None = None
     reason: str = ""
+    # The wake-up recorded for an allowed refresh
+    record: WakeRecord | None = None
 
 
 class Blocked(Exception):
@@ -119,6 +146,10 @@ class Blocked(Exception):
         super().__init__(reason)
         self.key = key
         self.wait = wait
+
+
+class AlreadyDone(Exception):
+    """The vehicle confirmed this command moments ago, it need not go out."""
 
 
 @dataclass
@@ -359,9 +390,15 @@ class WakeGuard:
     def check_manual_command(
         self, vin: str, command: str, now: datetime | None = None
     ) -> None:
-        """Raise Blocked if a command sent on request should not go out now."""
+        """Check whether a command sent on request should go out now.
+
+        Raises Blocked if it is held back, and AlreadyDone if the vehicle
+        confirmed the very same command moments ago, so sending it again would
+        change nothing. A wake-up dated in the future only comes from a clock
+        that was set back, and must not hold commands back for hours.
+        """
         now = now or _utcnow()
-        wakes = self._vehicle(vin, now).wakes
+        wakes = [w for w in self._vehicle(vin, now).wakes if w.at <= now]
 
         if command in REFRESH_COMMANDS:
             refreshes = [w for w in wakes if w.command in REFRESH_COMMANDS]
@@ -384,15 +421,35 @@ class WakeGuard:
                     wait,
                 )
 
-        if command in STATE_COMMANDS:
-            same = [w for w in wakes if w.command == command]
-            if same and same[-1].confirmed and _age(now, same[-1].at) < REPEAT_WINDOW:
-                raise Blocked(
-                    f"{command} was confirmed by the vehicle "
-                    f"{int(_age(now, same[-1].at).total_seconds())} s ago.",
-                    "repeated_command",
-                    REPEAT_WINDOW - _age(now, same[-1].at),
-                )
+        # The last command that set the same thing, whatever its direction
+        group = COMMAND_GROUPS.get(command)
+        last_of_group = next(
+            (
+                w
+                for w in reversed(wakes)
+                if group is not None and COMMAND_GROUPS.get(w.command) == group
+            ),
+            None,
+        )
+
+        if (
+            command not in SECURING_COMMANDS
+            and last_of_group is not None
+            and last_of_group.command == command
+            and last_of_group.confirmed
+            and now - last_of_group.at < REPEAT_WINDOW
+        ):
+            raise AlreadyDone(
+                f"{command} was confirmed by the vehicle "
+                f"{int((now - last_of_group.at).total_seconds())} s ago"
+            )
+
+        # Locking after unlocking, or switching off what was switched on,
+        # always goes out
+        if command in SECURING_COMMANDS and (
+            last_of_group is None or last_of_group.command != command
+        ):
+            return
 
         last_hour = [
             w
@@ -406,6 +463,19 @@ class WakeGuard:
                 f"hour, which looks like an automation stuck in a loop. Try again "
                 f"in {_minutes(wait)} min.",
                 "hourly_limit",
+                wait,
+            )
+
+        last_day = [
+            w for w in wakes if not w.automatic and _age(now, w.at) < HISTORY_WINDOW
+        ]
+        if len(last_day) >= MANUAL_MAX_PER_DAY:
+            wait = HISTORY_WINDOW - _age(now, last_day[-MANUAL_MAX_PER_DAY].at)
+            raise Blocked(
+                f"{MANUAL_MAX_PER_DAY} commands were sent to the vehicle within 24 "
+                f"hours, which looks like an automation stuck in a loop. Try again "
+                f"in {_minutes(wait)} min.",
+                "daily_limit",
                 wait,
             )
 
@@ -423,6 +493,28 @@ class WakeGuard:
     @callback
     def command_confirmed(self, record: WakeRecord) -> None:
         record.confirmed = True
+        self._save()
+
+    @callback
+    def forget(self, vin: str, record: WakeRecord) -> None:
+        """Take back a wake-up recorded for a command that never went out.
+
+        An automatic refresh taken back no longer counts for its session, so
+        the refresh at the start of a charge can still happen once whatever
+        stopped it, such as a rejected PIN, is fixed.
+        """
+        entry = self._vehicle(vin, _utcnow())
+        if not any(w is record for w in entry.wakes):
+            return
+        entry.wakes = [w for w in entry.wakes if w is not record]
+        if record.automatic and entry.session.auto_refreshes:
+            entry.session.auto_refreshes -= 1
+        self._save()
+
+    @callback
+    def stop_session(self, vin: str) -> None:
+        """No more automatic refreshes this charge, until reset_failures."""
+        self._vehicle(vin, _utcnow()).session.failures = AUTO_REFRESH_MAX_FAILURES
         self._save()
 
     # --- Automatic refresh while charging --------------------------------
@@ -449,7 +541,18 @@ class WakeGuard:
         entry = self._vehicle(vin, now)
         session = entry.session
 
-        if interval is None and session.auto_refreshes >= 1:
+        # A deep refresh asked for by hand that made this charge show up
+        by_hand = [
+            w
+            for w in entry.wakes
+            if not w.automatic
+            and w.confirmed
+            and w.command in DEEP_REFRESH_COMMANDS
+            and session.started is not None
+            and w.at >= session.started - MANUAL_START_REFRESH_WINDOW
+        ]
+
+        if interval is None and (session.auto_refreshes >= 1 or by_hand):
             return AutoRefreshDecision(
                 Decision.SESSION_DONE,
                 reason="only the refresh at the start of a charge is enabled",
@@ -487,9 +590,11 @@ class WakeGuard:
                 )
 
         if interval is not None and session.started is not None:
-            in_session = [
-                w for w in entry.wakes if w.automatic and w.at >= session.started
-            ]
+            in_session = sorted(
+                [w for w in entry.wakes if w.automatic and w.at >= session.started]
+                + by_hand,
+                key=lambda w: w.at,
+            )
             if in_session and (since := _age(now, in_session[-1].at)) < interval:
                 return AutoRefreshDecision(
                     Decision.WAIT,
@@ -508,10 +613,11 @@ class WakeGuard:
                 reason=f"{AUTO_REFRESH_MAX_PER_DAY} refreshes in the last 24 hours",
             )
 
-        entry.wakes.append(WakeRecord(now, command, True))
+        record = WakeRecord(now, command, True)
+        entry.wakes.append(record)
         session.auto_refreshes += 1
         self._save()
-        return AutoRefreshDecision(Decision.ALLOWED)
+        return AutoRefreshDecision(Decision.ALLOWED, record=record)
 
     @callback
     def auto_refresh_done(
