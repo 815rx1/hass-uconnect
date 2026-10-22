@@ -109,31 +109,39 @@ issue with your vehicle year, make, model, and whether it shows in the official 
 
 Every remote command wakes the vehicle's telematics unit, which draws on its 12 V battery. Reading data does not: polls only fetch what the cloud holds.
 
-**Automatic wake-ups.** The only thing that wakes the vehicle on its own is the deep refresh while charging: one when a charge begins, three minutes after it is noticed so the vehicle has settled on its time-to-full, then one per interval of the option *Deep Refresh While Charging* (with 0 only the first). A vehicle that is not charging is never woken automatically. Each of them is only sent when all of this holds:
+**Automatic wake-ups.** The only thing that wakes the vehicle on its own is the deep refresh while charging: one when a charge begins, three minutes after it is noticed so the vehicle has settled on its time-to-full, then one per interval of the option *Deep Refresh While Charging* (with 0 only the first). A deep refresh you requested that made the charge show up counts as the first one. A vehicle that is not charging is never woken automatically. Each refresh is only sent when all of this holds:
 
-- the last poll worked and reports the vehicle as charging and not unplugged, with a known state of charge below 100 % and charge data the vehicle uploaded less than 12 hours ago
+- the last poll worked and reports the vehicle as charging and not unplugged, with a known state of charge below 100 %
+- the vehicle uploaded its charge data less than an hour ago for the first refresh of a charge, and less than 12 hours ago for the later ones. A charge reported long ago may have ended without the end reaching the cloud
 - at least 15 minutes passed since Home Assistant started and since any command was sent to the vehicle, and the interval passed since the last refresh of this charge
 - fewer than 24 automatic refreshes in the last 24 hours
-- the last 3 refreshes brought new charge data and did not fail; otherwise there are none until the next charge
+- not 3 refreshes in a row without new charge data, and not 3 failures in a row; otherwise there are none until the next charge. A rejected PIN also ends them, until it is changed
 
-Charging that pauses for less than 30 minutes, like a wallbox following solar surplus, counts as the same charge. These limits are kept per vehicle and written to disk before each wake-up, so they hold across restarts, crashes, reloads and several entries for the same car. The extrapolated battery sensor shows `last_deep_refresh`, `deep_refreshes_this_session` and `deep_refreshes_last_24h`.
+Charging that pauses for less than 30 minutes, like a wallbox following solar surplus, counts as the same charge. These limits are kept per vehicle and written to disk before each wake-up, so they hold across restarts, crashes, reloads and several entries for the same car. The extrapolated battery sensor shows `last_deep_refresh`, `deep_refreshes_this_session` and `deep_refreshes_last_24h`. To have no automatic wake-ups at all, disable the *Extrapolated Battery* sensor, which runs them.
 
-**Commands on request** are never delayed, with three exceptions that catch automations stuck in a loop: a deep refresh or location refresh within 10 minutes of the last refresh (at most 48 a day), the same command again within a minute of being confirmed, and more than 30 commands within an hour.
+**Commands on request** are never delayed, except to catch automations stuck in a loop: a deep refresh or location refresh within 10 minutes of the last refresh (at most 48 a day), and more than 30 commands within an hour or 100 within a day. Locking and switching off always go out, unless they only repeat themselves. The same command again right after the vehicle confirmed it is skipped without an error. A switch is not sent "on" again while the vehicle reports it on, nor a charging level the vehicle already has.
 
-**Unlocking** needs the Uconnect PIN as the code by default, for the lock entities and the unlock actions alike, so an automation unlocking all locks, a scene, a voice assistant or an accidental tap cannot open the car. Five wrong codes pause unlocking for 5 minutes. Locking needs no code. This can be turned off in the options.
+**The PIN.** A PIN the backend rejected is not sent again until you change it in the options. Further wrong attempts can lock it, which also blocks the official app.
 
-**Bulk actions.** The trunk and liftgate are locks, not switches, so "turn off all switches" cannot open them. The remaining command switches (engine, preconditioning, climate, charging), the charge schedule entities and the charging level are configuration entities: they are not reached by turning off a whole area or device, not bridged to HomeKit by default and not exposed to voice assistants. Switches exposed by earlier versions are taken out of Assist, Alexa and Google once; expose them again if you want them by voice. A switch is not sent "on" again while the vehicle already reports it on.
+**Unlocking** needs the Uconnect PIN as the code by default, for the lock entities and the unlock actions alike, so an automation unlocking all locks, a scene, a voice assistant or an accidental tap cannot open the car. Five wrong codes pause unlocking for 5 minutes. Locking needs no code. This can be turned off in the options. In YAML, put the PIN in quotes (`code: "0123"`), a leading zero would otherwise change the number. Do not store the PIN as the lock's default code in the entity settings, that would skip the check.
+
+**Bulk actions.** The trunk and liftgate are locks, not switches, so "turn off all switches" cannot open them. The remaining command switches (engine, preconditioning, climate, charging), the charge schedule entities and the charging level are configuration entities: they are not reached by turning off a whole area, floor or device, not bridged to HomeKit by default and not exposed to voice assistants. Switches exposed by earlier versions are taken out of Assist, Alexa and Google once; expose them again if you want them by voice. Actions with `entity_id: all`, or with a template listing every switch or button, do reach them though, Home Assistant makes no exception there. Leave the vehicle out of such actions.
+
+**Privacy.** Error messages and debug logs leave out the password, tokens, the account ID, the VIN and the position. The diagnostics download leaves them out too.
 
 ## Switching from the original
 
-Configuration, entities and history are kept, because the domain and the entity IDs are the same.
+Configuration, entities and history are kept: the domain, the entity IDs and the state classes are the same.
 
 1. Make a backup (Settings → System → Backups).
-2. In HACS, open the original Uconnect integration and choose **Remove**. This removes the files only; do **not** delete the integration under Settings → Devices & services.
-3. Add `https://github.com/815rx1/hass-uconnect` as a custom repository (type *Integration*) and download it.
+2. In HACS, open the original Uconnect integration and choose **Remove**. This removes the files only. Do **not** delete the integration under Settings → Devices & services, and do **not** restart until step 4. Started without the files, Home Assistant offers to remove the configuration; if that happens, choose *Ignore* and carry on.
+3. Add `https://github.com/815rx1/hass-uconnect` as a custom repository (type *Integration*), open it and choose **Download**. Under *Need a different version?* pick the newest `v0.6.0b…`. To be offered later betas, enable the *Pre-release* switch of this repository on the HACS device.
 4. Restart Home Assistant.
+5. Check the options, and add `code: "<your PIN>"` to automations that unlock the car.
 
-Going back works the same way the other way round. Entities only this fork has then show as unavailable and keep their history. The trunk of vehicles that had the *Lock Trunk* switch is now a lock entity; the old switch shows as unavailable and can be deleted.
+What changes: unlocking asks for the PIN, the command switches move out of the generated dashboards and voice assistants (see [Safety](#safety-)), the trunk switch becomes a lock (the old switch shows as unavailable and can be deleted), and the deep refresh while charging comes every 30 minutes by default, where 0.5.4 refreshed once per charge; set 0 to keep that.
+
+**Going back** works the same way: back up, **Remove** this repository in HACS, download the original (*Need a different version?* for a particular one, such as v0.5.4), then restart. Entities only this fork has show as unavailable and keep their history, and the trunk switch returns. There, unlocking no longer asks for a code, and the `set_charge_schedule_slot` action is missing. Saving the original's options drops this fork's own options, so check them when you come back. The wake-up history in `.storage/uconnect.wake_history` stays behind; it is harmless and used again on your return.
 
 ## How to install 🛠️
 
@@ -152,7 +160,7 @@ The options are:
 
 - **Scan Interval (min)**: how often the integration polls the API, 5 minutes by default
 - **Pin**: needed to issue remote commands, set it here if it was left empty during setup. A change takes effect straight away, and clearing the field falls back to the PIN given during setup. A PIN entered when reauthenticating or reconfiguring replaces this one too
-- **Deep Refresh While Charging (min, 0 = only at the start of a charge, 15 minimum)**: how often to ask an EV to push fresh data while it is charging, 30 minutes by default. Polling alone returns a cached state of charge, so without this the extrapolated battery has nothing to correct itself against. A deep refresh is always sent when a charge begins; with 0 that stays the only one. A change takes effect on the charge already under way. Requires a PIN and a vehicle that supports deep refresh. See [Safety](#safety-) for the limits that always apply
+- **Deep Refresh While Charging (min, 0 = only at the start of a charge, 15 minimum)**: how often to ask an EV to push fresh data while it is charging, 30 minutes by default. Polling alone returns a cached state of charge, so without this the extrapolated battery has nothing to correct itself against. A deep refresh is always sent when a charge begins; with 0 that stays the only one. A change takes effect on the charge already under way. Requires a PIN and a vehicle that supports deep refresh. See [Safety](#safety-) for the limits that always apply, and for turning automatic refreshes off entirely
 - **Add command entities (Button/Lock/Switch)**: create entities for the remote commands instead of using actions only
 - **Require the Uconnect PIN to unlock**: on by default, unlocking then asks for the PIN as its code
 
@@ -161,7 +169,7 @@ The options are:
 The integration includes a custom Lovelace card (`custom:uconnect-vehicle-card`) that is automatically registered on setup. It shows:
 
 - **Header**: Vehicle name and VIN (or custom license plate)
-- **Indicators**: Doors, windows, trunk, charging status, ignition
+- **Indicators**: Doors, windows, trunk or liftgate, charging status, ignition
 - **SOC/Fuel bar**: Battery percentage with charging animation, range value
 - **Vehicle image**: From the image entity (if available)
 - **Mini map**: Live location from the device tracker
