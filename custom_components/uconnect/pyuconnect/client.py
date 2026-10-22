@@ -557,13 +557,15 @@ class Client:
             vin = x["vin"]
 
             if vin not in self.vehicles:
+                # Names stay strings: a model like "1500" or "500" would
+                # become a number, which the device registry refuses
                 vehicle = Vehicle(
                     vin=vin,
                     nickname=sg_str(x, "nickname"),
-                    make=sg(x, "make"),
-                    model=sg(x, "modelDescription"),
+                    make=sg_str(x, "make"),
+                    model=sg_str(x, "modelDescription"),
                     year=sg(x, "tsoModelYear"),
-                    region=sg(x, "soldRegion"),
+                    region=sg_str(x, "soldRegion"),
                 )
                 self.vehicles[vin] = vehicle
             else:

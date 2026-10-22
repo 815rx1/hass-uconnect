@@ -136,6 +136,10 @@ class UconnectVehicleImage(UconnectEntity, ImageEntity):
         cached_url, mtime = await self.hass.async_add_executor_job(
             self._read_cache_info
         )
+        # Without a URL at startup, because the image service failed then,
+        # the image downloaded before is still shown
+        if cached_url and not self._image_url:
+            self._image_url = cached_url
         if cached_url and cached_url == self._image_url:
             self._cached_url = cached_url
         # The cached file's age, so a restart is not recorded as a new image

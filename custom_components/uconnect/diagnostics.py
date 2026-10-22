@@ -47,7 +47,16 @@ async def async_get_config_entry_diagnostics(
     fields a model reports.
     """
 
-    coordinator = entry.runtime_data
+    entry_info = {
+        "data": async_redact_data(dict(entry.data), TO_REDACT),
+        "options": async_redact_data(dict(entry.options), TO_REDACT),
+        "state": str(entry.state),
+    }
+
+    # An entry whose setup failed has no data yet, what it has still helps
+    if (coordinator := getattr(entry, "runtime_data", None)) is None:
+        return {"entry": entry_info, "coordinator": None, "vehicles": []}
+
     client = coordinator.client
     last_status = getattr(client, "_last_status", None)
     if not isinstance(last_status, dict):
@@ -85,10 +94,7 @@ async def async_get_config_entry_diagnostics(
         )
 
     return {
-        "entry": {
-            "data": async_redact_data(dict(entry.data), TO_REDACT),
-            "options": async_redact_data(dict(entry.options), TO_REDACT),
-        },
+        "entry": entry_info,
         "coordinator": {
             "last_update_success": coordinator.last_update_success,
             "consecutive_failures": coordinator.consecutive_failures,

@@ -247,8 +247,16 @@ def _build_vehicle_list(hass: HomeAssistant) -> list[dict[str, Any]]:
     dev_reg = dr.async_get(hass)
     unique_id_map = _build_unique_id_map(hass)
 
+    # By config entry: reading the whole registry's device mapping is
+    # deprecated from Home Assistant 2026.10
+    devices = {
+        device.id: device
+        for entry in hass.config_entries.async_entries(DOMAIN)
+        for device in dr.async_entries_for_config_entry(dev_reg, entry.entry_id)
+    }
+
     vehicles: list[dict[str, Any]] = []
-    for device in dev_reg.devices.values():
+    for device in devices.values():
         vin = _normalize_vin_from_identifiers(device.identifiers)
         if not vin:
             continue
@@ -278,6 +286,7 @@ def _build_vehicle_list(hass: HomeAssistant) -> list[dict[str, Any]]:
             ("door_rear_left", "door_rear_left_locked"),
             ("door_rear_right", "door_rear_right_locked"),
             ("trunk", "trunk_locked"),
+            ("liftgate", "liftgate_locked"),
             ("window_driver", "window_driver_closed"),
             ("window_passenger", "window_passenger_closed"),
             ("tire_fl", "wheel_front_left_pressure"),

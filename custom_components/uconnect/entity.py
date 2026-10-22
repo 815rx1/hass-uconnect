@@ -12,6 +12,11 @@ from .const import DOMAIN
 from .coordinator import UconnectDataUpdateCoordinator
 
 
+def _text(value) -> str | None:
+    """The device registry only takes strings, and stops accepting others."""
+    return None if value is None else str(value)
+
+
 def was_added(hass: HomeAssistant, platform: str, vin: str, key: str) -> bool:
     """Return whether the entity of this vehicle and key was created before.
 
@@ -75,9 +80,10 @@ class UconnectEntity(CoordinatorEntity):
     def device_info(self):
         """Return device information to use for this entity."""
 
+        vehicle = self.vehicle
         return DeviceInfo(
-            identifiers={(DOMAIN, self.vehicle.vin)},
-            manufacturer=self.vehicle.make,
-            model=self.vehicle.model,
-            name=f"{self.vehicle.make} {self.vehicle.nickname or self.vehicle.model}",
+            identifiers={(DOMAIN, vehicle.vin)},
+            manufacturer=_text(vehicle.make),
+            model=_text(vehicle.model),
+            name=f"{vehicle.make} {vehicle.nickname or vehicle.model}",
         )

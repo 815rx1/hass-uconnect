@@ -10,7 +10,7 @@ from typing import Any
 import voluptuous as vol
 
 from homeassistant import config_entries
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.config_entries import SOURCE_RECONFIGURE, ConfigEntry
 from homeassistant.const import (
     CONF_PASSWORD,
     CONF_PIN,
@@ -227,8 +227,8 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 _LOGGER.exception("Unexpected exception")
                 errors["base"] = "unknown"
             else:
-                return self.async_update_reload_and_abort(
-                    entry, data=data, options=_options_with_pin(entry, user_input)
+                return self._async_update_reload_and_abort(
+                    entry, data, _options_with_pin(entry, user_input)
                 )
 
         return self.async_show_form(
@@ -270,8 +270,8 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 _LOGGER.exception("Unexpected exception")
                 errors["base"] = "unknown"
             else:
-                return self.async_update_reload_and_abort(
-                    entry, data=data, options=_options_with_pin(entry, user_input)
+                return self._async_update_reload_and_abort(
+                    entry, data, _options_with_pin(entry, user_input)
                 )
 
         return self.async_show_form(
@@ -286,6 +286,25 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             ),
             description_placeholders={"username": entry.data.get(CONF_USERNAME, "")},
             errors=errors,
+        )
+
+    def _async_update_reload_and_abort(
+        self, entry: ConfigEntry, data: dict[str, Any], options: dict[str, Any]
+    ) -> ConfigFlowResult:
+        """Store the new login, reload the entry and finish.
+
+        The entry is reloaded even if nothing changed: the same password
+        entered again after an account lock has to be tried. Home Assistant's
+        own helper for this warns from 2026.10 for entries with an update
+        listener, and is meant to stop reloading those in 2026.12, which would
+        leave the rejected login in place.
+        """
+        self.hass.config_entries.async_update_entry(entry, data=data, options=options)
+        self.hass.config_entries.async_schedule_reload(entry.entry_id)
+        return self.async_abort(
+            reason="reconfigure_successful"
+            if self.source == SOURCE_RECONFIGURE
+            else "reauth_successful"
         )
 
 

@@ -88,6 +88,15 @@ SENSOR_DESCRIPTIONS: Final[tuple[UconnectBinarySensorEntityDescription, ...]] = 
         off_icon="mdi:lock-open",
         device_class=BinarySensorDeviceClass.LOCK,
     ),
+    # As in upstream 1.0.2, so its entity carries over in both directions
+    UconnectBinarySensorEntityDescription(
+        key="liftgate_locked",
+        name="Liftgate",
+        postprocess=lambda x: not x,
+        on_icon="mdi:lock",
+        off_icon="mdi:lock-open",
+        device_class=BinarySensorDeviceClass.LOCK,
+    ),
     UconnectBinarySensorEntityDescription(
         key="window_driver_closed",
         name="Window Driver",

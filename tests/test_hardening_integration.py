@@ -232,3 +232,88 @@ async def test_saving_unchanged_options_does_not_reload(hass, setup_integration)
     )
     await hass.async_block_till_done()
     assert setup_integration.runtime_data is coordinator
+
+
+# --- Home Assistant compatibility ---------------------------------------
+
+
+async def test_reauth_of_a_loaded_entry_reloads_it(
+    hass, setup_integration, mock_client, caplog
+):
+    entry = setup_integration
+    coordinator = entry.runtime_data
+    result = await entry.start_reauth_flow(hass)
+    with patch(LOGIN):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {"password": "new-secret"}
+        )
+        await hass.async_block_till_done()
+
+    assert result["reason"] == "reauth_successful"
+    assert entry.data["password"] == "new-secret"
+    # Set up again with the new login, without the 2026.10 deprecation
+    assert entry.state is ConfigEntryState.LOADED
+    assert entry.runtime_data is not coordinator
+    assert "update listener" not in caplog.text
+
+
+async def test_failed_first_poll_with_a_listed_vehicle_retries_setup(
+    hass, config_entry, mock_client
+):
+    # The client lists the vehicle before its status fails
+    mock_client.refresh.side_effect = Exception("status timed out")
+    config_entry.add_to_hass(hass)
+    assert not await hass.config_entries.async_setup(config_entry.entry_id)
+    assert config_entry.state is ConfigEntryState.SETUP_RETRY
+
+
+async def test_display_precision_and_state_classes(hass, setup_integration):
+    from homeassistant.helpers import entity_registry as er
+
+    registry = er.async_get(hass)
+
+    def entry(key):
+        return registry.async_get(
+            registry.async_get_entity_id("sensor", DOMAIN, f"{DOMAIN}_{VIN}_{key}")
+        )
+
+    # 14.55 V shows as 14.6 V, not 15 V
+    assert entry("battery_voltage").options["sensor"]["suggested_display_precision"] == 1
+    # The same state classes as the original integration, so switching in
+    # either direction keeps the long-term statistics visible
+    state = hass.states.get(entry("distance_to_empty").entity_id)
+    assert state.attributes["state_class"] == "total"
+
+
+async def test_numeric_model_reaches_the_device_registry_as_text(
+    hass, config_entry, mock_client, vehicle
+):
+    from homeassistant.helpers import device_registry as dr
+
+    vehicle.model = 1500
+    config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+    device = dr.async_entries_for_config_entry(dr.async_get(hass), config_entry.entry_id)[0]
+    assert device.model == "1500"
+
+
+async def test_liftgate_sensor(hass, config_entry, mock_client, vehicle):
+    vehicle.liftgate_locked = True
+    config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+    from homeassistant.helpers import entity_registry as er
+
+    entity_id = er.async_get(hass).async_get_entity_id(
+        "binary_sensor", DOMAIN, f"{DOMAIN}_{VIN}_liftgate_locked"
+    )
+    # Locked is "off" for a lock binary sensor
+    assert hass.states.get(entity_id).state == "off"
+
+
+async def test_diagnostics_of_an_entry_that_is_not_loaded(hass, config_entry):
+    config_entry.add_to_hass(hass)
+    result = await async_get_config_entry_diagnostics(hass, config_entry)
+    assert result["coordinator"] is None
+    assert result["entry"]["data"]["password"] == "**REDACTED**"

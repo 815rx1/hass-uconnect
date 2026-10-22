@@ -58,6 +58,10 @@ class UconnectSensorEntityDescription(SensorEntityDescription):
     get: Callable[[Vehicle], Any] | None = None
 
 
+# The ranges, times to charge and service intervals keep the state class the
+# original integration gives them. Their long-term statistics are kept by state
+# class, and a different one hides the statistics recorded before whenever the
+# integration is switched, in either direction.
 SENSOR_DESCRIPTIONS: Final[tuple[UconnectSensorEntityDescription, ...]] = (
     UconnectSensorEntityDescription(
         key="odometer",
@@ -73,7 +77,7 @@ SENSOR_DESCRIPTIONS: Final[tuple[UconnectSensorEntityDescription, ...]] = (
         name="Driving Range",
         icon="mdi:road-variant",
         device_class=SensorDeviceClass.DISTANCE,
-        state_class=SensorStateClass.MEASUREMENT,
+        state_class=SensorStateClass.TOTAL,
         native_unit_of_measurement=UNIT_DYNAMIC,
         suggested_display_precision=0,
     ),
@@ -82,7 +86,7 @@ SENSOR_DESCRIPTIONS: Final[tuple[UconnectSensorEntityDescription, ...]] = (
         name="Driving Range (Gas)",
         icon="mdi:road-variant",
         device_class=SensorDeviceClass.DISTANCE,
-        state_class=SensorStateClass.MEASUREMENT,
+        state_class=SensorStateClass.TOTAL,
         native_unit_of_measurement=UNIT_DYNAMIC,
         suggested_display_precision=0,
     ),
@@ -91,7 +95,7 @@ SENSOR_DESCRIPTIONS: Final[tuple[UconnectSensorEntityDescription, ...]] = (
         name="Driving Range (Total)",
         icon="mdi:road-variant",
         device_class=SensorDeviceClass.DISTANCE,
-        state_class=SensorStateClass.MEASUREMENT,
+        state_class=SensorStateClass.TOTAL,
         native_unit_of_measurement=UNIT_DYNAMIC,
         suggested_display_precision=0,
     ),
@@ -122,7 +126,7 @@ SENSOR_DESCRIPTIONS: Final[tuple[UconnectSensorEntityDescription, ...]] = (
         name="Time to Charge L2",
         icon="mdi:battery-clock",
         native_unit_of_measurement=UnitOfTime.MINUTES,
-        state_class=SensorStateClass.MEASUREMENT,
+        state_class=SensorStateClass.TOTAL,
         device_class=SensorDeviceClass.DURATION,
         suggested_display_precision=0,
     ),
@@ -131,7 +135,7 @@ SENSOR_DESCRIPTIONS: Final[tuple[UconnectSensorEntityDescription, ...]] = (
         name="Time to Charge L3",
         icon="mdi:battery-clock",
         native_unit_of_measurement=UnitOfTime.MINUTES,
-        state_class=SensorStateClass.MEASUREMENT,
+        state_class=SensorStateClass.TOTAL,
         device_class=SensorDeviceClass.DURATION,
         suggested_display_precision=0,
     ),
@@ -140,7 +144,7 @@ SENSOR_DESCRIPTIONS: Final[tuple[UconnectSensorEntityDescription, ...]] = (
         name="Distance to Service",
         icon="mdi:car-wrench",
         device_class=SensorDeviceClass.DISTANCE,
-        state_class=SensorStateClass.MEASUREMENT,
+        state_class=SensorStateClass.TOTAL,
         native_unit_of_measurement=UNIT_DYNAMIC,
         suggested_display_precision=0,
     ),
@@ -149,7 +153,7 @@ SENSOR_DESCRIPTIONS: Final[tuple[UconnectSensorEntityDescription, ...]] = (
         name="Days till service needed",
         icon="mdi:car-wrench",
         device_class=SensorDeviceClass.DURATION,
-        state_class=SensorStateClass.MEASUREMENT,
+        state_class=SensorStateClass.TOTAL,
         native_unit_of_measurement=UnitOfTime.DAYS,
         suggested_display_precision=0,
     ),
@@ -285,7 +289,7 @@ SENSOR_DESCRIPTIONS: Final[tuple[UconnectSensorEntityDescription, ...]] = (
         name="Time to Charge L1",
         icon="mdi:battery-clock",
         native_unit_of_measurement=UnitOfTime.MINUTES,
-        state_class=SensorStateClass.MEASUREMENT,
+        state_class=SensorStateClass.TOTAL,
         device_class=SensorDeviceClass.DURATION,
         suggested_display_precision=0,
     ),
@@ -352,6 +356,9 @@ class UconnectSensor(SensorEntity, UconnectEntity):
 
         super().__init__(coordinator, vehicle)
 
+        # Also brings in the display precision, without it Home Assistant
+        # falls back to its defaults and shows the 12 V battery in whole volts
+        self.entity_description = description
         self._description: UconnectSensorEntityDescription = description
         self._key = self._description.key
         self._attr_unique_id = f"{DOMAIN}_{vehicle.vin}_{self._key}"
