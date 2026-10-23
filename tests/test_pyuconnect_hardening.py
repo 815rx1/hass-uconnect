@@ -835,10 +835,29 @@ def test_confirmed_lock_survives_a_restart():
     client.api.get_remote_operation_status.return_value = {"status": "SUCCESS"}
     with patch("custom_components.uconnect.pyuconnect.client.sleep"):
         client.command_verify(VIN, COMMAND_DOORS_LOCK)
-    saved = json.loads(json.dumps(client.confirmed_locks()))
+    saved = json.loads(json.dumps(client.confirmed_states()))
 
     # Home Assistant restarted: a new client, and the cloud still lags
     restarted = make_client([load_fixture("status_500e.json")], remote=unlocked)
-    restarted.restore_confirmed_locks(saved)
+    restarted.restore_confirmed_states(saved)
     restarted.refresh()
     assert restarted.vehicles[VIN].door_driver_locked is True
+
+
+def test_confirmed_schedule_and_level_survive_a_restart():
+    from custom_components.uconnect.pyuconnect.api import CHARGING_LEVEL_FIVE
+
+    client, status = lagging_client()
+    with patch("custom_components.uconnect.pyuconnect.client.sleep"):
+        plan = client.plan_charge_schedule_emea(VIN, 0, {"start_time": "02:30"})
+        client.send_charge_schedules_emea(VIN, plan)
+        client.set_charging_level_verify(VIN, CHARGING_LEVEL_FIVE)
+    saved = json.loads(json.dumps(client.confirmed_states()))
+
+    restarted = make_client([])
+    restarted.api.get_vehicle.side_effect = lambda vin: copy.deepcopy(status)
+    restarted.restore_confirmed_states(saved)
+    restarted.refresh()
+    v = restarted.vehicles[VIN]
+    assert v.charge_schedules[0].start_time == "02:30"
+    assert v.charging_level_preference == 5

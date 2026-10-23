@@ -331,21 +331,21 @@ async def test_card_is_served_while_the_entry_waits_for_the_cloud(
     assert hass.data[DOMAIN][frontend_cards._DATA_KEY] is True
 
 
-async def test_confirmed_locks_are_kept_over_a_restart(
+async def test_confirmed_states_are_kept_over_a_restart(
     hass, hass_storage, config_entry, mock_client
 ):
-    from custom_components.uconnect.coordinator import CONFIRMED_LOCKS_STORAGE_KEY
+    from custom_components.uconnect.coordinator import CONFIRMED_STATES_STORAGE_KEY
 
     saved = {VIN: {"lock:x": {"value": {"door_driver_locked": True}, "at": "2026-10-22T20:10:00+00:00"}}}
-    hass_storage[CONFIRMED_LOCKS_STORAGE_KEY] = {
-        "version": 1, "minor_version": 1, "key": CONFIRMED_LOCKS_STORAGE_KEY, "data": saved
+    hass_storage[CONFIRMED_STATES_STORAGE_KEY] = {
+        "version": 1, "minor_version": 1, "key": CONFIRMED_STATES_STORAGE_KEY, "data": saved
     }
     config_entry.add_to_hass(hass)
     assert await hass.config_entries.async_setup(config_entry.entry_id)
     await hass.async_block_till_done()
-    mock_client.restore_confirmed_locks.assert_called_once_with(saved)
+    mock_client.restore_confirmed_states.assert_called_once_with(saved)
 
-    mock_client.confirmed_locks.return_value = saved
+    mock_client.confirmed_states.return_value = saved
     await hass.services.async_call(DOMAIN, "doors_lock", {}, blocking=True)
     await hass.async_block_till_done()
-    assert hass_storage[CONFIRMED_LOCKS_STORAGE_KEY]["data"] == saved
+    assert hass_storage[CONFIRMED_STATES_STORAGE_KEY]["data"] == saved

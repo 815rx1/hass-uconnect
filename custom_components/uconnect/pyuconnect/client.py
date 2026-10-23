@@ -819,21 +819,25 @@ class Client:
 
             self._apply_written_locks(vin, vehicle)
 
-    def confirmed_locks(self) -> dict[str, dict[str, Any]]:
-        """The lock states confirmed and not reported yet, to keep over a restart."""
+    @staticmethod
+    def _override_max_age(what: str) -> float:
+        return LOCK_OVERRIDE_MAX_AGE if what.startswith("lock:") else WRITE_OVERRIDE_MAX_AGE
+
+    def confirmed_states(self) -> dict[str, dict[str, Any]]:
+        """The changes confirmed and not reported yet, to keep over a restart:
+        lock states, charge schedules and the charging level."""
 
         return {
             vin: {
                 what: {"value": value, "at": at.isoformat()}
                 for what, (value, at, _) in entries.items()
-                if what.startswith("lock:")
             }
             for vin, entries in self._written.items()
-            if any(what.startswith("lock:") for what in entries)
+            if entries
         }
 
-    def restore_confirmed_locks(self, data: Any) -> None:
-        """Takes back what confirmed_locks returned before a restart."""
+    def restore_confirmed_states(self, data: Any) -> None:
+        """Takes back what confirmed_states returned before a restart."""
 
         if not isinstance(data, dict):
             return
@@ -847,12 +851,21 @@ class Client:
                     at = datetime.fromisoformat(entry["at"])
                 except (KeyError, TypeError, ValueError):
                     continue
-                if not isinstance(value, dict) or not str(what).startswith("lock:"):
+                what = str(what)
+                if what.startswith("lock:"):
+                    valid = isinstance(value, dict)
+                elif what == "schedules":
+                    valid = isinstance(value, list) and all(isinstance(x, dict) for x in value)
+                elif what == "level":
+                    valid = isinstance(value, int) and not isinstance(value, bool)
+                else:
+                    valid = False
+                if not valid:
                     continue
                 if at.tzinfo is None:
                     at = at.replace(tzinfo=timezone.utc)
                 age = max((now - at).total_seconds(), 0.0)
-                if age > LOCK_OVERRIDE_MAX_AGE:
+                if age > self._override_max_age(what):
                     continue
                 self._written.setdefault(vin, {})[what] = (value, at, monotonic() - age)
 
