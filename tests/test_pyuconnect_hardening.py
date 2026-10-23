@@ -822,3 +822,23 @@ def test_confirmed_lock_is_shown_until_the_vehicle_reports():
     client.api.get_vehicle_status.return_value = later
     client.refresh()
     assert client.vehicles[VIN].door_driver_locked is False
+
+
+def test_confirmed_lock_survives_a_restart():
+    from custom_components.uconnect.pyuconnect.command import COMMAND_DOORS_LOCK
+
+    unlocked = copy.deepcopy(REMOTE_STATUS)
+    unlocked["doors"]["driver"]["status"] = "UNLOCKED"
+    client = make_client([load_fixture("status_500e.json")] * 2, remote=unlocked)
+    client.refresh()
+    client.api.command.return_value = "corr"
+    client.api.get_remote_operation_status.return_value = {"status": "SUCCESS"}
+    with patch("custom_components.uconnect.pyuconnect.client.sleep"):
+        client.command_verify(VIN, COMMAND_DOORS_LOCK)
+    saved = json.loads(json.dumps(client.confirmed_locks()))
+
+    # Home Assistant restarted: a new client, and the cloud still lags
+    restarted = make_client([load_fixture("status_500e.json")], remote=unlocked)
+    restarted.restore_confirmed_locks(saved)
+    restarted.refresh()
+    assert restarted.vehicles[VIN].door_driver_locked is True

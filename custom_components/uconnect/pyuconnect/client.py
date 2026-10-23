@@ -819,6 +819,43 @@ class Client:
 
             self._apply_written_locks(vin, vehicle)
 
+    def confirmed_locks(self) -> dict[str, dict[str, Any]]:
+        """The lock states confirmed and not reported yet, to keep over a restart."""
+
+        return {
+            vin: {
+                what: {"value": value, "at": at.isoformat()}
+                for what, (value, at, _) in entries.items()
+                if what.startswith("lock:")
+            }
+            for vin, entries in self._written.items()
+            if any(what.startswith("lock:") for what in entries)
+        }
+
+    def restore_confirmed_locks(self, data: Any) -> None:
+        """Takes back what confirmed_locks returned before a restart."""
+
+        if not isinstance(data, dict):
+            return
+        now = datetime.now(timezone.utc)
+        for vin, entries in data.items():
+            if not isinstance(entries, dict):
+                continue
+            for what, entry in entries.items():
+                try:
+                    value = entry["value"]
+                    at = datetime.fromisoformat(entry["at"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if not isinstance(value, dict) or not str(what).startswith("lock:"):
+                    continue
+                if at.tzinfo is None:
+                    at = at.replace(tzinfo=timezone.utc)
+                age = max((now - at).total_seconds(), 0.0)
+                if age > LOCK_OVERRIDE_MAX_AGE:
+                    continue
+                self._written.setdefault(vin, {})[what] = (value, at, monotonic() - age)
+
     def _remember(self, vin: str, what: str, value: Any) -> None:
         self._written.setdefault(vin, {})[what] = (
             value,

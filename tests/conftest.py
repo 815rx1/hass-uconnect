@@ -101,6 +101,7 @@ def mock_client(vehicle, cloud_status):
     client.api.sess = requests.Session()
     client.api.pin = "1234"
     client.api.pin_rejected = False
+    client.confirmed_locks.return_value = {}
     client.vehicles = {VIN: vehicle}
     client.get_vehicles.return_value = client.vehicles
     client.get_vehicle_health_report.return_value = {}

@@ -35,6 +35,7 @@ from homeassistant.helpers.update_coordinator import (
     DataUpdateCoordinator,
     UpdateFailed,
 )
+from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
 from .charge_schedule import supports_emea_schedules
@@ -63,6 +64,11 @@ _T = TypeVar("_T")
 
 # Name the wake guard records a schedule write under
 SCHEDULE_COMMAND = "CPPLUS"
+
+# Lock states the vehicle confirmed but has not uploaded yet. The vehicle
+# often sends no status after a remote lock, so without these a restart
+# would show the doors as they were before the lock.
+CONFIRMED_LOCKS_STORAGE_KEY = f"{DOMAIN}.confirmed_locks"
 
 
 def is_auth_error(err: BaseException) -> bool:
@@ -149,6 +155,9 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
 
         self.charging_refresh_interval: int = self._read_charging_refresh_interval(
             config_entry
+        )
+        self._confirmed_locks: Store[dict[str, Any]] = Store(
+            hass, 1, CONFIRMED_LOCKS_STORAGE_KEY, atomic_writes=True
         )
 
         super().__init__(
@@ -594,9 +603,26 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
 
         await self._async_finish_action(what, record, result)
 
+    async def async_restore_confirmed_locks(self) -> None:
+        """Take back the lock states confirmed before the last restart."""
+        try:
+            data = await self._confirmed_locks.async_load()
+        except Exception as err:  # A damaged file must not stop the setup
+            _LOGGER.debug("Unable to read the confirmed lock states: %s", err)
+            return
+        self.client.restore_confirmed_locks(data)
+
+    async def _async_save_confirmed_locks(self) -> None:
+        try:
+            await self._confirmed_locks.async_save(self.client.confirmed_locks())
+        except Exception as err:
+            _LOGGER.debug("Unable to save the confirmed lock states: %s", err)
+
     async def _async_finish_action(self, what: str, record, result: Any) -> None:
         if result and record is not None:
             async_get_wake_guard(self.hass).command_confirmed(record)
+        if result:
+            await self._async_save_confirmed_locks()
 
         await self.async_refresh()
 
