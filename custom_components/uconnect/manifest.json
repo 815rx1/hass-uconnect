@@ -21,5 +21,5 @@
         "requests-auth-aws-sigv4>=0.7",
         "dataclasses-json>=0.6.7"
     ],
-    "version": "0.6.0b9"
+    "version": "0.6.0b10"
 }
