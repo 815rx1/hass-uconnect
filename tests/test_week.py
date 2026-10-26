@@ -198,12 +198,12 @@ async def test_a_week(
     names = {name for _, name, _ in commands}
     assert names <= {"DEEPREFRESH"}, names
 
-    # Never two wake-ups within 15 minutes, never more than 24 in a day
+    # Never two wake-ups within 5 minutes, never more than 72 in a day
     times = [at for at, _, _ in commands]
     for earlier, later in zip(times, times[1:]):
-        assert later - earlier >= timedelta(minutes=15), (earlier, later)
+        assert later - earlier >= timedelta(minutes=5), (earlier, later)
     for at in times:
-        assert sum(1 for t in times if at <= t < at + timedelta(days=1)) <= 24
+        assert sum(1 for t in times if at <= t < at + timedelta(days=1)) <= 72
 
     # Only while really charging. The one exception follows the interval:
     # the refresh that finds out about the charge whose end was never uploaded

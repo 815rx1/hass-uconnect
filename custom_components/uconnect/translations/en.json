@@ -49,7 +49,7 @@
                 "data": {
                     "scan_interval": "Scan Interval (min)",
                     "pin": "Pin",
-                    "charging_refresh_interval": "Deep Refresh While Charging (min, 0 = only at the start of a charge, 15 minimum)",
+                    "charging_refresh_interval": "Deep Refresh While Charging, at most every (min, 0 = only at the start of a charge, 15 minimum)",
                     "add_command_entities": "Add command entities (Button/Lock/Switch)",
                     "unlock_requires_pin": "Require the Uconnect PIN to unlock"
                 }

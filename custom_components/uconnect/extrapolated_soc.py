@@ -32,6 +32,7 @@ from .pyuconnect.command import COMMAND_DEEP_REFRESH
 from .const import DOMAIN
 from .coordinator import PinRejected, UconnectDataUpdateCoordinator, UconnectRequestError
 from .wake_guard import (
+    AUTO_REFRESH_FIRST_STEP,
     AUTO_REFRESH_MAX_FAILURES,
     Decision,
     WakeRecord,
@@ -600,11 +601,11 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
                 self.async_write_ha_state()
                 return
 
-            # Looked at again once the interval has passed, the guard makes
-            # sure it is not earlier. Without an interval the refresh at the
-            # start of the charge was the only one.
+            # Looked at again after the shortest step, the guard says how much
+            # longer to wait. Without an interval the refresh at the start of
+            # the charge was the only one.
             if interval:
-                self._schedule_deep_refresh(timedelta(minutes=interval))
+                self._schedule_deep_refresh(AUTO_REFRESH_FIRST_STEP)
             # Tied to the config entry so an unload cancels a refresh in flight
             self.coordinator.config_entry.async_create_background_task(
                 self.hass,

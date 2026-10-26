@@ -26,7 +26,8 @@ from custom_components.uconnect.wake_guard import (
 )
 
 VIN = "ZFAEFAC39MX000001"
-T0 = datetime(2026, 10, 22, 12, 0, tzinfo=timezone.utc)
+# Close to the real clock: some guard calls take the time themselves
+T0 = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(hours=1)
 INTERVAL = timedelta(minutes=30)
 
 
@@ -43,7 +44,14 @@ async def new_guard(hass, started: datetime | None = None) -> WakeGuard:
     return guard
 
 
-def begin(guard: WakeGuard, minute: float, interval=INTERVAL):
+def begin(guard: WakeGuard, minute: float, interval=INTERVAL, adaptive=False):
+    """Ask for an automatic refresh.
+
+    Unless adaptive, the step is set to the interval, so the interval is what
+    applies, as when refreshes found no new percent at shorter steps.
+    """
+    if interval is not None and not adaptive:
+        guard.session(VIN).step_minutes = int(interval.total_seconds() // 60)
     return guard.begin_auto_refresh(VIN, "DEEPREFRESH", interval, at(minute))
 
 

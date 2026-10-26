@@ -43,10 +43,17 @@ STORAGE_VERSION = 1
 DATA_WAKE_GUARD = "_wake_guard"
 
 # The automatic deep refresh never wakes the vehicle within this time after
-# any command, whoever sent it
-AUTO_REFRESH_MIN_SPACING = timedelta(minutes=15)
-# and at most this many times within any 24 hours
-AUTO_REFRESH_MAX_PER_DAY = 24
+# any command, whoever sent it. It only runs while the vehicle charges, which
+# keeps its 12 V battery charged, so a fast charge can be followed closely.
+AUTO_REFRESH_MIN_SPACING = timedelta(minutes=5)
+# and at most this many times within any 24 hours, enough for a full charge
+# at a wallbox refreshed for every percent
+AUTO_REFRESH_MAX_PER_DAY = 72
+# While charging the refreshes start this far apart. One that brings no new
+# state of charge doubles the time until the next, up to the interval
+# configured: a fast charge is followed every few minutes, a slow one settles
+# where each refresh brings a new percent, which is all the vehicle reports.
+AUTO_REFRESH_FIRST_STEP = timedelta(minutes=5)
 # A charge that has finished or stalled while the cloud still reports it as
 # charging shows no gain in state of charge. After this many automatic
 # refreshes in a row without new data, the session gets no more of them.
@@ -172,6 +179,10 @@ class ChargeSession:
     failures: int = 0
     soc_at_last_refresh: float | None = None
     data_at_last_refresh: datetime | None = None
+    # Minutes until the next refresh, see AUTO_REFRESH_FIRST_STEP, and the
+    # interval configured when it was last asked, its upper bound
+    step_minutes: int = 0
+    longest_minutes: int = 0
 
     @property
     def active(self) -> bool:
@@ -277,6 +288,8 @@ class WakeGuard:
                     failures=_count(session.get("failures")),
                     soc_at_last_refresh=_number(session.get("soc_at_last_refresh")),
                     data_at_last_refresh=_parse(session.get("data_at_last_refresh")),
+                    step_minutes=_count(session.get("step_minutes")),
+                    longest_minutes=_count(session.get("longest_minutes")),
                 )
             self._vehicles[vin] = entry
 
@@ -303,6 +316,8 @@ class WakeGuard:
                         "failures": entry.session.failures,
                         "soc_at_last_refresh": entry.session.soc_at_last_refresh,
                         "data_at_last_refresh": _iso(entry.session.data_at_last_refresh),
+                        "step_minutes": entry.session.step_minutes,
+                        "longest_minutes": entry.session.longest_minutes,
                     },
                 }
                 for vin, entry in self._vehicles.items()
@@ -586,8 +601,16 @@ class WakeGuard:
                 return AutoRefreshDecision(
                     Decision.WAIT,
                     wait=AUTO_REFRESH_MIN_SPACING - since,
-                    reason="the vehicle was woken less than 15 minutes ago",
+                    reason="the vehicle was woken moments ago",
                 )
+
+        if interval is not None:
+            session.longest_minutes = max(int(interval.total_seconds() // 60), 1)
+            step = timedelta(
+                minutes=session.step_minutes
+                or int(AUTO_REFRESH_FIRST_STEP.total_seconds() // 60)
+            )
+            interval = min(interval, step)
 
         if interval is not None and session.started is not None:
             in_session = sorted(
@@ -646,7 +669,15 @@ class WakeGuard:
         ):
             progress = False
 
-        session.without_progress = 0 if progress else session.without_progress + 1
+        first = int(AUTO_REFRESH_FIRST_STEP.total_seconds() // 60)
+        step = session.step_minutes or first
+        if progress:
+            session.without_progress = 0
+        elif step < session.longest_minutes:
+            # Asked too early for a new percent: wait longer next time
+            session.step_minutes = min(step * 2, session.longest_minutes)
+        else:
+            session.without_progress += 1
         if state_of_charge is not None:
             session.soc_at_last_refresh = state_of_charge
         if data_timestamp is not None:

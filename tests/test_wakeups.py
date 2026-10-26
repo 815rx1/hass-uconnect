@@ -8,6 +8,7 @@ pinned down here, through the whole integration with the clock moving.
 from __future__ import annotations
 
 from datetime import timedelta
+from unittest.mock import patch
 
 import pytest
 from homeassistant.core import State
@@ -29,6 +30,23 @@ from custom_components.uconnect.wake_guard import (
 )
 
 from .conftest import VIN
+
+
+@pytest.fixture(autouse=True)
+def fixed_interval(request):
+    """Refresh at the configured interval from the start, unless adaptive.
+
+    Most tests here are about the limits, which a step starting at five
+    minutes and growing until refreshes bring a new percent would blur.
+    """
+    if "adaptive" in request.keywords:
+        yield
+        return
+    with patch(
+        "custom_components.uconnect.wake_guard.AUTO_REFRESH_FIRST_STEP",
+        timedelta(hours=24),
+    ):
+        yield
 
 
 def deep_refreshes(mock_client) -> int:
@@ -54,15 +72,27 @@ async def run_for(hass, freezer, minutes: int, every: float = 1) -> None:
 
 
 def charging_car(mock_client, vehicle, gain: float = 1) -> None:
-    """Make the vehicle a charging one that uploads on every deep refresh."""
+    """Make the vehicle a charging one that uploads on every deep refresh.
+
+    It gains gain percent per half hour, like a slow charge, whenever it is
+    asked: the state of charge follows the time, not the refreshes.
+    """
+    started = dt_util.utcnow()
     vehicle.charging = True
     vehicle.plugged_in = True
     vehicle.state_of_charge = 10
     vehicle.timestamp_ev_info = dt_util.utcnow()
+    # No time-to-full: the charging speed is only known from the gains, so
+    # the configured interval is what applies until it is measured
+    vehicle.time_to_fully_charge_l1 = None
+    vehicle.time_to_fully_charge_l2 = None
+    vehicle.time_to_fully_charge_l3 = None
 
     def command(vin, cmd):
         if cmd.name == "DEEPREFRESH":
-            vehicle.state_of_charge = min(vehicle.state_of_charge + gain, 99)
+            hours = (dt_util.utcnow() - started).total_seconds() / 3600
+            # Whole percent, as the vehicle reports it
+            vehicle.state_of_charge = min(int(10 + 2 * gain * hours), 99)
             vehicle.timestamp_ev_info = dt_util.utcnow()
         return True
 
@@ -130,7 +160,8 @@ async def test_refresh_when_a_charge_begins(
 async def test_charging_day_stays_within_daily_limit(
     hass, freezer, config_entry, mock_client, vehicle
 ):
-    charging_car(mock_client, vehicle, gain=0.5)
+    # A new percent at every refresh, so only the daily limit applies
+    charging_car(mock_client, vehicle, gain=2)
     # The shortest interval the options allow
     await setup(hass, config_entry, 15)
 
@@ -432,9 +463,10 @@ async def test_command_holds_the_automatic_refresh(
     await setup(hass, config_entry, 30)
     await run_for(hass, freezer, 14)
 
-    # Locked by hand a minute before the refresh would be due
+    # Locked by hand a minute before the refresh would be due: it waits the
+    # spacing after that command
     await hass.services.async_call(DOMAIN, "doors_lock", {}, blocking=True)
-    await run_for(hass, freezer, 14)
+    await run_for(hass, freezer, 4)
     assert deep_refreshes(mock_client) == 0
     await run_for(hass, freezer, 2)
     assert deep_refreshes(mock_client) == 1
@@ -596,3 +628,33 @@ async def test_rejected_pin_keeps_the_start_refresh_for_later(
     await hass.async_block_till_done()
     await run_for(hass, freezer, 20)
     assert deep_refreshes(mock_client) == 2
+
+
+# --- How often while charging --------------------------------------------
+
+
+@pytest.mark.adaptive
+async def test_fast_charge_is_refreshed_every_five_minutes(
+    hass, freezer, config_entry, mock_client, vehicle
+):
+    # A DC charge: a new percent every couple of minutes
+    charging_car(mock_client, vehicle, gain=15)
+    await setup(hass, config_entry, 30)
+
+    await run_for(hass, freezer, 15)
+    start = deep_refreshes(mock_client)
+    await run_for(hass, freezer, 30)
+    assert deep_refreshes(mock_client) - start == 6
+
+
+@pytest.mark.adaptive
+async def test_slow_charge_settles_on_longer_steps(
+    hass, freezer, config_entry, mock_client, vehicle
+):
+    # A domestic socket: about one percent an hour
+    charging_car(mock_client, vehicle, gain=0.5)
+    await setup(hass, config_entry, 30)
+
+    await run_for(hass, freezer, 3 * 60)
+    # 5, 10, 20 minutes, then every 30: far fewer than every five minutes
+    assert 4 <= deep_refreshes(mock_client) <= 9

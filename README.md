@@ -109,13 +109,13 @@ issue with your vehicle year, make, model, and whether it shows in the official 
 
 Every remote command wakes the vehicle's telematics unit, which draws on its 12 V battery. Reading data does not: polls only fetch what the cloud holds.
 
-**Automatic wake-ups.** The only thing that wakes the vehicle on its own is the deep refresh while charging: one when a charge begins, three minutes after it is noticed so the vehicle has settled on its time-to-full, then one per interval of the option *Deep Refresh While Charging* (with 0 only the first). A deep refresh you requested that made the charge show up counts as the first one. A vehicle that is not charging is never woken automatically. Each refresh is only sent when all of this holds:
+**Automatic wake-ups.** The only thing that wakes the vehicle on its own is the deep refresh while charging: one when a charge begins, three minutes after it is noticed so the vehicle has settled on its time-to-full, then more while the charge goes on. They start 5 minutes apart; one that brings no new percent doubles the time until the next, up to the option *Deep Refresh While Charging* (with 0 only the first). A fast DC charge is so followed every 5 minutes, a slow one settles where each refresh brings a new percent, which is all the vehicle reports. A deep refresh you requested that made the charge show up counts as the first one. A vehicle that is not charging is never woken automatically. Each refresh is only sent when all of this holds:
 
 - the last poll worked and reports the vehicle as charging and not unplugged, with a known state of charge below 100 %
 - the vehicle uploaded its charge data less than an hour ago for the first refresh of a charge, and less than 12 hours ago for the later ones. A charge reported long ago may have ended without the end reaching the cloud
-- at least 15 minutes passed since Home Assistant started and since any command was sent to the vehicle, and the interval passed since the last refresh of this charge
-- fewer than 24 automatic refreshes in the last 24 hours
-- not 3 refreshes in a row without new charge data, and not 3 failures in a row; otherwise there are none until the next charge. A rejected PIN also ends them, until it is changed
+- at least 15 minutes passed since Home Assistant started, at least 5 minutes since any command was sent to the vehicle, and the step described above since the last refresh of this charge
+- fewer than 72 automatic refreshes in the last 24 hours
+- not 3 refreshes in a row without new charge data at the longest step, and not 3 failures in a row; otherwise there are none until the next charge. A rejected PIN also ends them, until it is changed
 
 Charging that pauses for less than 30 minutes, like a wallbox following solar surplus, counts as the same charge. These limits are kept per vehicle and written to disk before each wake-up, so they hold across restarts, crashes, reloads and several entries for the same car. The extrapolated battery sensor shows `last_deep_refresh`, `deep_refreshes_this_session` and `deep_refreshes_last_24h`. To have no automatic wake-ups at all, disable the *Extrapolated Battery* sensor, which runs them.
 
@@ -160,7 +160,7 @@ The options are:
 
 - **Scan Interval (min)**: how often the integration polls the API, 5 minutes by default
 - **Pin**: needed to issue remote commands, set it here if it was left empty during setup. A change takes effect straight away, and clearing the field falls back to the PIN given during setup. A PIN entered when reauthenticating or reconfiguring replaces this one too
-- **Deep Refresh While Charging (min, 0 = only at the start of a charge, 15 minimum)**: how often to ask an EV to push fresh data while it is charging, 30 minutes by default. Polling alone returns a cached state of charge, so without this the extrapolated battery has nothing to correct itself against. A deep refresh is always sent when a charge begins; with 0 that stays the only one. A change takes effect on the charge already under way. Requires a PIN and a vehicle that supports deep refresh. See [Safety](#safety-) for the limits that always apply, and for turning automatic refreshes off entirely
+- **Deep Refresh While Charging (min, 0 = only at the start of a charge, 15 minimum)**: the longest time between two requests for fresh data while an EV charges, 30 minutes by default; faster charges are refreshed more often, see [Safety](#safety-). Polling alone returns a cached state of charge, so without this the extrapolated battery has nothing to correct itself against. A deep refresh is always sent when a charge begins; with 0 that stays the only one. A change takes effect on the charge already under way. Requires a PIN and a vehicle that supports deep refresh. See [Safety](#safety-) for the limits that always apply, and for turning automatic refreshes off entirely
 - **Add command entities (Button/Lock/Switch)**: create entities for the remote commands instead of using actions only
 - **Require the Uconnect PIN to unlock**: on by default, unlocking then asks for the PIN as its code
 
