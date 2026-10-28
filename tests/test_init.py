@@ -11,7 +11,10 @@ from homeassistant.const import STATE_UNAVAILABLE
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers import entity_registry as er
 from homeassistant.util import dt as dt_util
-from pytest_homeassistant_custom_component.common import async_fire_time_changed
+from pytest_homeassistant_custom_component.common import (
+    async_capture_events,
+    async_fire_time_changed,
+)
 
 from custom_components.uconnect.const import CONF_ADD_COMMAND_ENTITIES, DOMAIN
 from custom_components.uconnect.pyuconnect.api import AuthenticationError
@@ -445,3 +448,29 @@ async def test_unreported_entities_are_not_created(hass, config_entry, mock_clie
 
     assert entity_id(hass, "sensor", "trip_a_distance") is None
     assert entity_id(hass, "switch", "charge_schedule_1") is None
+
+
+async def test_placeholder_is_told_once_per_upload(hass, setup_integration, mock_client):
+    events = async_capture_events(hass, "uconnect_placeholder_discarded")
+    coordinator = setup_integration.runtime_data
+    uploaded = dt_util.utcnow()
+    mock_client.placeholders[VIN] = {"uploaded": uploaded, "range": 171}
+
+    await coordinator.async_refresh()
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    assert len(events) == 1
+    assert events[0].data == {
+        "vin": VIN,
+        "uploaded": uploaded.isoformat(),
+        "range": 171,
+    }
+
+    mock_client.placeholders[VIN] = {
+        "uploaded": uploaded + timedelta(hours=1),
+        "range": 55,
+    }
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    assert len(events) == 2

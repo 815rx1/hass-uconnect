@@ -706,10 +706,13 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
             # an overestimated drain from ever being corrected or unlearned.
             # Any state transition (idle to driving or back) means fresh data,
             # and so does a higher reading after a charge that ended without
-            # one, the gain it brought having to arrive somehow
+            # one, the gain it brought having to arrive somehow. A last report
+            # of 0 does not hold the next one back either: a vehicle that is
+            # really empty is not parked somewhere it could report more, and
+            # the cloud's placeholder 0 would otherwise stick for good
             if soc_changed and self._state.is_idle and is_idle:
                 if (
-                    self._state.last_vehicle_soc is None
+                    not self._state.last_vehicle_soc
                     or current_soc <= self._state.last_vehicle_soc
                     or self._state.charged_since_reading
                 ):

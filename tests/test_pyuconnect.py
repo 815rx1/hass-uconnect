@@ -239,6 +239,99 @@ def test_refresh_keeps_values_on_empty_status():
     assert v.odometer == 12345
 
 
+def placeholder_status(soc: int, range_km: int) -> dict:
+    """The status with the 0 % packet the cloud sends now and then."""
+    status = load_fixture("status_500e.json")
+    battery = status["evInfo"]["battery"]
+    battery["stateOfCharge"] = soc
+    battery["distanceToEmpty"] = {"value": str(range_km), "unit": "km"}
+    battery["totalRange"] = range_km
+    battery["timeToFullyChargeL2"] = 0
+    battery["timeToFullyChargeL3"] = 0
+    return status
+
+
+def test_refresh_ignores_zero_charge_next_to_a_range():
+    client = make_client(
+        [load_fixture("status_500e.json"), placeholder_status(0, 171)]
+    )
+    client.refresh()
+    client.refresh()
+    v = client.vehicles[VIN]
+
+    assert v.state_of_charge == 72
+    assert v.time_to_fully_charge_l2 == 205
+    # The rest of the status is taken as it is
+    assert v.distance_to_empty == 171
+
+
+def test_refresh_without_earlier_charge_leaves_it_unknown():
+    client = make_client([placeholder_status(0, 171)])
+    client.refresh()
+
+    assert client.vehicles[VIN].state_of_charge is None
+
+
+def remote_status(state: str) -> dict:
+    return {
+        "doors": {
+            door: {"status": state}
+            for door in ("driver", "passenger", "leftRear", "rightRear")
+        },
+        "windows": {"driver": {"status": "CLOSED"}, "passenger": {"status": "CLOSED"}},
+        "trunk": {"status": state},
+        "timestamp": 1760000000000,
+    }
+
+
+def test_placeholder_keeps_the_lock_states():
+    client = make_client(
+        [load_fixture("status_500e.json"), placeholder_status(0, 55)]
+    )
+    client.api.get_vehicle_status.side_effect = [
+        remote_status("LOCKED"),
+        remote_status("UNLOCKED"),
+    ]
+    client.refresh()
+    client.refresh()
+    v = client.vehicles[VIN]
+
+    assert v.door_driver_locked is True
+    assert v.door_rear_right_locked is True
+    assert v.trunk_locked is True
+    assert client.placeholders[VIN]["range"] == 55
+    assert client.placeholders[VIN]["uploaded"] == datetime.fromtimestamp(
+        1760000100
+    ).astimezone()
+
+
+def test_lock_states_are_taken_again_after_a_placeholder():
+    client = make_client(
+        [placeholder_status(0, 55), load_fixture("status_500e.json")]
+    )
+    client.api.get_vehicle_status.side_effect = [
+        remote_status("LOCKED"),
+        remote_status("UNLOCKED"),
+    ]
+    client.refresh()
+    assert client.vehicles[VIN].door_driver_locked is None
+
+    client.refresh()
+    v = client.vehicles[VIN]
+    assert v.door_driver_locked is False
+    assert v.trunk_locked is False
+
+
+def test_refresh_takes_zero_charge_without_range():
+    client = make_client(
+        [load_fixture("status_500e.json"), placeholder_status(0, 0)]
+    )
+    client.refresh()
+    client.refresh()
+
+    assert client.vehicles[VIN].state_of_charge == 0
+
+
 def test_refresh_fills_missing_block_from_last_status():
     full = load_fixture("status_500e.json")
     partial = {"vehicleInfo": dict(full["vehicleInfo"]), "timestamp": 1760000900000}

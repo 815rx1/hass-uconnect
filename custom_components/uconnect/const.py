@@ -24,6 +24,10 @@ from .pyuconnect.brands import (
 
 DOMAIN: str = "uconnect"
 
+# Fired once for each placeholder status the cloud sends, a state of charge
+# of 0 next to a range, which is left out together with the lock states
+EVENT_PLACEHOLDER_DISCARDED: str = f"{DOMAIN}_placeholder_discarded"
+
 CONF_BRAND_REGION: str = "brand_region"
 CONF_DISABLE_TLS_VERIFICATION: str = "disable_tls_verification"
 CONF_ADD_COMMAND_ENTITIES: str = "add_command_entities"

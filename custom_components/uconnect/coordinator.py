@@ -48,6 +48,7 @@ from .const import (
     DEFAULT_CHARGING_REFRESH_INTERVAL,
     DEFAULT_SCAN_INTERVAL,
     DEFAULT_UNLOCK_REQUIRES_PIN,
+    EVENT_PLACEHOLDER_DISCARDED,
     MAX_CONSECUTIVE_FAILURES,
     MIN_CHARGING_REFRESH_INTERVAL,
     SLOW_EXTRA_DATA_INTERVAL,
@@ -142,6 +143,8 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
         self._client_lock = asyncio.Lock()
 
         self.consecutive_failures: int = 0
+        # The placeholder status of each vehicle automations were told about
+        self._placeholders_told: dict[str, dict[str, Any]] = {}
         self.last_successful_update = None
         # When the health report and maintenance history were last asked
         # for, per vehicle, whether that worked or not
@@ -328,6 +331,7 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
         else:
             self.consecutive_failures = 0
             self.last_successful_update = dt_util.utcnow()
+            self._fire_placeholder_events()
 
             # Only after a successful poll: each of these calls can take until
             # the request timeout while the cloud is down, and they hold the
@@ -335,6 +339,26 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
             await self._async_update_extra_data()
 
         return True
+
+    def _fire_placeholder_events(self) -> None:
+        """Tell automations about each placeholder status left out, once.
+
+        The cloud keeps returning the same one until the vehicle uploads
+        again, so it is told once per upload.
+        """
+        for vin, placeholder in self.client.placeholders.items():
+            if self._placeholders_told.get(vin) == placeholder:
+                continue
+            self._placeholders_told[vin] = dict(placeholder)
+            uploaded = placeholder.get("uploaded")
+            self.hass.bus.async_fire(
+                EVENT_PLACEHOLDER_DISCARDED,
+                {
+                    "vin": vin,
+                    "uploaded": uploaded.isoformat() if uploaded else None,
+                    "range": placeholder.get("range"),
+                },
+            )
 
     async def _async_update_extra_data(self) -> None:
         """Fetch extra data (VHR, maintenance, schedules, SVLA) for all vehicles.

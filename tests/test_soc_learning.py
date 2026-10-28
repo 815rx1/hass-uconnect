@@ -94,6 +94,23 @@ async def test_higher_reading_after_an_unseen_charge_is_taken(
     assert not parked._state.charged_since_reading
 
 
+async def test_reading_after_a_reported_zero_is_taken(
+    hass, freezer, setup_integration, vehicle, parked
+):
+    # A 0 that got through, e.g. stored by a version without the filter
+    await report(hass, freezer, setup_integration, vehicle, 1, ignition_on=True)
+    await report(
+        hass, freezer, setup_integration, vehicle, 0.1,
+        ignition_on=False, state_of_charge=0,
+    )
+    assert parked._state.last_vehicle_soc == 0
+
+    await report(hass, freezer, setup_integration, vehicle, 1, state_of_charge=75)
+
+    assert parked._state.last_vehicle_soc == 75
+    assert parked.native_value == pytest.approx(75, abs=0.1)
+
+
 async def test_no_drain_is_learned_over_a_charge(
     hass, freezer, setup_integration, vehicle, parked
 ):
