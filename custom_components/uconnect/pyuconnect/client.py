@@ -368,13 +368,14 @@ class Vehicle:
         return f"{self.vin} (nick: {self.nickname})"
 
 
-def placeholder_range(p: Any) -> int | float | None:
+def _placeholder_range(p: Any) -> int | float | None:
     """The electric range of a status that is a placeholder, else None.
 
     Now and then the cloud sends a state of charge of 0 next to an electric
     range that says otherwise, the times to full 0 as well (a 500e: 0 % and
-    171 km). A battery that is really empty has no range left, so the 0 is a
-    placeholder. The lock states polled with it were seen wrong too.
+    171 km, uploaded as it was switched off). A battery that is really empty
+    has no range left, so the 0 is a placeholder. Only these values are: the
+    lock states uploaded with it came with their own time and were right.
     """
 
     batt = sg(p, "evInfo", "battery")
@@ -468,7 +469,7 @@ def _update_vehicle(v: Vehicle, p: dict) -> Vehicle:
 
     # The state of charge of a placeholder status is not taken, the last
     # values stay, unknown when there are none
-    if (electric_range := placeholder_range(p)) is not None:
+    if (electric_range := _placeholder_range(p)) is not None:
         _LOGGER.debug(
             "Ignoring a state of charge of 0 next to a range of %s", electric_range
         )
@@ -663,7 +664,7 @@ class Client:
         )
         self.vehicles: Dict[str, Vehicle] = {}
         self._last_status: Dict[str, dict] = {}
-        # The last placeholder status of each vehicle, see placeholder_range:
+        # The last placeholder status of each vehicle, see _placeholder_range:
         # when the vehicle uploaded it and the range it gave
         self.placeholders: Dict[str, Dict[str, Any]] = {}
         self._block_fresh_at: Dict[str, Dict[str, float]] = {}
@@ -749,11 +750,9 @@ class Client:
                     supported.append(command)
             vehicle.supported_commands = supported
 
-            placeholder = None
             try:
                 info = self.api.get_vehicle(vin)
-                placeholder = placeholder_range(info)
-                if placeholder is not None:
+                if (placeholder := _placeholder_range(info)) is not None:
                     self.placeholders[vin] = {
                         "uploaded": _ms_timestamp(sg(info, "evInfo", "timestamp")),
                         "range": placeholder,
@@ -819,19 +818,6 @@ class Client:
                 if not isinstance(s, dict):
                     raise ValueError("remote status is not an object")
 
-                # The lock states polled with a placeholder status are not
-                # taken either, they were seen to say unlocked of a locked car
-                if placeholder is not None:
-                    _LOGGER.debug(
-                        "Keeping the last lock states of %s next to a placeholder",
-                        vin,
-                    )
-                    s = {
-                        k: v
-                        for k, v in s.items()
-                        if k not in (*REMOTE_STATE_GROUPS, "trunk", "liftGate")
-                    }
-
                 if "doors" in s:
                     vehicle.door_driver_locked = sg_state(
                         s, "LOCKED", "doors", "driver", "status"
@@ -859,12 +845,8 @@ class Client:
                 if (engine := sg_state(s, "ON", "engine", "status")) is not None:
                     vehicle.ignition_on = engine
 
-                if "trunk" in s or placeholder is None:
-                    vehicle.trunk_locked = sg_state(s, "LOCKED", "trunk", "status")
-                if "liftGate" in s or placeholder is None:
-                    vehicle.liftgate_locked = sg_state(
-                        s, "LOCKED", "liftGate", "status"
-                    )
+                vehicle.trunk_locked = sg_state(s, "LOCKED", "trunk", "status")
+                vehicle.liftgate_locked = sg_state(s, "LOCKED", "liftGate", "status")
                 vehicle.ev_running = sg_state(s, "ON", "evRunning", "status")
                 vehicle.hvac_on = sg_state(s, "ON", "hvac", "status")
 

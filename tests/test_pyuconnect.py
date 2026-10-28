@@ -284,7 +284,9 @@ def remote_status(state: str) -> dict:
     }
 
 
-def test_placeholder_keeps_the_lock_states():
+def test_placeholder_is_recorded_and_its_lock_states_taken():
+    # The lock states come with their own upload time, the one at switching
+    # off, and are right even when the state of charge is a placeholder
     client = make_client(
         [load_fixture("status_500e.json"), placeholder_status(0, 55)]
     )
@@ -293,33 +295,31 @@ def test_placeholder_keeps_the_lock_states():
         remote_status("UNLOCKED"),
     ]
     client.refresh()
-    client.refresh()
-    v = client.vehicles[VIN]
-
-    assert v.door_driver_locked is True
-    assert v.door_rear_right_locked is True
-    assert v.trunk_locked is True
-    assert client.placeholders[VIN]["range"] == 55
-    assert client.placeholders[VIN]["uploaded"] == datetime.fromtimestamp(
-        1760000100
-    ).astimezone()
-
-
-def test_lock_states_are_taken_again_after_a_placeholder():
-    client = make_client(
-        [placeholder_status(0, 55), load_fixture("status_500e.json")]
-    )
-    client.api.get_vehicle_status.side_effect = [
-        remote_status("LOCKED"),
-        remote_status("UNLOCKED"),
-    ]
-    client.refresh()
-    assert client.vehicles[VIN].door_driver_locked is None
+    assert client.placeholders == {}
 
     client.refresh()
     v = client.vehicles[VIN]
+
+    assert v.state_of_charge == 72
     assert v.door_driver_locked is False
+    assert v.door_rear_right_locked is False
     assert v.trunk_locked is False
+    assert client.placeholders[VIN] == {
+        "uploaded": datetime.fromtimestamp(1760000100).astimezone(),
+        "range": 55,
+    }
+
+
+def test_placeholder_carried_over_is_not_taken_either():
+    # An answer without the EV block is completed with the last one, here
+    # the placeholder
+    full = load_fixture("status_500e.json")
+    partial = {"vehicleInfo": dict(full["vehicleInfo"]), "timestamp": 1760000900000}
+    client = make_client([full, placeholder_status(0, 55), partial])
+    for _ in range(3):
+        client.refresh()
+
+    assert client.vehicles[VIN].state_of_charge == 72
 
 
 def test_refresh_takes_zero_charge_without_range():

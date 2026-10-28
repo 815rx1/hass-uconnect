@@ -344,9 +344,10 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
         """Tell automations about each placeholder status left out, once.
 
         The cloud keeps returning the same one until the vehicle uploads
-        again, so it is told once per upload.
+        again, so it is told once per upload, and once more after a restart.
         """
-        for vin, placeholder in self.client.placeholders.items():
+        # A copy: a command running in the executor may poll meanwhile
+        for vin, placeholder in list(self.client.placeholders.items()):
             if self._placeholders_told.get(vin) == placeholder:
                 continue
             self._placeholders_told[vin] = dict(placeholder)

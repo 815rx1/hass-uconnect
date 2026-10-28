@@ -62,6 +62,9 @@ async def async_get_config_entry_diagnostics(
     if not isinstance(last_status, dict):
         last_status = {}
     guard = async_get_wake_guard(hass)
+    placeholders = getattr(client, "placeholders", None)
+    if not isinstance(placeholders, dict):
+        placeholders = {}
 
     vehicles = []
     for index, (vin, vehicle) in enumerate(client.vehicles.items(), start=1):
@@ -90,6 +93,9 @@ async def async_get_config_entry_diagnostics(
                     for w in guard.wakes(vin)
                 ],
                 "charge_session": dataclasses.asdict(guard.session(vin)),
+                # The last status whose state of charge was left out as a
+                # placeholder of the cloud
+                "last_placeholder": placeholders.get(vin),
             }
         )
 
