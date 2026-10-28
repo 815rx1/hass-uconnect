@@ -368,6 +368,19 @@ class Vehicle:
         return f"{self.vin} (nick: {self.nickname})"
 
 
+# The times to full, in the order _update_vehicle keeps them with the state
+# of charge
+_CHARGE_TIMES = (
+    "time_to_fully_charge_l1",
+    "time_to_fully_charge_l2",
+    "time_to_fully_charge_l3",
+)
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
 def _placeholder_range(p: Any) -> int | float | None:
     """The electric range of a status that is a placeholder, else None.
 
@@ -389,7 +402,9 @@ def _placeholder_range(p: Any) -> int | float | None:
     return None
 
 
-def _update_vehicle(v: Vehicle, p: dict) -> Vehicle:
+def _update_vehicle(
+    v: Vehicle, p: dict, saved_charge: tuple[Any, Any, Any, Any] | None = None
+) -> Vehicle:
     vi = sg(p, "vehicleInfo")
     ev = sg(p, "evInfo")
     batt = sg(ev, "battery")
@@ -467,12 +482,15 @@ def _update_vehicle(v: Vehicle, p: dict) -> Vehicle:
     if v.time_to_fully_charge_l1 is not None and v.time_to_fully_charge_l1 < 0:
         v.time_to_fully_charge_l1 = None
 
-    # The state of charge of a placeholder status is not taken, the last
-    # values stay, unknown when there are none
+    # The state of charge of a placeholder status is not taken. The last real
+    # reading stands in, which the client keeps also over a restart (see
+    # Client.last_charges); without one the last values stay, else unknown
     if (electric_range := _placeholder_range(p)) is not None:
         _LOGGER.debug(
             "Ignoring a state of charge of 0 next to a range of %s", electric_range
         )
+        if saved_charge is not None:
+            last_charge = saved_charge
         (
             v.state_of_charge,
             v.time_to_fully_charge_l1,
@@ -667,6 +685,9 @@ class Client:
         # The last placeholder status of each vehicle, see _placeholder_range:
         # when the vehicle uploaded it and the range it gave
         self.placeholders: Dict[str, Dict[str, Any]] = {}
+        # The last state of charge each vehicle really reported, see
+        # last_charges
+        self._last_charge: Dict[str, Dict[str, Any]] = {}
         self._block_fresh_at: Dict[str, Dict[str, float]] = {}
         # When the remote status last reported each group of states
         self._remote_fresh_at: Dict[str, Dict[str, float]] = {}
@@ -768,7 +789,12 @@ class Client:
                         self._block_fresh_at.setdefault(vin, {}),
                     )
                     self._last_status[vin] = info
-                    _update_vehicle(vehicle, info)
+                    _update_vehicle(vehicle, info, self._saved_charge(vin))
+                    if (
+                        _placeholder_range(info) is None
+                        and vehicle.state_of_charge is not None
+                    ):
+                        self._remember_charge(vin, vehicle)
                     self._apply_written(vin, vehicle, info)
                 else:
                     _LOGGER.debug("No status data for %s, keeping the last values", vin)
@@ -866,6 +892,47 @@ class Client:
                         setattr(vehicle, attr, None)
 
             self._apply_written_locks(vin, vehicle)
+
+    def last_charges(self) -> dict[str, dict[str, Any]]:
+        """The last state of charge each vehicle really reported, with its times
+        to full, to keep over a restart. After one the cloud can answer with a
+        placeholder first and repeat it until the vehicle uploads again, which
+        can take days: the state of charge would stay unknown that long."""
+
+        return {vin: dict(entry) for vin, entry in self._last_charge.items()}
+
+    def restore_last_charges(self, data: Any) -> None:
+        """Takes back what last_charges returned before a restart."""
+
+        if not isinstance(data, dict):
+            return
+        for vin, entry in data.items():
+            if not isinstance(entry, dict):
+                continue
+            soc = entry.get("state_of_charge")
+            if not _is_number(soc) or not 0 <= soc <= 100:
+                continue
+            saved: Dict[str, Any] = {"state_of_charge": soc}
+            for key in _CHARGE_TIMES:
+                value = entry.get(key)
+                saved[key] = value if _is_number(value) and value >= 0 else None
+            uploaded = entry.get("uploaded")
+            saved["uploaded"] = uploaded if isinstance(uploaded, str) else None
+            self._last_charge[str(vin)] = saved
+
+    def _remember_charge(self, vin: str, vehicle: "Vehicle") -> None:
+        uploaded = getattr(vehicle, "timestamp_ev_info", None)
+        self._last_charge[vin] = {
+            "state_of_charge": vehicle.state_of_charge,
+            **{key: getattr(vehicle, key, None) for key in _CHARGE_TIMES},
+            "uploaded": uploaded.isoformat() if uploaded else None,
+        }
+
+    def _saved_charge(self, vin: str) -> tuple[Any, Any, Any, Any] | None:
+        entry = self._last_charge.get(vin)
+        if entry is None:
+            return None
+        return (entry["state_of_charge"], *(entry.get(key) for key in _CHARGE_TIMES))
 
     @staticmethod
     def _override_max_age(what: str) -> float:

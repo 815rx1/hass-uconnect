@@ -122,6 +122,36 @@ async def test_plain_polling_never_wakes_the_vehicle(
     assert mock_client.refresh.call_count > 200
 
 
+async def test_automatic_refresh_is_recorded_as_confirmed(
+    hass, freezer, config_entry, mock_client, vehicle
+):
+    from custom_components.uconnect.wake_guard import async_get_wake_guard
+
+    charging_car(mock_client, vehicle)
+    await setup(hass, config_entry, 0)
+    await run_for(hass, freezer, 30, every=3)
+
+    automatic = [w for w in async_get_wake_guard(hass).wakes(VIN) if w.automatic]
+    assert len(automatic) == 1
+    assert automatic[0].confirmed
+
+
+async def test_unconfirmed_automatic_refresh_stays_unconfirmed(
+    hass, freezer, config_entry, mock_client, vehicle
+):
+    from custom_components.uconnect.wake_guard import async_get_wake_guard
+
+    charging_car(mock_client, vehicle)
+    mock_client.command_verify.side_effect = None
+    mock_client.command_verify.return_value = False
+    await setup(hass, config_entry, 0)
+    await run_for(hass, freezer, 30, every=3)
+
+    automatic = [w for w in async_get_wake_guard(hass).wakes(VIN) if w.automatic]
+    assert automatic
+    assert not any(w.confirmed for w in automatic)
+
+
 async def test_interval_zero_refreshes_once_per_charge(
     hass, freezer, config_entry, mock_client, vehicle
 ):

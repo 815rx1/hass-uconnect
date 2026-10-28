@@ -65,6 +65,9 @@ async def async_get_config_entry_diagnostics(
     placeholders = getattr(client, "placeholders", None)
     if not isinstance(placeholders, dict):
         placeholders = {}
+    last_charges = client.last_charges()
+    if not isinstance(last_charges, dict):
+        last_charges = {}
 
     vehicles = []
     for index, (vin, vehicle) in enumerate(client.vehicles.items(), start=1):
@@ -96,6 +99,8 @@ async def async_get_config_entry_diagnostics(
                 # The last status whose state of charge was left out as a
                 # placeholder of the cloud
                 "last_placeholder": placeholders.get(vin),
+                # Kept over a restart for a placeholder answered first
+                "last_real_charge": last_charges.get(vin),
             }
         )
 

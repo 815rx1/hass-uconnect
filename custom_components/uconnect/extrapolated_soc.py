@@ -477,6 +477,9 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
             ):
                 await self.coordinator.async_request_refresh()
         else:
+            # Confirmed by the vehicle, like a command sent by hand
+            if record is not None:
+                guard.command_confirmed(record)
             vehicle = self.vehicle
             guard.auto_refresh_done(
                 self._vin,

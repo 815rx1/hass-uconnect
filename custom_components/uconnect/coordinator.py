@@ -72,6 +72,13 @@ SCHEDULE_COMMAND = "CPPLUS"
 # before the lock.
 CONFIRMED_STATES_STORAGE_KEY = f"{DOMAIN}.confirmed_states"
 
+# The last state of charge each vehicle really reported. After a restart the
+# cloud can answer with a placeholder first and repeat it until the vehicle
+# uploads again, see EVENT_PLACEHOLDER_DISCARDED. It changes with every
+# upload, so the writes are gathered.
+LAST_CHARGE_STORAGE_KEY = f"{DOMAIN}.last_charge"
+LAST_CHARGE_SAVE_DELAY = 60
+
 
 def is_auth_error(err: BaseException) -> bool:
     """Return whether the error means the stored credentials were rejected.
@@ -163,6 +170,10 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
         self._confirmed_states: Store[dict[str, Any]] = Store(
             hass, 1, CONFIRMED_STATES_STORAGE_KEY, atomic_writes=True
         )
+        self._last_charge: Store[dict[str, Any]] = Store(
+            hass, 1, LAST_CHARGE_STORAGE_KEY, atomic_writes=True
+        )
+        self._last_charge_saved: Any = {}
 
         super().__init__(
             hass,
@@ -332,6 +343,7 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
             self.consecutive_failures = 0
             self.last_successful_update = dt_util.utcnow()
             self._fire_placeholder_events()
+            self._save_last_charges()
 
             # Only after a successful poll: each of these calls can take until
             # the request timeout while the cloud is down, and they hold the
@@ -637,6 +649,24 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
             _LOGGER.debug("Unable to read the confirmed states: %s", err)
             return
         self.client.restore_confirmed_states(data)
+
+    async def async_restore_last_charges(self) -> None:
+        """Take back the last real state of charge from before the restart."""
+        try:
+            data = await self._last_charge.async_load()
+        except Exception as err:  # A damaged file must not stop the setup
+            _LOGGER.debug("Unable to read the last state of charge: %s", err)
+            return
+        self.client.restore_last_charges(data)
+        if isinstance(data, dict):
+            self._last_charge_saved = data
+
+    def _save_last_charges(self) -> None:
+        data = self.client.last_charges()
+        if data == self._last_charge_saved:
+            return
+        self._last_charge_saved = data
+        self._last_charge.async_delay_save(lambda: data, LAST_CHARGE_SAVE_DELAY)
 
     async def _async_save_confirmed_states(self) -> None:
         try:

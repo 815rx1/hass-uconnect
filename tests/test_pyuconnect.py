@@ -18,7 +18,10 @@ from custom_components.uconnect.pyuconnect.api import (
 )
 from custom_components.uconnect.pyuconnect.brands import FIAT_EU
 from custom_components.uconnect.pyuconnect.client import Client
-from custom_components.uconnect.pyuconnect.command import COMMAND_DOORS_LOCK
+from custom_components.uconnect.pyuconnect.command import (
+    COMMAND_DEEP_REFRESH,
+    COMMAND_DOORS_LOCK,
+)
 
 from .conftest import VIN, load_fixture
 
@@ -196,6 +199,98 @@ def test_refused_command_does_not_relogin():
     api.login.assert_not_called()
 
 
+def http_error(status: int) -> requests.HTTPError:
+    return requests.HTTPError(response=response(status, {"debugMsg": "refused"}))
+
+
+def command_api(answer):
+    """An API whose command requests go to answer(command name)."""
+    api = API("user@example.com", "pw", "1234", FIAT_EU)
+    api._pin_auth = MagicMock(return_value="pin-token")
+    sent = []
+
+    def send(vin, cmd, pin_auth):
+        sent.append((vin, cmd.name))
+        return answer(cmd.name)
+
+    api._command_with_pin_auth = MagicMock(side_effect=send)
+    return api, sent
+
+
+def refuse(*names, status=403):
+    def answer(name):
+        if name in names:
+            raise http_error(status)
+        return "correlation"
+
+    return answer
+
+
+def test_command_goes_out_as_the_variant_that_worked(caplog):
+    api, sent = command_api(refuse("DEEPREFRESH"))
+
+    assert api.command(VIN, COMMAND_DEEP_REFRESH) == "correlation"
+    assert api.command(VIN, COMMAND_DEEP_REFRESH) == "correlation"
+
+    assert [name for _, name in sent] == ["DEEPREFRESH", "DEEPREFRESH2", "DEEPREFRESH2"]
+    assert caplog.text.count("retrying with") == 1
+
+
+def test_variant_refused_for_the_vehicle_state_is_still_taken():
+    # A 500e not plugged in: DEEPREFRESH 403, DEEPREFRESH2 400
+    def answer(name):
+        raise http_error(403 if name == "DEEPREFRESH" else 400)
+
+    api, sent = command_api(answer)
+
+    for _ in range(2):
+        with pytest.raises(requests.HTTPError):
+            api.command(VIN, COMMAND_DEEP_REFRESH)
+
+    assert [name for _, name in sent] == ["DEEPREFRESH", "DEEPREFRESH2", "DEEPREFRESH2"]
+
+
+def test_variant_refused_with_403_is_not_taken_again():
+    api, sent = command_api(refuse("DEEPREFRESH", "DEEPREFRESH2"))
+
+    for _ in range(2):
+        with pytest.raises(requests.HTTPError):
+            api.command(VIN, COMMAND_DEEP_REFRESH)
+
+    assert [name for _, name in sent] == ["DEEPREFRESH", "DEEPREFRESH2"] * 2
+
+
+def test_variant_refused_later_lets_the_command_try_again():
+    refused = {"DEEPREFRESH"}
+
+    def answer(name):
+        return refuse(*refused)(name)
+
+    api, sent = command_api(answer)
+    api.command(VIN, COMMAND_DEEP_REFRESH)
+
+    refused.add("DEEPREFRESH2")
+    with pytest.raises(requests.HTTPError):
+        api.command(VIN, COMMAND_DEEP_REFRESH)
+    refused.discard("DEEPREFRESH")
+    assert api.command(VIN, COMMAND_DEEP_REFRESH) == "correlation"
+
+    assert [name for _, name in sent] == [
+        "DEEPREFRESH", "DEEPREFRESH2", "DEEPREFRESH2", "DEEPREFRESH",
+    ]
+
+
+def test_variant_is_remembered_per_vehicle():
+    api, sent = command_api(refuse("DEEPREFRESH"))
+    api.command(VIN, COMMAND_DEEP_REFRESH)
+    api.command("OTHERVIN0000000001", COMMAND_DEEP_REFRESH)
+
+    assert sent[2:] == [
+        ("OTHERVIN0000000001", "DEEPREFRESH"),
+        ("OTHERVIN0000000001", "DEEPREFRESH2"),
+    ]
+
+
 def make_client(status_payloads, location=None):
     client = Client("user@example.com", "pw", "1234", FIAT_EU)
     api = MagicMock()
@@ -320,6 +415,84 @@ def test_placeholder_carried_over_is_not_taken_either():
         client.refresh()
 
     assert client.vehicles[VIN].state_of_charge == 72
+
+
+def test_placeholder_after_a_restart_shows_the_saved_charge():
+    client = make_client([load_fixture("status_500e.json")])
+    client.refresh()
+    saved = json.loads(json.dumps(client.last_charges()))
+    assert saved[VIN]["state_of_charge"] == 72
+    assert saved[VIN]["time_to_fully_charge_l2"] == 205
+    assert saved[VIN]["uploaded"] == datetime.fromtimestamp(1760000100).astimezone().isoformat()
+
+    restarted = make_client([placeholder_status(0, 171)])
+    restarted.restore_last_charges(saved)
+    restarted.refresh()
+    v = restarted.vehicles[VIN]
+
+    assert v.state_of_charge == 72
+    assert v.time_to_fully_charge_l2 == 205
+    assert v.distance_to_empty == 171
+
+
+def test_saved_charge_gives_way_to_a_real_reading():
+    status = load_fixture("status_500e.json")
+    status["evInfo"]["battery"]["stateOfCharge"] = 80
+    restarted = make_client([status, placeholder_status(0, 171)])
+    restarted.restore_last_charges({VIN: {"state_of_charge": 72}})
+    restarted.refresh()
+    assert restarted.vehicles[VIN].state_of_charge == 80
+    assert restarted.last_charges()[VIN]["state_of_charge"] == 80
+
+    restarted.refresh()
+    assert restarted.vehicles[VIN].state_of_charge == 80
+
+
+def test_placeholder_is_not_saved_as_charge():
+    client = make_client(
+        [load_fixture("status_500e.json"), placeholder_status(0, 171)]
+    )
+    client.refresh()
+    client.refresh()
+
+    assert client.last_charges()[VIN]["state_of_charge"] == 72
+
+
+@pytest.mark.parametrize(
+    "saved",
+    [
+        None,
+        [],
+        {VIN: None},
+        {VIN: {}},
+        {VIN: {"state_of_charge": "72"}},
+        {VIN: {"state_of_charge": 150}},
+        {VIN: {"state_of_charge": -1}},
+        {VIN: {"state_of_charge": True}},
+    ],
+)
+def test_damaged_saved_charge_is_ignored(saved):
+    restarted = make_client([placeholder_status(0, 171)])
+    restarted.restore_last_charges(saved)
+    restarted.refresh()
+
+    assert restarted.vehicles[VIN].state_of_charge is None
+    assert restarted.last_charges() == {}
+
+
+def test_damaged_saved_times_are_left_out():
+    restarted = make_client([placeholder_status(0, 171)])
+    restarted.restore_last_charges(
+        {VIN: {"state_of_charge": 72, "time_to_fully_charge_l2": -1,
+               "time_to_fully_charge_l3": "27", "uploaded": 5}}
+    )
+    restarted.refresh()
+    v = restarted.vehicles[VIN]
+
+    assert v.state_of_charge == 72
+    assert v.time_to_fully_charge_l2 is None
+    assert v.time_to_fully_charge_l3 is None
+    assert restarted.last_charges()[VIN]["uploaded"] is None
 
 
 def test_refresh_takes_zero_charge_without_range():

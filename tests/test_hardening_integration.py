@@ -331,6 +331,63 @@ async def test_card_is_served_while_the_entry_waits_for_the_cloud(
     assert hass.data[DOMAIN][frontend_cards._DATA_KEY] is True
 
 
+async def test_last_charge_is_kept_over_a_restart(
+    hass, hass_storage, config_entry, mock_client
+):
+    from custom_components.uconnect.coordinator import (
+        LAST_CHARGE_SAVE_DELAY,
+        LAST_CHARGE_STORAGE_KEY,
+    )
+
+    saved = {VIN: {"state_of_charge": 72, "time_to_fully_charge_l1": None,
+                   "time_to_fully_charge_l2": 205, "time_to_fully_charge_l3": None,
+                   "uploaded": None}}
+    hass_storage[LAST_CHARGE_STORAGE_KEY] = {
+        "version": 1, "minor_version": 1, "key": LAST_CHARGE_STORAGE_KEY, "data": saved
+    }
+    mock_client.last_charges.return_value = saved
+    config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+    mock_client.restore_last_charges.assert_called_once_with(saved)
+
+    coordinator = config_entry.runtime_data
+    with patch.object(coordinator._last_charge, "async_delay_save") as save:
+        # Nothing new: nothing written
+        await coordinator.async_refresh()
+        save.assert_not_called()
+
+        newer = {VIN: dict(saved[VIN], state_of_charge=80)}
+        mock_client.last_charges.return_value = newer
+        await coordinator.async_refresh()
+        await coordinator.async_refresh()
+        save.assert_called_once()
+        assert save.call_args.args[0]() == newer
+        assert save.call_args.args[1] == LAST_CHARGE_SAVE_DELAY
+
+
+async def test_last_charge_reaches_storage(
+    hass, hass_storage, freezer, config_entry, mock_client
+):
+    from custom_components.uconnect.coordinator import (
+        LAST_CHARGE_SAVE_DELAY,
+        LAST_CHARGE_STORAGE_KEY,
+    )
+
+    charge = {VIN: {"state_of_charge": 75, "time_to_fully_charge_l1": None,
+                    "time_to_fully_charge_l2": 65, "time_to_fully_charge_l3": 27,
+                    "uploaded": "2026-10-28T18:45:33+01:00"}}
+    mock_client.last_charges.return_value = charge
+    config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    freezer.tick(LAST_CHARGE_SAVE_DELAY + 1)
+    async_fire_time_changed(hass)
+    await hass.async_block_till_done()
+    assert hass_storage[LAST_CHARGE_STORAGE_KEY]["data"] == charge
+
+
 async def test_confirmed_states_are_kept_over_a_restart(
     hass, hass_storage, config_entry, mock_client
 ):
