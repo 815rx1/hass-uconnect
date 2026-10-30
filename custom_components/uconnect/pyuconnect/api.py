@@ -282,7 +282,7 @@ class API:
         # The PIN the backend rejected, see PinRejectedError
         self._pin_rejected: str | None = None
         # Commands, per vehicle, the backend refused with 403 while their
-        # fallback was taken: they go out as the fallback right away
+        # fallback went out: they go out as the fallback right away
         self._use_fallback: set[tuple[str, str]] = set()
 
         # Login protection, see LOGIN_BACKOFF_START. The credentials, once
@@ -1068,15 +1068,16 @@ class API:
         pin_auth = self._pin_auth()
         fallback = getattr(cmd, "fallback", None)
 
-        # The 500e refuses DEEPREFRESH every time and takes DEEPREFRESH2, so
-        # once seen the fallback goes out first, saving a request each time.
-        # Refused as well, the command itself is tried again the next time.
+        # A fallback the backend took after a 403 goes out first from then on,
+        # saving a request each time. Refused in any way, the command itself
+        # is tried again the next time: the 403 can depend on the vehicle
+        # state, a 500e refuses DEEPREFRESH only while not plugged in and
+        # takes it while charging, but never DEEPREFRESH2.
         if fallback is not None and (vin, cmd.name) in self._use_fallback:
             try:
                 return self._command_with_pin_auth(vin, fallback, pin_auth)
-            except requests.exceptions.HTTPError as err:
-                if err.response is not None and err.response.status_code == 403:
-                    self._use_fallback.discard((vin, cmd.name))
+            except requests.exceptions.HTTPError:
+                self._use_fallback.discard((vin, cmd.name))
                 raise
 
         try:
@@ -1092,17 +1093,9 @@ class API:
                     cmd,
                     fallback,
                 )
-                try:
-                    result = self._command_with_pin_auth(vin, fallback, pin_auth)
-                except requests.exceptions.HTTPError as fallback_err:
-                    # Refused for another reason, like a 500e not plugged in:
-                    # the backend took the variant, the vehicle state did not
-                    if (
-                        fallback_err.response is None
-                        or fallback_err.response.status_code != 403
-                    ):
-                        self._use_fallback.add((vin, cmd.name))
-                    raise
+                # Remembered only once the fallback went out: refused as well,
+                # it says nothing about which variant the vehicle takes
+                result = self._command_with_pin_auth(vin, fallback, pin_auth)
                 self._use_fallback.add((vin, cmd.name))
                 return result
 

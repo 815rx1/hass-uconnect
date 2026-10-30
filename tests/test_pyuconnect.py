@@ -236,7 +236,7 @@ def test_command_goes_out_as_the_variant_that_worked(caplog):
     assert caplog.text.count("retrying with") == 1
 
 
-def test_variant_refused_for_the_vehicle_state_is_still_taken():
+def test_fallback_refused_for_another_reason_is_not_remembered():
     # A 500e not plugged in: DEEPREFRESH 403, DEEPREFRESH2 400
     def answer(name):
         raise http_error(403 if name == "DEEPREFRESH" else 400)
@@ -247,7 +247,28 @@ def test_variant_refused_for_the_vehicle_state_is_still_taken():
         with pytest.raises(requests.HTTPError):
             api.command(VIN, COMMAND_DEEP_REFRESH)
 
-    assert [name for _, name in sent] == ["DEEPREFRESH", "DEEPREFRESH2", "DEEPREFRESH2"]
+    assert [name for _, name in sent] == ["DEEPREFRESH", "DEEPREFRESH2"] * 2
+
+
+def test_refresh_refused_unplugged_still_goes_out_while_charging():
+    # 2026-10-30: pressed while not plugged in, then charging. The 500e
+    # takes DEEPREFRESH while charging and refuses DEEPREFRESH2 with 400
+    plugged = {"in": False}
+
+    def answer(name):
+        if name == "DEEPREFRESH2":
+            raise http_error(400)
+        if not plugged["in"]:
+            raise http_error(403)
+        return "correlation"
+
+    api, sent = command_api(answer)
+    with pytest.raises(requests.HTTPError):
+        api.command(VIN, COMMAND_DEEP_REFRESH)
+
+    plugged["in"] = True
+    assert api.command(VIN, COMMAND_DEEP_REFRESH) == "correlation"
+    assert [name for _, name in sent] == ["DEEPREFRESH", "DEEPREFRESH2", "DEEPREFRESH"]
 
 
 def test_variant_refused_with_403_is_not_taken_again():
@@ -273,6 +294,29 @@ def test_variant_refused_later_lets_the_command_try_again():
     with pytest.raises(requests.HTTPError):
         api.command(VIN, COMMAND_DEEP_REFRESH)
     refused.discard("DEEPREFRESH")
+    assert api.command(VIN, COMMAND_DEEP_REFRESH) == "correlation"
+
+    assert [name for _, name in sent] == [
+        "DEEPREFRESH", "DEEPREFRESH2", "DEEPREFRESH2", "DEEPREFRESH",
+    ]
+
+
+@pytest.mark.parametrize("status", [400, 500])
+def test_remembered_variant_refused_in_any_way_is_forgotten(status):
+    refused = {"DEEPREFRESH": 403}
+
+    def answer(name):
+        if name in refused:
+            raise http_error(refused[name])
+        return "correlation"
+
+    api, sent = command_api(answer)
+    api.command(VIN, COMMAND_DEEP_REFRESH)
+
+    refused["DEEPREFRESH2"] = status
+    with pytest.raises(requests.HTTPError):
+        api.command(VIN, COMMAND_DEEP_REFRESH)
+    refused.pop("DEEPREFRESH")
     assert api.command(VIN, COMMAND_DEEP_REFRESH) == "correlation"
 
     assert [name for _, name in sent] == [
