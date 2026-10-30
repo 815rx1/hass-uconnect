@@ -531,3 +531,56 @@ async def test_command_refused_by_the_cloud_holds_nothing_back(
     mock_client.command_verify.return_value = True
     await hass.services.async_call(DOMAIN, "deep_refresh", {}, blocking=True)
     assert sent(mock_client)[-1] == "DEEPREFRESH"
+
+
+def refused_by_the_cloud(status: int):
+    import requests
+
+    answer = requests.Response()
+    answer.status_code = status
+    return requests.HTTPError(str(status), response=answer)
+
+
+async def test_refresh_refused_while_unplugged_says_so(
+    hass, config_entry, mock_client, vehicle
+):
+    from custom_components.uconnect.coordinator import RefreshNeedsPlug
+
+    await setup(hass, config_entry)
+    vehicle.plugged_in = False
+    mock_client.command_verify.side_effect = refused_by_the_cloud(400)
+
+    with pytest.raises(RefreshNeedsPlug) as raised:
+        await hass.services.async_call(DOMAIN, "deep_refresh", {}, blocking=True)
+
+    assert raised.value.translation_key == "refresh_needs_plug"
+    assert "plugged in" in str(raised.value)
+    assert hass.data[DOMAIN]["_wake_guard"].wakes(VIN) == []
+
+
+@pytest.mark.parametrize(
+    ("plugged_in", "status", "service"),
+    [
+        (True, 400, "deep_refresh"),
+        (None, 400, "deep_refresh"),
+        (False, 500, "deep_refresh"),
+        (False, 400, "doors_lock"),
+    ],
+)
+async def test_other_refusals_keep_the_reason(
+    hass, config_entry, mock_client, vehicle, plugged_in, status, service
+):
+    from custom_components.uconnect.coordinator import (
+        RefreshNeedsPlug,
+        UconnectRequestError,
+    )
+
+    await setup(hass, config_entry)
+    vehicle.plugged_in = plugged_in
+    mock_client.command_verify.side_effect = refused_by_the_cloud(status)
+
+    with pytest.raises(UconnectRequestError) as raised:
+        await hass.services.async_call(DOMAIN, service, {}, blocking=True)
+
+    assert not isinstance(raised.value, RefreshNeedsPlug)
+    assert str(status) in str(raised.value)

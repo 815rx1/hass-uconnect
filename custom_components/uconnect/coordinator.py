@@ -12,7 +12,7 @@ import time
 from typing import Any, NoReturn, TypeVar
 
 from .pyuconnect import Client
-from .pyuconnect.command import Command
+from .pyuconnect.command import COMMAND_DEEP_REFRESH, Command
 from .pyuconnect.api import CHARGING_LEVELS_BY_NAME
 from .pyuconnect.brands import BRANDS as BRANDS_BY_NAME
 
@@ -106,6 +106,23 @@ class UconnectRequestError(HomeAssistantError):
     refused, the cloud may still carry this action out, and no refresh has
     followed it yet.
     """
+
+
+class RefreshNeedsPlug(UconnectRequestError):
+    """A deep refresh the cloud refused while the vehicle is not plugged in.
+
+    The 500e takes it only while plugged in. The cloud refuses it outright
+    otherwise, so nothing reached the vehicle; the raw answer, a 400 from
+    the fallback variant, told the user nothing.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Deep refresh only works while the vehicle is plugged in. The cloud "
+            "refused it, the vehicle was not woken.",
+            translation_domain=DOMAIN,
+            translation_key="refresh_needs_plug",
+        )
 
 
 class PinRejected(ServiceValidationError):
@@ -635,8 +652,16 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
             # Refused by the cloud before it was queued, e.g. a deep refresh
             # of a 500e that is not plugged in: it never reached the vehicle,
             # so it holds back no later command
-            if record is not None and _refused_before_queued(err):
+            refused = _refused_before_queued(err)
+            if record is not None and refused:
                 async_get_wake_guard(self.hass).forget(vin, record)
+            vehicle = self.client.get_vehicles().get(vin)
+            if (
+                refused
+                and command == COMMAND_DEEP_REFRESH.name
+                and getattr(vehicle, "plugged_in", None) is False
+            ):
+                raise RefreshNeedsPlug from err
             raise UconnectRequestError(f"{what} failed: {err}") from err
 
         await self._async_finish_action(what, record, result)

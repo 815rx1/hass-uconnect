@@ -366,6 +366,9 @@
         }
     },
     "exceptions": {
+        "refresh_needs_plug": {
+            "message": "Deep refresh only works while the vehicle is plugged in. The cloud refused it, the vehicle was not woken."
+        },
         "refresh_cooldown": {
             "message": "Not sent: the vehicle was refreshed shortly before. Try again in {minutes} min."
         },

@@ -366,6 +366,9 @@
         }
     },
     "exceptions": {
+        "refresh_needs_plug": {
+            "message": "Deep Refresh geht nur, solange das Auto eingesteckt ist. Die Cloud hat ihn abgelehnt, das Auto wurde nicht geweckt."
+        },
         "refresh_cooldown": {
             "message": "Nicht gesendet: Das Fahrzeug wurde eben erst aktualisiert. Versuche es in {minutes} Min. erneut."
         },
