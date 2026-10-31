@@ -352,7 +352,7 @@ async def test_last_charge_is_kept_over_a_restart(
     mock_client.restore_last_charges.assert_called_once_with(saved)
 
     coordinator = config_entry.runtime_data
-    with patch.object(coordinator._last_charge, "async_delay_save") as save:
+    with patch.object(coordinator._last_charge._store, "async_delay_save") as save:
         # Nothing new: nothing written
         await coordinator.async_refresh()
         save.assert_not_called()
@@ -406,3 +406,269 @@ async def test_confirmed_states_are_kept_over_a_restart(
     await hass.services.async_call(DOMAIN, "doors_lock", {}, blocking=True)
     await hass.async_block_till_done()
     assert hass_storage[CONFIRMED_STATES_STORAGE_KEY]["data"] == saved
+
+
+async def test_stores_keep_the_vehicles_of_other_entries(
+    hass, hass_storage, freezer, config_entry, mock_client
+):
+    from custom_components.uconnect.coordinator import (
+        CONFIRMED_STATES_SAVE_DELAY,
+        CONFIRMED_STATES_STORAGE_KEY,
+    )
+
+    other = {"ZFAOTHERCAR0000001": {"lock:x": {"value": {"door_driver_locked": True}, "at": "2026-10-22T20:10:00+00:00"}}}
+    hass_storage[CONFIRMED_STATES_STORAGE_KEY] = {
+        "version": 1, "minor_version": 1, "key": CONFIRMED_STATES_STORAGE_KEY, "data": other
+    }
+    config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    mine = {VIN: {"lock:y": {"value": {"door_driver_locked": True}, "at": "2026-10-31T08:00:00+00:00"}}}
+    mock_client.confirmed_states.return_value = mine
+    await hass.services.async_call(DOMAIN, "doors_lock", {}, blocking=True)
+    await hass.async_block_till_done()
+    assert hass_storage[CONFIRMED_STATES_STORAGE_KEY]["data"] == {**other, **mine}
+
+    # Replaced by a newer status: dropped after the next poll, while the
+    # vehicle of the other entry stays
+    mock_client.confirmed_states.return_value = {}
+    await config_entry.runtime_data.async_refresh()
+    freezer.tick(CONFIRMED_STATES_SAVE_DELAY + 1)
+    async_fire_time_changed(hass)
+    await hass.async_block_till_done()
+    assert hass_storage[CONFIRMED_STATES_STORAGE_KEY]["data"] == other
+
+
+async def test_vehicle_store_is_read_once_and_survives_damage(hass, hass_storage):
+    from custom_components.uconnect.coordinator import VehicleStore
+
+    key = f"{DOMAIN}.test"
+    hass_storage[key] = {"version": 1, "minor_version": 1, "key": key, "data": ["damaged"]}
+    store = VehicleStore.shared(hass, key)
+    assert VehicleStore.shared(hass, key) is store
+    assert await store.async_load() == {}
+
+    assert store.update([VIN], {VIN: {"a": 1}})
+    assert not store.update([VIN], {VIN: {"a": 1}})
+    # What one entry changed is not lost to another entry loading later
+    assert await store.async_load() == {VIN: {"a": 1}}
+
+
+async def test_rejected_pin_is_kept_over_a_restart(
+    hass, hass_storage, config_entry, mock_client
+):
+    from custom_components.uconnect.coordinator import PIN_REJECTION_STORAGE_KEY
+
+    other = {"pin": "0123456789abcdef", "locked": False}
+    mine = {"pin": "fp", "locked": True}
+    hass_storage[PIN_REJECTION_STORAGE_KEY] = {
+        "version": 1, "minor_version": 1, "key": PIN_REJECTION_STORAGE_KEY,
+        "data": {config_entry.entry_id: mine, "other_entry": other},
+    }
+
+    def restore(fingerprint, locked, salt):
+        mock_client.api.pin_rejected = fingerprint == "fp"
+
+    mock_client.api.restore_pin_rejection.side_effect = restore
+    config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+    mock_client.api.restore_pin_rejection.assert_called_once_with(
+        "fp", True, config_entry.entry_id
+    )
+    assert hass_storage[PIN_REJECTION_STORAGE_KEY]["data"] == {
+        config_entry.entry_id: mine, "other_entry": other
+    }
+
+    # Saving the options unchanged sends it again, e.g. once unlocked in the
+    # app. The rejection of the other entry stays.
+    mock_client.api.pin_rejected = False
+    result = await hass.config_entries.options.async_init(config_entry.entry_id)
+    await hass.config_entries.options.async_configure(
+        result["flow_id"], {**config_entry.options, "pin": "1234"}
+    )
+    await hass.async_block_till_done()
+    mock_client.api.clear_pin_rejection.assert_called_once()
+    assert hass_storage[PIN_REJECTION_STORAGE_KEY]["data"] == {"other_entry": other}
+
+
+async def test_new_pin_in_the_options_does_not_release_the_old_one_early(
+    hass, config_entry, mock_client
+):
+    config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    result = await hass.config_entries.options.async_init(config_entry.entry_id)
+    await hass.config_entries.options.async_configure(
+        result["flow_id"], {**config_entry.options, "pin": "5678"}
+    )
+    await hass.async_block_till_done()
+    # The new PIN takes the place of the rejected one when the options apply;
+    # released before, the old one could have gone out once more
+    mock_client.api.clear_pin_rejection.assert_not_called()
+    mock_client.set_pin.assert_called_with("5678")
+
+
+async def test_rejection_of_a_replaced_pin_is_dropped(
+    hass, hass_storage, config_entry, mock_client
+):
+    from custom_components.uconnect.coordinator import PIN_REJECTION_STORAGE_KEY
+
+    hass_storage[PIN_REJECTION_STORAGE_KEY] = {
+        "version": 1, "minor_version": 1, "key": PIN_REJECTION_STORAGE_KEY,
+        "data": {config_entry.entry_id: {"pin": "of-the-old-pin", "locked": False}},
+    }
+    config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+    # The PIN set now was not the one rejected: nothing is held back, and
+    # setting the old one again later does not bring the rejection back
+    assert not mock_client.api.pin_rejected
+    assert hass_storage[PIN_REJECTION_STORAGE_KEY]["data"] == {}
+
+
+@pytest.mark.parametrize("new_pin", [None, "5678"])
+async def test_options_of_an_entry_not_loaded_let_the_pin_go_out(
+    hass, hass_storage, config_entry, new_pin
+):
+    from custom_components.uconnect.const import BRANDS
+    from custom_components.uconnect.coordinator import PIN_REJECTION_STORAGE_KEY
+    from custom_components.uconnect.pyuconnect.api import _PIN_REJECTIONS, API
+    from custom_components.uconnect.pyuconnect.brands import BRANDS as BRANDS_BY_NAME
+
+    stored = {config_entry.entry_id: {"pin": "fp", "locked": True}}
+    hass_storage[PIN_REJECTION_STORAGE_KEY] = {
+        "version": 1, "minor_version": 1, "key": PIN_REJECTION_STORAGE_KEY, "data": stored,
+    }
+    brand = BRANDS_BY_NAME[BRANDS[config_entry.data["brand_region"]]]
+    API("user@example.com", "pw", "1234", brand)._reject_pin(True)
+    assert _PIN_REJECTIONS
+
+    config_entry.add_to_hass(hass)
+    result = await hass.config_entries.options.async_init(config_entry.entry_id)
+    options = dict(config_entry.options) | ({"pin": new_pin} if new_pin else {})
+    with patch(SETUP, return_value=True):
+        await hass.config_entries.options.async_configure(result["flow_id"], options)
+        await hass.async_block_till_done()
+
+    if new_pin:
+        # Left as it is: the new PIN is not the rejected one, and the stored
+        # rejection is dropped at the next setup
+        assert _PIN_REJECTIONS
+        assert hass_storage[PIN_REJECTION_STORAGE_KEY]["data"] == stored
+    else:
+        assert not _PIN_REJECTIONS
+        assert hass_storage[PIN_REJECTION_STORAGE_KEY]["data"] == {}
+
+
+# --- Setup while the cloud is not fully there ----------------------------
+
+
+async def test_entry_starts_without_status_once_its_entities_exist(
+    hass, config_entry, mock_client, vehicle
+):
+    from homeassistant.helpers import entity_registry as er
+
+    config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+    assert await hass.config_entries.async_unload(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    # Home Assistant starts while the status cannot be read: the vehicle is
+    # listed, but nothing about it is known
+    mock_client.refresh.side_effect = Exception("status timed out")
+    for door in ("driver", "passenger", "rear_left", "rear_right"):
+        setattr(vehicle, f"door_{door}_locked", None)
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+    assert config_entry.state is ConfigEntryState.LOADED
+
+    lock = er.async_get(hass).async_get_entity_id(
+        "lock", DOMAIN, f"{DOMAIN}_{VIN}_lock_doors"
+    )
+    assert hass.states.get(lock).state == "unknown"
+    # An automation locking the car at night still can
+    await hass.services.async_call("lock", "lock", {"entity_id": lock}, blocking=True)
+    assert mock_client.command_verify.call_args.args[1].name == "RDL"
+    # Once set up, failing polls count as failures again
+    assert not config_entry.runtime_data.last_update_success
+
+
+async def test_account_without_a_vehicle_at_setup_retries(hass, config_entry, mock_client):
+    mock_client.vehicles = {}
+    mock_client.get_vehicles.return_value = {}
+    config_entry.add_to_hass(hass)
+    assert not await hass.config_entries.async_setup(config_entry.entry_id)
+    assert config_entry.state is ConfigEntryState.SETUP_RETRY
+
+
+# --- Entities -------------------------------------------------------------
+
+
+async def test_update_button_stays_usable_while_polls_fail(
+    hass, setup_integration, mock_client
+):
+    from homeassistant.helpers import entity_registry as er
+
+    coordinator = setup_integration.runtime_data
+    button = er.async_get(hass).async_get_entity_id(
+        "button", DOMAIN, f"{DOMAIN}_{VIN}_update"
+    )
+    mock_client.refresh.side_effect = Exception("status down")
+    for _ in range(3):
+        await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    assert not coordinator.last_update_success
+    assert hass.states.get(button).state != "unavailable"
+
+    mock_client.refresh.side_effect = None
+    await hass.services.async_call("button", "press", {"entity_id": button}, blocking=True)
+    assert coordinator.last_update_success
+
+
+async def test_lock_icons_follow_the_state(hass, config_entry, mock_client, vehicle):
+    from homeassistant.helpers import entity_registry as er
+
+    # Reported by the remote status, which the sample does not include
+    vehicle.door_driver_locked = True
+    config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    registry = er.async_get(hass)
+    door = registry.async_get_entity_id(
+        "binary_sensor", DOMAIN, f"{DOMAIN}_{VIN}_door_driver_locked"
+    )
+    lock = registry.async_get_entity_id("lock", DOMAIN, f"{DOMAIN}_{VIN}_lock_doors")
+    coordinator = config_entry.runtime_data
+
+    async def states():
+        await coordinator.async_refresh()
+        await hass.async_block_till_done()
+        return hass.states.get(door), hass.states.get(lock)
+
+    vehicle.door_driver_locked = True
+    door_state, _ = await states()
+    assert (door_state.state, door_state.attributes["icon"]) == ("off", "mdi:car-door-lock")
+
+    vehicle.door_driver_locked = False
+    door_state, _ = await states()
+    assert (door_state.state, door_state.attributes["icon"]) == (
+        "on", "mdi:car-door-lock-open"
+    )
+
+    # Not known: a question mark, neither an open nor a closed lock
+    vehicle.door_driver_locked = None
+    door_state, _ = await states()
+    assert (door_state.state, door_state.attributes["icon"]) == (
+        "unknown", "mdi:lock-question"
+    )
+    mock_client.refresh.side_effect = Exception("status down")
+    for _ in range(3):
+        _, lock_state = await states()
+    assert (lock_state.state, lock_state.attributes["icon"]) == (
+        "unknown", "mdi:lock-question"
+    )

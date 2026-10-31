@@ -48,44 +48,47 @@ SENSOR_DESCRIPTIONS: Final[tuple[UconnectBinarySensorEntityDescription, ...]] = 
         off_icon="mdi:engine-off",
         device_class=BinarySensorDeviceClass.POWER,
     ),
+    # The lock sensors are on when unlocked, as the LOCK device class has it,
+    # so the open lock is their on icon. Unknown shows neither, see
+    # UconnectBinarySensor.icon.
     UconnectBinarySensorEntityDescription(
         key="door_driver_locked",
         name="Door Driver",
         postprocess=lambda x: not x,
-        on_icon="mdi:car-door-lock",
-        off_icon="mdi:car-door-lock-open",
+        on_icon="mdi:car-door-lock-open",
+        off_icon="mdi:car-door-lock",
         device_class=BinarySensorDeviceClass.LOCK,
     ),
     UconnectBinarySensorEntityDescription(
         key="door_passenger_locked",
         name="Door Passenger",
         postprocess=lambda x: not x,
-        on_icon="mdi:car-door-lock",
-        off_icon="mdi:car-door-lock-open",
+        on_icon="mdi:car-door-lock-open",
+        off_icon="mdi:car-door-lock",
         device_class=BinarySensorDeviceClass.LOCK,
     ),
     UconnectBinarySensorEntityDescription(
         key="door_rear_left_locked",
         name="Door Rear Left",
         postprocess=lambda x: not x,
-        on_icon="mdi:car-door-lock",
-        off_icon="mdi:car-door-lock-open",
+        on_icon="mdi:car-door-lock-open",
+        off_icon="mdi:car-door-lock",
         device_class=BinarySensorDeviceClass.LOCK,
     ),
     UconnectBinarySensorEntityDescription(
         key="door_rear_right_locked",
         name="Door Rear Right",
         postprocess=lambda x: not x,
-        on_icon="mdi:car-door-lock",
-        off_icon="mdi:car-door-lock-open",
+        on_icon="mdi:car-door-lock-open",
+        off_icon="mdi:car-door-lock",
         device_class=BinarySensorDeviceClass.LOCK,
     ),
     UconnectBinarySensorEntityDescription(
         key="trunk_locked",
         name="Trunk",
         postprocess=lambda x: not x,
-        on_icon="mdi:lock",
-        off_icon="mdi:lock-open",
+        on_icon="mdi:lock-open",
+        off_icon="mdi:lock",
         device_class=BinarySensorDeviceClass.LOCK,
     ),
     # As in upstream 1.0.2, so its entity carries over in both directions
@@ -93,8 +96,8 @@ SENSOR_DESCRIPTIONS: Final[tuple[UconnectBinarySensorEntityDescription, ...]] = 
         key="liftgate_locked",
         name="Liftgate",
         postprocess=lambda x: not x,
-        on_icon="mdi:lock",
-        off_icon="mdi:lock-open",
+        on_icon="mdi:lock-open",
+        off_icon="mdi:lock",
         device_class=BinarySensorDeviceClass.LOCK,
     ),
     UconnectBinarySensorEntityDescription(
@@ -245,9 +248,14 @@ class UconnectBinarySensor(BinarySensorEntity, UconnectEntity):
         if self.entity_description.on_icon is None:
             return None
 
+        is_on = self.is_on
+        # Not known: the off icon, a closed lock, would suggest it is locked
+        if is_on is None and self.entity_description.device_class == BinarySensorDeviceClass.LOCK:
+            return "mdi:lock-question"
+
         return (
             self.entity_description.on_icon
-            if self.is_on
+            if is_on
             else self.entity_description.off_icon or self.entity_description.on_icon
         )
 

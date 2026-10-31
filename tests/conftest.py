@@ -19,7 +19,7 @@ from custom_components.uconnect.const import (
     CONF_DISABLE_TLS_VERIFICATION,
     DOMAIN,
 )
-from custom_components.uconnect.pyuconnect.api import _LOGIN_BACKOFFS
+from custom_components.uconnect.pyuconnect.api import _LOGIN_BACKOFFS, _PIN_REJECTIONS
 from custom_components.uconnect.pyuconnect.brands import FIAT_EU
 from custom_components.uconnect.pyuconnect.client import (
     Client,
@@ -48,10 +48,12 @@ def auto_enable_custom_integrations(enable_custom_integrations):
 
 @pytest.fixture(autouse=True)
 def fresh_login_backoff():
-    """The login backoff outlives API objects, but not a test."""
+    """The login backoff and a rejected PIN outlive API objects, but not a test."""
     _LOGIN_BACKOFFS.clear()
+    _PIN_REJECTIONS.clear()
     yield
     _LOGIN_BACKOFFS.clear()
+    _PIN_REJECTIONS.clear()
 
 
 def load_fixture(name: str) -> dict:
@@ -101,6 +103,8 @@ def mock_client(vehicle, cloud_status):
     client.api.sess = requests.Session()
     client.api.pin = "1234"
     client.api.pin_rejected = False
+    client.api.pin_locked = False
+    client.api.pin_rejection_fingerprint.return_value = "fp"
     client.confirmed_states.return_value = {}
     client.placeholders = {}
     client.last_charges.return_value = {}

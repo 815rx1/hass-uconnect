@@ -30,7 +30,12 @@ from .pyuconnect.client import Vehicle
 from .pyuconnect.command import COMMAND_DEEP_REFRESH
 
 from .const import DOMAIN
-from .coordinator import PinRejected, UconnectDataUpdateCoordinator, UconnectRequestError
+from .coordinator import (
+    PinRejected,
+    UconnectDataUpdateCoordinator,
+    UconnectRequestError,
+    _refused_before_queued,
+)
 from .wake_guard import (
     AUTO_REFRESH_FIRST_STEP,
     AUTO_REFRESH_MAX_FAILURES,
@@ -459,6 +464,13 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
                 guard.stop_session(self._vin)
             _LOGGER.warning("Deep refresh for %s not sent: %s", self._vin, err)
         except Exception as err:
+            # Refused outright by the cloud, like a 500e that is not plugged
+            # in, or stopped at the PIN authentication: nothing reached the
+            # vehicle, so it holds back no manual refresh and uses up no daily
+            # budget. It still counts as a failure, so a charge does not keep
+            # trying forever
+            if record is not None and _refused_before_queued(err.__cause__ or err):
+                guard.forget(self._vin, record)
             failures = guard.auto_refresh_failed(self._vin)
             _LOGGER.warning(
                 "Deep refresh failed for %s (%d/%d): %s",

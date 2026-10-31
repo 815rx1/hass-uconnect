@@ -42,7 +42,7 @@ from .const import (
     DEFAULT_PIN,
     DOMAIN,
 )
-from .coordinator import is_auth_error
+from .coordinator import async_retry_pin, is_auth_error
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -123,6 +123,13 @@ class UconnectOptionFlowHandler(config_entries.OptionsFlow):
         """Handle options init setup."""
 
         if user_input is not None:
+            # Saved with the same PIN, a rejected one is sent again. A blank
+            # field keeps the PIN given at setup, as in the coordinator.
+            await async_retry_pin(
+                self.hass,
+                self.config_entry,
+                user_input.get(CONF_PIN) or self.config_entry.data.get(CONF_PIN, ""),
+            )
             return self.async_create_entry(
                 title=self.config_entry.title, data=user_input
             )

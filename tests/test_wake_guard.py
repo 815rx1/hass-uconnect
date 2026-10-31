@@ -13,6 +13,7 @@ from custom_components.uconnect.wake_guard import (
     AUTO_REFRESH_MAX_PER_DAY,
     AUTO_REFRESH_MAX_WITHOUT_PROGRESS,
     AUTO_REFRESH_MIN_SPACING,
+    MANUAL_MAX_PER_DAY,
     MANUAL_MAX_PER_HOUR,
     MANUAL_REFRESH_COOLDOWN,
     MANUAL_REFRESH_MAX_PER_DAY,
@@ -271,10 +272,29 @@ async def test_hourly_limit_lets_locking_through(hass):
     guard.check_manual_command(VIN, "RDL", at(MANUAL_MAX_PER_HOUR))
     guard.record_command(VIN, "RDL", at(MANUAL_MAX_PER_HOUR))
 
-    # Locking again and again is a loop, which the limit holds back
+    # Locking again goes out too: the other commands used up the hour, not
+    # the lock, and they must never hold a lock back
+    guard.check_manual_command(VIN, "RDL", at(MANUAL_MAX_PER_HOUR + 1))
+
+
+async def test_locking_again_and_again_is_a_loop(hass):
+    guard = await new_guard(hass)
+    for i in range(MANUAL_MAX_PER_HOUR):
+        guard.record_command(VIN, "RDL", at(i))
+
     with pytest.raises(Blocked) as err:
-        guard.check_manual_command(VIN, "RDL", at(MANUAL_MAX_PER_HOUR + 1))
+        guard.check_manual_command(VIN, "RDL", at(MANUAL_MAX_PER_HOUR))
     assert err.value.key == "hourly_limit"
+
+
+async def test_lock_repeated_today_is_not_held_by_other_commands(hass):
+    # Locked this morning; later an automation sent 100 other commands
+    guard = await new_guard(hass)
+    guard.record_command(VIN, "RDL", at(0))
+    for i in range(MANUAL_MAX_PER_DAY):
+        guard.record_command(VIN, "HBLF", at(600 + i * 5))
+
+    guard.check_manual_command(VIN, "RDL", at(600 + MANUAL_MAX_PER_DAY * 5))
 
 
 async def test_clock_set_back_does_not_hold_commands_back(hass):

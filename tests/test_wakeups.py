@@ -688,3 +688,22 @@ async def test_slow_charge_settles_on_longer_steps(
     await run_for(hass, freezer, 3 * 60)
     # 5, 10, 20 minutes, then every 30: far fewer than every five minutes
     assert 4 <= deep_refreshes(mock_client) <= 9
+
+
+async def test_refused_automatic_refresh_holds_nothing_back(
+    hass, freezer, config_entry, mock_client, vehicle
+):
+    from .test_command_safety import refused_by_the_cloud
+
+    charging_car(mock_client, vehicle)
+    mock_client.command_verify.side_effect = refused_by_the_cloud(400)
+    await setup(hass, config_entry, 15)
+    await run_for(hass, freezer, 20, every=2)
+    tried = mock_client.command_verify.call_count
+    assert tried >= 1
+
+    # Nothing reached the vehicle: no wake-up kept, a refresh by hand goes out
+    assert hass.data[DOMAIN]["_wake_guard"].wakes(VIN) == []
+    charging_car(mock_client, vehicle)
+    await hass.services.async_call(DOMAIN, "deep_refresh", {}, blocking=True)
+    assert mock_client.command_verify.call_count == tried + 1

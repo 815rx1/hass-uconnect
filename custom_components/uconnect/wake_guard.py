@@ -460,15 +460,18 @@ class WakeGuard:
             )
 
         # Locking after unlocking, or switching off what was switched on,
-        # always goes out
-        if command in SECURING_COMMANDS and (
-            last_of_group is None or last_of_group.command != command
-        ):
-            return
+        # always goes out. Repeated, only its own repeats count towards the
+        # loop limits: other commands must never use up the budget of a lock
+        if command in SECURING_COMMANDS:
+            if last_of_group is None or last_of_group.command != command:
+                return
+            counted = [w for w in wakes if w.command == command]
+        else:
+            counted = wakes
 
         last_hour = [
             w
-            for w in wakes
+            for w in counted
             if not w.automatic and _age(now, w.at) < timedelta(hours=1)
         ]
         if len(last_hour) >= MANUAL_MAX_PER_HOUR:
@@ -482,7 +485,7 @@ class WakeGuard:
             )
 
         last_day = [
-            w for w in wakes if not w.automatic and _age(now, w.at) < HISTORY_WINDOW
+            w for w in counted if not w.automatic and _age(now, w.at) < HISTORY_WINDOW
         ]
         if len(last_day) >= MANUAL_MAX_PER_DAY:
             wait = HISTORY_WINDOW - _age(now, last_day[-MANUAL_MAX_PER_DAY].at)

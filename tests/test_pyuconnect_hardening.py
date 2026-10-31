@@ -13,12 +13,15 @@ import requests
 
 from custom_components.uconnect.pyuconnect import client as client_module
 from custom_components.uconnect.pyuconnect.api import (
+    _PIN_REJECTIONS,
     API,
     LOGIN_BACKOFF_START,
     AuthenticationError,
     LoginBackoffError,
+    PinAuthError,
     PinRejectedError,
     _is_token_rejected,
+    forget_pin_rejection,
 )
 from custom_components.uconnect.pyuconnect.command import COMMAND_DOORS_LOCK
 from custom_components.uconnect.pyuconnect.brands import FIAT_EU
@@ -111,7 +114,7 @@ def test_numeric_nickname_stays_text():
     assert client.vehicles[VIN].nickname == "500"
 
 
-def test_vehicle_gone_from_the_account_is_dropped():
+def test_vehicle_gone_from_the_account_is_dropped(caplog):
     client = make_client([load_fixture("status_500e.json")] * 3)
     client.refresh()
     assert VIN in client.vehicles
@@ -123,8 +126,12 @@ def test_vehicle_gone_from_the_account_is_dropped():
 
     other = dict(LIST_ITEM, vin="ZFAOTHERCAR0000001")
     client.api.list_vehicles.return_value = [other]
-    client.refresh()
+    with caplog.at_level(logging.INFO):
+        client.refresh()
     assert VIN not in client.vehicles
+    # Logged without the full VIN
+    assert "no longer in the account" in caplog.text
+    assert VIN not in caplog.text and VIN[-4:] in caplog.text
 
 
 # --- Parsing ------------------------------------------------------------
@@ -522,6 +529,15 @@ def test_debug_log_leaves_out_vin_position_and_account(caplog):
         assert secret not in text
 
 
+def test_status_endpoint_warnings_leave_out_the_vin(caplog):
+    api = logged_in_api()
+    with patch.object(api.sess, "request", return_value=response(404, {})):
+        with caplog.at_level(logging.WARNING):
+            assert api.get_vehicle(VIN) == {}
+    assert "status endpoint" in caplog.text
+    assert VIN not in caplog.text and VIN[-4:] in caplog.text
+
+
 def test_signing_library_does_not_log_secrets():
     assert logging.getLogger("requests_auth_aws_sigv4").getEffectiveLevel() >= logging.WARNING
 
@@ -535,12 +551,18 @@ def test_signing_library_does_not_log_secrets():
 )
 def test_rejected_pin_is_not_sent_again(status, body):
     api = logged_in_api()
-    api._last_rejected_relogin = 0.0
-    with patch(
-        "custom_components.uconnect.pyuconnect.api.time.monotonic", return_value=100.0
-    ), patch.object(api.sess, "request", return_value=response(status, body)) as req:
+
+    def answer(method, url, **kwargs):
+        # A bare 401 has the credentials checked with the vehicle list: taken
+        if url.endswith("/vehicles"):
+            return response(200, {"vehicles": []})
+        return response(status, body)
+
+    with patch.object(api.sess, "request", side_effect=answer) as req:
         with pytest.raises(PinRejectedError):
             api.command(VIN, COMMAND_DOORS_LOCK)
+        assert len(pin_requests(req)) == 1
+        assert api.pin_locked is (status == 423)
         sent = req.call_count
         # Nothing goes out any more, neither a command nor the PIN
         with pytest.raises(PinRejectedError):
@@ -555,6 +577,192 @@ def test_rejected_pin_is_not_sent_again(status, body):
     ]
     with patch.object(api.sess, "request", side_effect=answers):
         assert api.command(VIN, COMMAND_DOORS_LOCK) == "a"
+
+
+def pin_requests(req) -> list:
+    return [c for c in req.call_args_list if c.kwargs["url"].endswith("/pin/authenticate")]
+
+
+def counting_login(api) -> list:
+    logins = []
+
+    def login():
+        logins.append(1)
+        api.expire_time = datetime.now(timezone.utc) + timedelta(hours=1)
+
+    api.login = login
+    return logins
+
+
+@pytest.mark.parametrize(
+    "refused",
+    [
+        response(401, {"message": "Unauthorized"}),
+        # The error envelope, with a 200
+        response(200, {"name": "EXPIRED_TOKEN"}),
+    ],
+)
+def test_bare_401_with_refused_credentials_sends_the_pin_once_more(refused):
+    api = logged_in_api()
+    logins = counting_login(api)
+    pin_answers = [
+        response(401, {"message": "Unauthorized"}),
+        response(200, {"token": "pin-1", "expiry": 300000}),
+    ]
+
+    def answer(method, url, **kwargs):
+        if url.endswith("/pin/authenticate"):
+            return pin_answers.pop(0)
+        if url.endswith("/vehicles"):
+            return refused
+        return response(200, {"responseStatus": "pending", "correlationId": "a"})
+
+    with patch.object(api.sess, "request", side_effect=answer) as req:
+        assert api.command(VIN, COMMAND_DOORS_LOCK) == "a"
+    # One fresh login, then the PIN went through: it was never wrong
+    assert logins == [1]
+    assert len(pin_requests(req)) == 2
+    assert not api.pin_rejected
+
+
+@pytest.mark.parametrize(("fresh_taken", "error"), [(True, PinRejectedError), (False, PinAuthError)])
+def test_bare_401_again_after_a_fresh_login(fresh_taken, error):
+    api = logged_in_api()
+    logins = counting_login(api)
+    unauthorized = response(401, {"message": "Unauthorized"})
+
+    def answer(method, url, **kwargs):
+        if url.endswith("/vehicles"):
+            # Refused before the fresh login; after it, taken or not
+            return response(200, {"vehicles": []}) if logins and fresh_taken else unauthorized
+        return unauthorized
+
+    with patch.object(api.sess, "request", side_effect=answer) as req:
+        with pytest.raises(error):
+            api.command(VIN, COMMAND_DOORS_LOCK)
+    # Sent twice at most, and taken as wrong only once the fresh credentials
+    # proved to work: otherwise everything was refused, an outage
+    assert logins == [1]
+    assert len(pin_requests(req)) == 2
+    assert api.pin_rejected is fresh_taken
+
+
+def test_bare_401_shortly_after_a_fresh_login_is_left_open():
+    api = logged_in_api()
+    api._last_rejected_relogin = 100.0
+    unauthorized = response(401, {"message": "Unauthorized"})
+    with patch(
+        "custom_components.uconnect.pyuconnect.api.time.monotonic", return_value=160.0
+    ), patch.object(api.sess, "request", return_value=unauthorized) as req:
+        with pytest.raises(PinAuthError):
+            api.command(VIN, COMMAND_DOORS_LOCK)
+    # Neither taken as a wrong PIN nor sent a second time
+    assert len(pin_requests(req)) == 1
+    assert not api.pin_rejected
+
+
+def maintenance_page() -> requests.Response:
+    r = response(200)
+    r._content = b"<html><body>Down for maintenance</body></html>"
+    return r
+
+
+@pytest.mark.parametrize(
+    "check", [response(503, {"message": "Service Unavailable"}), maintenance_page()]
+)
+def test_bare_401_while_the_service_fails_is_left_open(check):
+    api = logged_in_api()
+    api.login = MagicMock()
+
+    def answer(method, url, **kwargs):
+        if url.endswith("/vehicles"):
+            return check
+        return response(401, {"message": "Unauthorized"})
+
+    with patch.object(api.sess, "request", side_effect=answer) as req:
+        with pytest.raises(PinAuthError):
+            api.command(VIN, COMMAND_DOORS_LOCK)
+    # Nothing says the credentials were refused: no new login, the PIN is
+    # neither sent again nor taken as wrong
+    api.login.assert_not_called()
+    assert len(pin_requests(req)) == 1
+    assert not api.pin_rejected
+
+
+def test_pin_rejection_outlives_the_api_object():
+    api = logged_in_api()
+    with patch.object(api.sess, "request", return_value=response(423, {"name": "PIN_LOCKED"})):
+        with pytest.raises(PinRejectedError):
+            api.command(VIN, COMMAND_DOORS_LOCK)
+
+    # A reload creates a new API object: the same PIN is still not sent
+    again = logged_in_api()
+    assert again.pin_rejected and again.pin_locked
+    with patch.object(again.sess, "request") as req:
+        with pytest.raises(PinRejectedError, match="locked"):
+            again.command(VIN, COMMAND_DOORS_LOCK)
+    req.assert_not_called()
+
+    # Other accounts are not affected, and forgetting it lets the PIN go out,
+    # also from the API objects already running
+    assert not API("other@example.com", "pw", "1234", FIAT_EU).pin_rejected
+    forget_pin_rejection(FIAT_EU.login_url, "USER@example.com")
+    assert not again.pin_rejected and not again.pin_locked
+    assert not api.pin_rejected
+    assert not _PIN_REJECTIONS
+
+
+def test_pin_rejection_is_restored_only_for_the_same_pin():
+    api = logged_in_api()
+    fingerprint = api.pin_rejection_fingerprint("entry1")
+    assert "1234" not in fingerprint
+
+    api.restore_pin_rejection(api.pin_rejection_fingerprint("other entry"), True, "entry1")
+    api.restore_pin_rejection("0000000000000000", True, "entry1")
+    api.restore_pin_rejection(None, True, "entry1")
+    assert not api.pin_rejected
+
+    api.restore_pin_rejection(fingerprint, True, "entry1")
+    assert api.pin_rejected and api.pin_locked
+
+    # A new PIN, or saving the options, lets it go out again
+    api.set_pin("5678")
+    assert not api.pin_rejected and not _PIN_REJECTIONS
+    api.set_pin("1234")
+    api.restore_pin_rejection(fingerprint, False, "entry1")
+    assert api.pin_rejected and not api.pin_locked
+    api.clear_pin_rejection()
+    assert not api.pin_rejected and not _PIN_REJECTIONS
+
+
+def no_json() -> requests.Response:
+    r = response(200)
+    r._content = b"OK"
+    return r
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        requests.exceptions.ReadTimeout(
+            "HTTPSConnectionPool: Read timed out. (url: /v1/accounts/uid1/ignite/pin/authenticate)"
+        ),
+        requests.exceptions.ConnectionError("Max retries exceeded with url: /v1/accounts/uid1/x"),
+        no_json(),
+        response(200, {"message": "ok"}),
+        response(200, ["token"]),
+    ],
+)
+def test_failures_at_the_pin_step_say_nothing_was_sent(outcome):
+    api = logged_in_api()
+    kwargs = {"side_effect": outcome} if isinstance(outcome, Exception) else {"return_value": outcome}
+    with patch.object(api.sess, "request", **kwargs) as req:
+        with pytest.raises(PinAuthError) as err:
+            api.command(VIN, COMMAND_DOORS_LOCK)
+    # Only the PIN authentication went out, and the PIN was not refused
+    assert len(pin_requests(req)) == req.call_count == 1
+    assert not api.pin_rejected
+    assert "uid1" not in str(err.value)
 
 
 def test_pin_that_cannot_be_right_is_not_sent():
@@ -625,6 +833,28 @@ def test_lock_states_expire_without_a_fresh_report():
         assert client.vehicles[VIN].door_driver_locked is None
 
 
+def test_other_remote_states_expire_too():
+    from custom_components.uconnect.pyuconnect.client import REMOTE_STATE_MAX_AGE
+
+    status = load_fixture("status_500e.json")
+    remote = dict(REMOTE_STATUS, trunk={"status": "LOCKED"})
+    client = make_client([copy.deepcopy(status) for _ in range(2)], remote=remote)
+    clock = [1000.0]
+    with patch.object(client_module, "monotonic", lambda: clock[0]):
+        client.refresh()
+        v = client.vehicles[VIN]
+        assert (v.trunk_locked, v.liftgate_locked, v.ev_running, v.hvac_on) == (
+            True, True, False, True
+        )
+
+        client.api.get_vehicle_status.side_effect = requests.exceptions.ReadTimeout("x")
+        clock[0] += REMOTE_STATE_MAX_AGE + 10
+        client.refresh()
+        assert (v.trunk_locked, v.liftgate_locked, v.ev_running, v.hvac_on) == (
+            None, None, None, None
+        )
+
+
 def test_bad_timestamps_do_not_break_the_refresh():
     from custom_components.uconnect.pyuconnect.client import _ms_timestamp
 
@@ -652,6 +882,14 @@ def test_odometer_left_out_keeps_the_last_reading():
     for _ in range(4):
         client.refresh()
         assert client.vehicles[VIN].odometer == pytest.approx(float(reading))
+
+
+def test_odometer_of_0_after_a_restart_is_no_reading():
+    status = load_fixture("status_500e.json")
+    zero = copy.deepcopy(status)
+    zero["vehicleInfo"]["odometer"]["odometer"]["value"] = "0"
+    # No reading yet to compare with: a 0 would read as a meter reset
+    assert vehicle_from(zero).odometer is None
 
 
 def test_flags_sent_as_strings():

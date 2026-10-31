@@ -474,3 +474,20 @@ async def test_placeholder_is_told_once_per_upload(hass, setup_integration, mock
     await coordinator.async_refresh()
     await hass.async_block_till_done()
     assert len(events) == 2
+
+
+async def test_placeholder_is_not_told_again_after_a_reload(
+    hass, setup_integration, mock_client
+):
+    events = async_capture_events(hass, "uconnect_placeholder_discarded")
+    mock_client.placeholders[VIN] = {"uploaded": dt_util.utcnow(), "range": 171}
+    await setup_integration.runtime_data.async_refresh()
+    await hass.async_block_till_done()
+    assert len(events) == 1
+
+    # Reloading the entry, e.g. for changed options, is no new upload
+    assert await hass.config_entries.async_reload(setup_integration.entry_id)
+    await hass.async_block_till_done()
+    await setup_integration.runtime_data.async_refresh()
+    await hass.async_block_till_done()
+    assert len(events) == 1

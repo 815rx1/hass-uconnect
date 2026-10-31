@@ -12,13 +12,18 @@ import time
 from typing import Any, NoReturn, TypeVar
 
 from .pyuconnect import Client
-from .pyuconnect.command import COMMAND_DEEP_REFRESH, Command
+from .pyuconnect.command import Command
 from .pyuconnect.api import CHARGING_LEVELS_BY_NAME
 from .pyuconnect.brands import BRANDS as BRANDS_BY_NAME
 
-from .pyuconnect.api import AuthenticationError, PinRejectedError
+from .pyuconnect.api import (
+    AuthenticationError,
+    PinAuthError,
+    PinRejectedError,
+    forget_pin_rejection,
+)
 
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.const import (
     CONF_PASSWORD,
     CONF_PIN,
@@ -31,6 +36,7 @@ from homeassistant.exceptions import (
     HomeAssistantError,
     ServiceValidationError,
 )
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.update_coordinator import (
     DataUpdateCoordinator,
     UpdateFailed,
@@ -57,7 +63,12 @@ from .const import (
     UNLOCK_MAX_WRONG_CODES,
     DOMAIN,
 )
-from .wake_guard import AlreadyDone, Blocked, async_get_wake_guard
+from .wake_guard import (
+    DEEP_REFRESH_COMMANDS,
+    AlreadyDone,
+    Blocked,
+    async_get_wake_guard,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -78,6 +89,66 @@ CONFIRMED_STATES_STORAGE_KEY = f"{DOMAIN}.confirmed_states"
 # upload, so the writes are gathered.
 LAST_CHARGE_STORAGE_KEY = f"{DOMAIN}.last_charge"
 LAST_CHARGE_SAVE_DELAY = 60
+# Confirmed states the cloud has since replaced are dropped from the store
+# after a poll; a restart would otherwise bring them back
+CONFIRMED_STATES_SAVE_DELAY = 10
+
+# A PIN the backend rejected, per entry, so a restart does not send it again:
+# every wrong attempt brings the PIN lock closer, also for the official app
+PIN_REJECTION_STORAGE_KEY = f"{DOMAIN}.pin_rejection"
+
+# The placeholder statuses automations were told about, kept per VIN for the
+# Home Assistant run so a reload of the entry does not tell them again
+_PLACEHOLDERS_TOLD = "_placeholders_told"
+
+
+class VehicleStore:
+    """A store all entries share, each one writing only its own vehicles.
+
+    The data is kept per VIN under one key. An entry saving only what its
+    own client knows would drop the vehicles of every other entry.
+    """
+
+    def __init__(self, hass: HomeAssistant, key: str) -> None:
+        self._store: Store[dict[str, Any]] = Store(hass, 1, key, atomic_writes=True)
+        self._data: dict[str, Any] | None = None
+        self._lock = asyncio.Lock()
+
+    @classmethod
+    def shared(cls, hass: HomeAssistant, key: str) -> VehicleStore:
+        return hass.data.setdefault(DOMAIN, {}).setdefault(f"_store_{key}", cls(hass, key))
+
+    async def async_load(self) -> dict[str, Any]:
+        """Return what is stored, read once per Home Assistant run."""
+        async with self._lock:
+            if self._data is None:
+                try:
+                    data = await self._store.async_load()
+                except Exception as err:  # A damaged file must not stop the setup
+                    _LOGGER.debug("Unable to read %s: %s", self._store.key, err)
+                    data = None
+                self._data = dict(data) if isinstance(data, dict) else {}
+            return dict(self._data)
+
+    def update(self, vins: Any, entries: dict[str, Any]) -> bool:
+        """Take over the entries of these vehicles, return whether any changed."""
+        if self._data is None:
+            self._data = {}
+        changed = False
+        for vin in vins:
+            entry = entries.get(vin)
+            if entry is None:
+                changed = self._data.pop(vin, None) is not None or changed
+            elif self._data.get(vin) != entry:
+                self._data[vin] = entry
+                changed = True
+        return changed
+
+    def async_delay_save(self, delay: float) -> None:
+        self._store.async_delay_save(lambda: dict(self._data or {}), delay)
+
+    async def async_save(self) -> None:
+        await self._store.async_save(dict(self._data or {}))
 
 
 def is_auth_error(err: BaseException) -> bool:
@@ -92,8 +163,14 @@ def is_auth_error(err: BaseException) -> bool:
 
 
 def _refused_before_queued(err: BaseException) -> bool:
-    """Whether the cloud refused a command outright, with a 4xx answer."""
+    """Whether a command failed before anything reached the vehicle.
 
+    The cloud refused it outright with a 4xx answer, or the PIN
+    authentication before it failed, whatever the answer.
+    """
+
+    if isinstance(err, PinAuthError):
+        return True
     response = getattr(err, "response", None)
     status = getattr(response, "status_code", None)
     return isinstance(status, int) and 400 <= status < 500
@@ -132,7 +209,15 @@ class PinRejected(ServiceValidationError):
     wrong attempts can lock it, also for the official app.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, locked: bool = False) -> None:
+        if locked:
+            super().__init__(
+                "The Uconnect PIN is locked. Unlock it in the official app, then "
+                "save the integration options once.",
+                translation_domain=DOMAIN,
+                translation_key="pin_locked",
+            )
+            return
         super().__init__(
             "The Uconnect PIN was rejected. Correct it in the integration options.",
             translation_domain=DOMAIN,
@@ -168,7 +253,9 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
 
         self.consecutive_failures: int = 0
         # The placeholder status of each vehicle automations were told about
-        self._placeholders_told: dict[str, dict[str, Any]] = {}
+        self._placeholders_told: dict[str, dict[str, Any]] = hass.data.setdefault(
+            DOMAIN, {}
+        ).setdefault(_PLACEHOLDERS_TOLD, {})
         self.last_successful_update = None
         # When the health report and maintenance history were last asked
         # for, per vehicle, whether that worked or not
@@ -184,13 +271,9 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
         self.charging_refresh_interval: int = self._read_charging_refresh_interval(
             config_entry
         )
-        self._confirmed_states: Store[dict[str, Any]] = Store(
-            hass, 1, CONFIRMED_STATES_STORAGE_KEY, atomic_writes=True
-        )
-        self._last_charge: Store[dict[str, Any]] = Store(
-            hass, 1, LAST_CHARGE_STORAGE_KEY, atomic_writes=True
-        )
-        self._last_charge_saved: Any = {}
+        self._confirmed_states = VehicleStore.shared(hass, CONFIRMED_STATES_STORAGE_KEY)
+        self._last_charge = VehicleStore.shared(hass, LAST_CHARGE_STORAGE_KEY)
+        self._pin_rejection = VehicleStore.shared(hass, PIN_REJECTION_STORAGE_KEY)
 
         super().__init__(
             hass,
@@ -340,6 +423,8 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
             # before its status is fetched, and setting up with that half of
             # the data would leave out most entities until a reload.
             if not self.client.vehicles or self.last_successful_update is None:
+                if self._may_start_without_status(err):
+                    return True
                 raise UpdateFailed(f"Initial data fetch failed: {err}") from err
 
             # A single failed poll is common with this cloud, so the cached
@@ -357,16 +442,45 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
                 err,
             )
         else:
+            # An empty vehicle list answered at setup would set the entry up
+            # without any entity, the lock included, until a reload
+            if self.last_successful_update is None and not self.client.vehicles:
+                raise UpdateFailed("The account lists no vehicle yet")
+
             self.consecutive_failures = 0
             self.last_successful_update = dt_util.utcnow()
             self._fire_placeholder_events()
-            self._save_last_charges()
+            self._save_vehicle_stores()
 
             # Only after a successful poll: each of these calls can take until
             # the request timeout while the cloud is down, and they hold the
             # client lock, so commands would queue behind them for minutes
             await self._async_update_extra_data()
 
+        return True
+
+    def _may_start_without_status(self, err: Exception) -> bool:
+        """Whether setup goes on although its first status poll failed.
+
+        A status outage while Home Assistant starts would keep the entry
+        retrying without entities, the lock included, and an automation
+        locking the car at night would be skipped. Once the vehicles are
+        listed and their entities registered by an earlier start, they come
+        back with their states unknown, and the commands can be used.
+        """
+        if self.config_entry.state is not ConfigEntryState.SETUP_IN_PROGRESS:
+            return False
+        if not self.client.vehicles:
+            return False
+        if not er.async_entries_for_config_entry(
+            er.async_get(self.hass), self.config_entry.entry_id
+        ):
+            return False
+        _LOGGER.warning(
+            "Vehicle status not available while setting up, starting with the "
+            "states unknown: %s",
+            err,
+        )
         return True
 
     def _fire_placeholder_events(self) -> None:
@@ -491,6 +605,8 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
             except ValueError as err:
                 raise HomeAssistantError(f"{what} failed: {err}") from err
             except Exception as err:
+                if is_auth_error(err):
+                    self.auth_failed = True
                 raise UconnectRequestError(f"{what} failed: {err}") from err
 
             if schedules is None:
@@ -508,8 +624,15 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
                 )
             except PinRejectedError as err:
                 async_get_wake_guard(self.hass).forget(vin, record)
-                raise PinRejected from err
+                await self._async_save_pin_rejection()
+                raise PinRejected(self.client.api.pin_locked) from err
             except Exception as err:
+                # As for any other command: rejected credentials stop further
+                # attempts, and a write refused outright never woke the car
+                if is_auth_error(err):
+                    self.auth_failed = True
+                if _refused_before_queued(err):
+                    async_get_wake_guard(self.hass).forget(vin, record)
                 raise UconnectRequestError(f"{what} failed: {err}") from err
 
         await self._async_finish_action(what, record, result)
@@ -568,7 +691,7 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
         if not self.client.api.pin:
             self._raise_pin_missing()
         if self.client.api.pin_rejected:
-            raise PinRejected
+            raise PinRejected(self.client.api.pin_locked)
         if vin not in self.client.vehicles:
             raise ServiceValidationError(f"Vehicle {vin} is currently not available")
 
@@ -645,20 +768,25 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
             # Only the PIN went out, the vehicle was not reached
             if record is not None:
                 async_get_wake_guard(self.hass).forget(vin, record)
-            raise PinRejected from err
+            await self._async_save_pin_rejection()
+            raise PinRejected(self.client.api.pin_locked) from err
         except Exception as err:
             if is_auth_error(err):
                 self.auth_failed = True
             # Refused by the cloud before it was queued, e.g. a deep refresh
-            # of a 500e that is not plugged in: it never reached the vehicle,
-            # so it holds back no later command
+            # of a 500e that is not plugged in, or stopped at the PIN
+            # authentication: it never reached the vehicle, so it holds back
+            # no later command
             refused = _refused_before_queued(err)
             if record is not None and refused:
                 async_get_wake_guard(self.hass).forget(vin, record)
             vehicle = self.client.get_vehicles().get(vin)
+            # Only the command itself: a PIN authentication refused (rate
+            # limit, service down) has nothing to do with the plug
             if (
                 refused
-                and command == COMMAND_DEEP_REFRESH.name
+                and not isinstance(err, PinAuthError)
+                and command in DEEP_REFRESH_COMMANDS
                 and getattr(vehicle, "plugged_in", None) is False
             ):
                 raise RefreshNeedsPlug from err
@@ -668,34 +796,67 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
 
     async def async_restore_confirmed_states(self) -> None:
         """Take back the changes confirmed before the last restart."""
-        try:
-            data = await self._confirmed_states.async_load()
-        except Exception as err:  # A damaged file must not stop the setup
-            _LOGGER.debug("Unable to read the confirmed states: %s", err)
-            return
-        self.client.restore_confirmed_states(data)
+        self.client.restore_confirmed_states(await self._confirmed_states.async_load())
 
     async def async_restore_last_charges(self) -> None:
         """Take back the last real state of charge from before the restart."""
-        try:
-            data = await self._last_charge.async_load()
-        except Exception as err:  # A damaged file must not stop the setup
-            _LOGGER.debug("Unable to read the last state of charge: %s", err)
-            return
-        self.client.restore_last_charges(data)
-        if isinstance(data, dict):
-            self._last_charge_saved = data
+        self.client.restore_last_charges(await self._last_charge.async_load())
 
-    def _save_last_charges(self) -> None:
-        data = self.client.last_charges()
-        if data == self._last_charge_saved:
+    async def async_restore_pin_rejection(self) -> None:
+        """Take back a rejection of the PIN set now from before the restart."""
+        entry_id = self.config_entry.entry_id
+        stored = (await self._pin_rejection.async_load()).get(entry_id)
+        if stored is None:
             return
-        self._last_charge_saved = data
-        self._last_charge.async_delay_save(lambda: data, LAST_CHARGE_SAVE_DELAY)
+        if isinstance(stored, dict):
+            self.client.api.restore_pin_rejection(
+                stored.get("pin"), stored.get("locked"), entry_id
+            )
+        # One for a PIN since replaced, e.g. at a reauthentication, would come
+        # back if that PIN were set again
+        if not self.client.api.pin_rejected:
+            await self._async_save_pin_rejection()
+
+    async def _async_save_pin_rejection(self) -> None:
+        api = self.client.api
+        entry_id = self.config_entry.entry_id
+        entries = (
+            {entry_id: {"pin": api.pin_rejection_fingerprint(entry_id), "locked": api.pin_locked}}
+            if api.pin_rejected
+            else {}
+        )
+        try:
+            await self._pin_rejection.async_load()
+            if self._pin_rejection.update([entry_id], entries):
+                await self._pin_rejection.async_save()
+        except Exception as err:
+            _LOGGER.debug("Unable to save the PIN rejection: %s", err)
+
+    async def async_clear_pin_rejection(self) -> None:
+        """Let a rejected PIN be sent again, e.g. once unlocked in the app."""
+        async with self._client_lock:
+            self.client.api.clear_pin_rejection()
+        await self._async_save_pin_rejection()
+
+    def _save_vehicle_stores(self) -> None:
+        """Keep the stores in step with the client after a poll.
+
+        A confirmed state the vehicle has since replaced is dropped here too,
+        or a restart within its lifetime would bring it back while the status
+        call still fails.
+        """
+        vins = list(self.client.vehicles)
+        if self._confirmed_states.update(vins, self.client.confirmed_states()):
+            self._confirmed_states.async_delay_save(CONFIRMED_STATES_SAVE_DELAY)
+        if self._last_charge.update(vins, self.client.last_charges()):
+            self._last_charge.async_delay_save(LAST_CHARGE_SAVE_DELAY)
 
     async def _async_save_confirmed_states(self) -> None:
         try:
-            await self._confirmed_states.async_save(self.client.confirmed_states())
+            if self._confirmed_states.update(
+                list(self.client.vehicles), self.client.confirmed_states()
+            ):
+                await self._confirmed_states.async_save()
         except Exception as err:
             _LOGGER.debug("Unable to save the confirmed states: %s", err)
 
@@ -723,9 +884,37 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
         # with the old PIN before its token is dropped
         async with self._client_lock:
             self.client.set_pin(new_pin)
+        if pin_changed:
+            await self._async_save_pin_rejection()
 
         # A dormant deep refresh schedule has nothing left to re-arm it, so a
         # charge already under way has to be told the options allow one now,
         # or that they no longer do
         for sensor in self.extrapolated_soc_sensors.values():
             sensor.resume_deep_refresh(pin_changed=pin_changed)
+
+
+async def async_retry_pin(hass: HomeAssistant, entry: ConfigEntry, pin: str) -> None:
+    """Let a rejected PIN be sent again, whether the entry is loaded or not.
+
+    Saving the options with the same PIN is how the user says it is right
+    again: it may have been unlocked in the official app, and Home Assistant
+    does not tell the entry about options saved unchanged. A new PIN takes
+    the place of the rejected one once the options apply; releasing the old
+    one before that would let it go out once more.
+    """
+    coordinator = getattr(entry, "runtime_data", None)
+    if isinstance(coordinator, UconnectDataUpdateCoordinator):
+        if pin == coordinator.client.api.pin:
+            await coordinator.async_clear_pin_rejection()
+        return
+
+    if pin != UconnectDataUpdateCoordinator._read_pin(entry):
+        return
+    brand = BRANDS_BY_NAME.get(BRANDS.get(entry.data.get(CONF_BRAND_REGION)))
+    if brand is not None:
+        forget_pin_rejection(brand.login_url, entry.data.get(CONF_USERNAME))
+    store = VehicleStore.shared(hass, PIN_REJECTION_STORAGE_KEY)
+    await store.async_load()
+    if store.update([entry.entry_id], {}):
+        await store.async_save()

@@ -149,9 +149,13 @@ class UconnectLock(LockEntity, UconnectCommandEntity):
 
     @property
     def icon(self):
+        locked = self.is_locked
+        if locked is None:
+            # Not known: an open lock would suggest the car is open
+            return "mdi:lock-question"
         return (
             self.entity_description.icon_locked
-            if self.is_locked
+            if locked
             else self.entity_description.icon_unlocked
         )
 

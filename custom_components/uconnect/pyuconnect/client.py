@@ -7,7 +7,7 @@ import logging
 
 from requests.exceptions import HTTPError, RequestException
 
-from .api import API, ChargingLevel, DEFAULT_TIMEOUT
+from .api import API, ChargingLevel, DEFAULT_TIMEOUT, _masked_vin
 from .brands import Brand
 from .command import (
     COMMAND_CHARGE,
@@ -504,7 +504,9 @@ def _update_vehicle(
     # total increasing sensor as a meter reset, so a single bad reading would
     # add the whole distance to the long-term statistics once it recovers.
     # A reading left out keeps the last one, so a 0 after it is still caught.
-    if not isinstance(odometer, (int, float)) or isinstance(odometer, bool):
+    # A 0 is no reading at all: right after a restart there is no last one to
+    # compare it with, and it would read as a reset when the real one follows.
+    if not isinstance(odometer, (int, float)) or isinstance(odometer, bool) or odometer == 0:
         pass
     elif (
         isinstance(v.odometer, (int, float))
@@ -623,9 +625,9 @@ def _merge_status(
 TERMINAL_SUCCESS = ("success", "succeeded", "completed", "complete")
 TERMINAL_FAILURE = ("failure", "failed", "error", "rejected", "timeout")
 
-# Lock and window states the remote status stopped reporting are kept for at
-# most this long. Shown as locked for days while the status call fails, a lock
-# would be trusted.
+# States the remote status stopped reporting are kept for at most this long.
+# Shown as locked for days while the status call fails, a lock would be
+# trusted. Grouped by the key the remote status reports them under.
 REMOTE_STATE_MAX_AGE = 24 * 3600
 REMOTE_STATE_GROUPS = {
     "doors": (
@@ -635,6 +637,10 @@ REMOTE_STATE_GROUPS = {
         "door_rear_right_locked",
     ),
     "windows": ("window_driver_closed", "window_passenger_closed"),
+    "trunk": ("trunk_locked",),
+    "liftGate": ("liftgate_locked",),
+    "evRunning": ("ev_running",),
+    "hvac": ("hvac_on",),
 }
 
 # A change the vehicle confirmed is shown, and the next one planned from it,
@@ -719,7 +725,7 @@ class Client:
         # account without vehicles.
         if listed:
             for vin in [v for v in self.vehicles if v not in listed]:
-                _LOGGER.info("Vehicle %s is no longer in the account", vin)
+                _LOGGER.info("Vehicle %s is no longer in the account", _masked_vin(vin))
                 del self.vehicles[vin]
                 self._last_status.pop(vin, None)
                 self._block_fresh_at.pop(vin, None)

@@ -93,6 +93,7 @@ async def async_setup_entry(
     coordinator = UconnectDataUpdateCoordinator(hass, config_entry)
     await coordinator.async_restore_confirmed_states()
     await coordinator.async_restore_last_charges()
+    await coordinator.async_restore_pin_rejection()
 
     # Raises ConfigEntryNotReady on update failures and starts the reauth
     # flow when the credentials were rejected

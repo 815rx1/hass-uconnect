@@ -381,8 +381,11 @@
         "daily_limit": {
             "message": "Not sent: more commands than a person sends within a day, which looks like an automation stuck in a loop. Try again in {minutes} min."
         },
+        "pin_locked": {
+            "message": "The Uconnect PIN is locked. Unlock it in the official app, then save the integration options once to send it again."
+        },
         "pin_rejected": {
-            "message": "The Uconnect PIN was rejected. Correct it in the integration options. It is not sent again until then, as more wrong attempts can lock it, also in the official app."
+            "message": "The Uconnect PIN was rejected. Correct it in the integration options; if it is right, save the options once to send it again. It is not sent again until then, as more wrong attempts can lock it, also in the official app."
         },
         "pin_missing": {
             "message": "Commands need the Uconnect PIN. Set it in the integration options."

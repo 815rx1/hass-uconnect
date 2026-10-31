@@ -161,6 +161,12 @@ class UconnectButtonUpdate(ButtonEntity, UconnectEntity):
     def icon(self):
         return "mdi:update"
 
+    @property
+    def available(self) -> bool:
+        # Most needed after failed polls, and it only reads what the cloud
+        # holds: never unavailable for the data being out of date
+        return UconnectCommandEntity.available.fget(self)
+
     async def async_press(self, **kwargs):
         await self.coordinator.async_refresh()
 

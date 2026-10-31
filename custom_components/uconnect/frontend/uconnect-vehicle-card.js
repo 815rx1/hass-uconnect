@@ -540,7 +540,13 @@ class UconnectVehicleCard extends HTMLElement {
       return;
     }
 
-    if (this._cachedMapCard && this._cachedMapTracker === trackerEntityId) {
+    // A changed config rebuilds the card and a message empties the map, so
+    // the cached map is only reused while it is still shown here
+    if (
+      this._cachedMapCard
+      && this._cachedMapTracker === trackerEntityId
+      && target.contains(this._cachedMapCard)
+    ) {
       this._cachedMapCard.hass = hass;
       return;
     }
@@ -621,32 +627,38 @@ class UconnectVehicleCard extends HTMLElement {
     // Uconnect binary sensors use postprocess inversion:
     //   off = locked/closed (secure), on = unlocked/open (not secure)
     // Sensors without a usable state (e.g. rear doors of a two-door car, which
-    // the vehicle reports as not available) are left out.
+    // the vehicle reports as not available) are left out. With none left the
+    // state is unknown, which must not show as unlocked or open.
     const secureStates = (keys) => keys
       .map((key) => read(key))
       .filter((s) => hasUsableState(s))
       .map((s) => !isOnState(s));
 
     const doorStates = secureStates(["door_driver", "door_passenger", "door_rear_left", "door_rear_right"]);
-    const allDoorsLocked = doorStates.length > 0 && doorStates.every(Boolean);
+    const doorsKnown = doorStates.length > 0;
+    const allDoorsLocked = doorsKnown && doorStates.every(Boolean);
     const anyDoorEntity = entities.door_driver || entities.door_passenger || "";
 
     const windowStates = secureStates(["window_driver", "window_passenger"]);
-    const allWindowsClosed = windowStates.length > 0 && windowStates.every(Boolean);
+    const windowsKnown = windowStates.length > 0;
+    const allWindowsClosed = windowsKnown && windowStates.every(Boolean);
     const openWindows = windowStates.filter((closed) => !closed).length;
     const windowEntity = entities.window_driver || entities.window_passenger || "";
 
     // Vehicles have either a trunk or a liftgate, the other one reports nothing
     const trunkKey = hasUsableState(read("trunk")) || !entities.liftgate ? "trunk" : "liftgate";
     const trunkName = trunkKey === "trunk" ? "Trunk" : "Liftgate";
-    const trunkLocked = hasUsableState(read(trunkKey)) && !isOnState(read(trunkKey));
+    const trunkKnown = hasUsableState(read(trunkKey));
+    const trunkLocked = trunkKnown && !isOnState(read(trunkKey));
     const trunkEntity = entities[trunkKey] || "";
 
     const chargingActive = isOnState(read("charging"));
     const pluggedIn = isOnState(read("plugged_in"));
+    const chargingKnown = hasUsableState(read("charging")) || hasUsableState(read("plugged_in"));
     const chargingEntity = entities.charging || entities.plugged_in || "";
 
     const ignitionOn = isOnState(read("ignition")) || isOnState(read("ev_running"));
+    const ignitionKnown = hasUsableState(read("ignition")) || hasUsableState(read("ev_running"));
     const ignitionEntity = entities.ignition || entities.ev_running || "";
 
     const hasSoc = Boolean(entities.soc && hasUsableState(read("soc")));
@@ -672,33 +684,39 @@ class UconnectVehicleCard extends HTMLElement {
       const indicatorItems = [
         {
           icon: "mdi:car-door-lock",
-          stateClass: allDoorsLocked ? "ok" : "alert",
+          stateClass: allDoorsLocked ? "ok" : doorsKnown ? "alert" : "",
           entity: anyDoorEntity,
-          title: allDoorsLocked ? "Doors: Locked" : "Doors: Unlocked",
+          title: allDoorsLocked ? "Doors: Locked" : doorsKnown ? "Doors: Unlocked" : "Doors: Unknown",
         },
         {
           icon: allWindowsClosed ? "mdi:car-windshield" : "mdi:car-windshield-outline",
           stateClass: allWindowsClosed ? "ok" : openWindows > 0 ? "alert" : "",
           entity: windowEntity,
-          title: allWindowsClosed ? "Windows: Closed" : `Windows: ${openWindows} open`,
+          title: allWindowsClosed
+            ? "Windows: Closed"
+            : windowsKnown ? `Windows: ${openWindows} open` : "Windows: Unknown",
         },
         {
           icon: "mdi:lock",
-          stateClass: trunkLocked ? "ok" : hasUsableState(read(trunkKey)) ? "alert" : "",
+          stateClass: trunkLocked ? "ok" : trunkKnown ? "alert" : "",
           entity: trunkEntity,
-          title: trunkLocked ? `${trunkName}: Locked` : `${trunkName}: Unlocked`,
+          title: trunkLocked
+            ? `${trunkName}: Locked`
+            : trunkKnown ? `${trunkName}: Unlocked` : `${trunkName}: Unknown`,
         },
         {
           icon: "mdi:ev-station",
           stateClass: chargingActive ? "ok charging" : pluggedIn ? "ok" : "",
           entity: chargingEntity,
-          title: chargingActive ? "Charging" : pluggedIn ? "Plugged in" : "Not plugged in",
+          title: chargingActive
+            ? "Charging"
+            : pluggedIn ? "Plugged in" : chargingKnown ? "Not plugged in" : "Charging: Unknown",
         },
         {
           icon: "mdi:engine",
           stateClass: ignitionOn ? "ok" : "",
           entity: ignitionEntity,
-          title: ignitionOn ? "Ignition: On" : "Ignition: Off",
+          title: ignitionOn ? "Ignition: On" : ignitionKnown ? "Ignition: Off" : "Ignition: Unknown",
         },
       ];
 
@@ -833,7 +851,7 @@ class UconnectVehicleCard extends HTMLElement {
         {
           icon: "mdi:ev-station",
           label: "Charging",
-          value: chargingActive ? "Charging" : pluggedIn ? "Plugged in" : "Not charging",
+          value: chargingActive ? "Charging" : pluggedIn ? "Plugged in" : chargingKnown ? "Not charging" : "—",
           entity: chargingEntity,
         },
         {

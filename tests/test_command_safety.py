@@ -584,3 +584,100 @@ async def test_other_refusals_keep_the_reason(
 
     assert not isinstance(raised.value, RefreshNeedsPlug)
     assert str(status) in str(raised.value)
+
+
+async def test_refresh_v2_refused_while_unplugged_says_so(
+    hass, config_entry, mock_client, vehicle
+):
+    from custom_components.uconnect.coordinator import RefreshNeedsPlug
+
+    vehicle.supported_commands = [*vehicle.supported_commands, "DEEPREFRESH2"]
+    await setup(hass, config_entry)
+    vehicle.plugged_in = False
+    mock_client.command_verify.side_effect = refused_by_the_cloud(400)
+
+    with pytest.raises(RefreshNeedsPlug):
+        await hass.services.async_call(DOMAIN, "deep_refresh_v2", {}, blocking=True)
+    assert hass.data[DOMAIN]["_wake_guard"].wakes(VIN) == []
+
+
+@pytest.mark.parametrize("status", [429, 503])
+async def test_failed_pin_authentication_holds_nothing_back(
+    hass, config_entry, mock_client, vehicle, status
+):
+    from custom_components.uconnect.coordinator import (
+        RefreshNeedsPlug,
+        UconnectRequestError,
+    )
+    from custom_components.uconnect.pyuconnect.api import PinAuthError
+
+    await setup(hass, config_entry)
+    vehicle.plugged_in = False
+    answer = refused_by_the_cloud(status).response
+    mock_client.command_verify.side_effect = PinAuthError(str(status), response=answer)
+
+    with pytest.raises(UconnectRequestError) as raised:
+        await hass.services.async_call(DOMAIN, "deep_refresh", {}, blocking=True)
+
+    # The PIN service failed, not the vehicle: nothing about the plug, and no
+    # wake-up kept that would hold back the next try
+    assert not isinstance(raised.value, RefreshNeedsPlug)
+    assert hass.data[DOMAIN]["_wake_guard"].wakes(VIN) == []
+
+
+async def test_locked_pin_says_so_and_is_kept(
+    hass, hass_storage, config_entry, mock_client
+):
+    from custom_components.uconnect.coordinator import PIN_REJECTION_STORAGE_KEY
+    from custom_components.uconnect.pyuconnect.api import PinRejectedError
+
+    await setup(hass, config_entry)
+
+    def locked(*args):
+        mock_client.api.pin_rejected = True
+        mock_client.api.pin_locked = True
+        raise PinRejectedError("locked")
+
+    mock_client.command_verify.side_effect = locked
+    with pytest.raises(ServiceValidationError) as err:
+        await hass.services.async_call(DOMAIN, "doors_lock", {}, blocking=True)
+    assert err.value.translation_key == "pin_locked"
+    # Kept over a restart, by a fingerprint instead of the PIN
+    assert hass_storage[PIN_REJECTION_STORAGE_KEY]["data"] == {
+        config_entry.entry_id: {"pin": "fp", "locked": True}
+    }
+    mock_client.api.pin_rejection_fingerprint.assert_called_with(config_entry.entry_id)
+
+    # Refused right away from then on, still saying why
+    mock_client.command_verify.reset_mock()
+    with pytest.raises(ServiceValidationError) as err:
+        await hass.services.async_call(DOMAIN, "doors_lock", {}, blocking=True)
+    assert err.value.translation_key == "pin_locked"
+    mock_client.command_verify.assert_not_called()
+
+
+async def test_schedule_write_failures_are_handled_like_commands(
+    hass, config_entry, mock_client
+):
+    from homeassistant.exceptions import HomeAssistantError
+
+    from custom_components.uconnect.pyuconnect.api import AuthenticationError
+
+    await setup(hass, config_entry)
+    switch = entity_id(hass, "switch", "charge_schedule_2")
+
+    # Refused outright: it never reached the vehicle
+    mock_client.send_charge_schedules_emea.side_effect = refused_by_the_cloud(400)
+    with pytest.raises(HomeAssistantError):
+        await hass.services.async_call(
+            "switch", "turn_on", {"entity_id": switch}, blocking=True
+        )
+    assert hass.data[DOMAIN]["_wake_guard"].wakes(VIN) == []
+
+    # A rejected login stops everything else, as for any command
+    mock_client.send_charge_schedules_emea.side_effect = AuthenticationError("rejected")
+    with pytest.raises(HomeAssistantError):
+        await hass.services.async_call(
+            "switch", "turn_on", {"entity_id": switch}, blocking=True
+        )
+    assert config_entry.runtime_data.auth_failed
