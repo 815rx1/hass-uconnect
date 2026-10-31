@@ -194,9 +194,14 @@ async def async_setup_entry(
     entities: list[BinarySensorEntity] = []
 
     for vehicle in coordinator.client.vehicles.values():
+        # Also the states the vehicle reports that are unknown right now, for
+        # example since it was switched off without reporting them again
+        reported = coordinator.client.reported_parts(vehicle.vin)
         for description in SENSOR_DESCRIPTIONS:
-            if getattr(vehicle, description.key, None) is not None or was_added(
-                hass, "binary_sensor", vehicle.vin, description.key
+            if (
+                getattr(vehicle, description.key, None) is not None
+                or description.key in reported
+                or was_added(hass, "binary_sensor", vehicle.vin, description.key)
             ):
                 entities.append(UconnectBinarySensor(coordinator, description, vehicle))
 

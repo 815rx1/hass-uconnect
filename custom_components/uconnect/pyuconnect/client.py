@@ -654,6 +654,8 @@ WRITE_OVERRIDE_MAX_AGE = 3600
 # before for hours. The state confirmed is shown until the vehicle uploads a
 # newer one, which it does when it is unlocked by key, for a day at most.
 LOCK_OVERRIDE_MAX_AGE = 24 * 3600
+# Kept with the confirmed states, see Client._drop_states_reported_while_on
+REPORTED_BEFORE_OFF = "reported_before_switch_off"
 LOCK_COMMAND_STATES: dict[str, tuple[tuple[str, ...], bool]] = {
     "RDL": (REMOTE_STATE_GROUPS["doors"], True),
     "RDU": (REMOTE_STATE_GROUPS["doors"], False),
@@ -697,6 +699,11 @@ class Client:
         self._block_fresh_at: Dict[str, Dict[str, float]] = {}
         # When the remote status last reported each group of states
         self._remote_fresh_at: Dict[str, Dict[str, float]] = {}
+        # The parts each vehicle reported in its last remote status
+        self._remote_parts: Dict[str, set[str]] = {}
+        # The time of each remote status the vehicle was switched off after,
+        # see _drop_states_reported_while_on
+        self._reported_before_off: Dict[str, datetime] = {}
         # Confirmed changes the cloud may not show yet, see
         # WRITE_OVERRIDE_MAX_AGE: value, when it was written and monotonic
         self._written: Dict[str, Dict[str, tuple[Any, datetime, float]]] = {}
@@ -730,6 +737,8 @@ class Client:
                 self._last_status.pop(vin, None)
                 self._block_fresh_at.pop(vin, None)
                 self._remote_fresh_at.pop(vin, None)
+                self._remote_parts.pop(vin, None)
+                self._reported_before_off.pop(vin, None)
                 self._written.pop(vin, None)
 
         for x in vehicles:
@@ -884,6 +893,12 @@ class Client:
 
                 vehicle.timestamp_status = _ms_timestamp(sg(s, "timestamp"))
                 reported = {group for group in REMOTE_STATE_GROUPS if group in s}
+                self._remote_parts[vin] = {
+                    attr
+                    for attrs in REMOTE_STATE_GROUPS.values()
+                    for attr in attrs
+                    if getattr(vehicle, attr) is not None
+                }
             except Exception as err:
                 _LOGGER.debug("Remote status not available for %s: %s", vin, err)
                 reported = set()
@@ -897,7 +912,8 @@ class Client:
                     for attr in attrs:
                         setattr(vehicle, attr, None)
 
-            self._apply_written_locks(vin, vehicle)
+            self._drop_states_reported_while_on(vin, vehicle)
+            self._apply_written_locks(vin, vehicle, reported)
 
     def last_charges(self) -> dict[str, dict[str, Any]]:
         """The last state of charge each vehicle really reported, with its times
@@ -946,9 +962,11 @@ class Client:
 
     def confirmed_states(self) -> dict[str, dict[str, Any]]:
         """The changes confirmed and not reported yet, to keep over a restart:
-        lock states, charge schedules and the charging level."""
+        lock states, charge schedules and the charging level. Also the remote
+        status each vehicle was switched off after: a restart while the status
+        upload fails would otherwise show the states of the drive again."""
 
-        return {
+        states = {
             vin: {
                 what: {"value": value, "at": at.isoformat()}
                 for what, (value, at, _) in entries.items()
@@ -956,6 +974,12 @@ class Client:
             for vin, entries in self._written.items()
             if entries
         }
+        for vin, reported in self._reported_before_off.items():
+            states.setdefault(vin, {})[REPORTED_BEFORE_OFF] = {
+                "value": reported.isoformat(),
+                "at": reported.isoformat(),
+            }
+        return states
 
     def restore_confirmed_states(self, data: Any) -> None:
         """Takes back what confirmed_states returned before a restart."""
@@ -973,6 +997,11 @@ class Client:
                 except (KeyError, TypeError, ValueError):
                     continue
                 what = str(what)
+                if what == REPORTED_BEFORE_OFF:
+                    # Applies only as long as the cloud has this report
+                    if at.tzinfo is not None:
+                        self._reported_before_off[vin] = at
+                    continue
                 if what.startswith("lock:"):
                     valid = isinstance(value, dict)
                 elif what == "schedules":
@@ -990,11 +1019,15 @@ class Client:
                     continue
                 self._written.setdefault(vin, {})[what] = (value, at, monotonic() - age)
 
-    def _remember(self, vin: str, what: str, value: Any) -> None:
+    def _remember(
+        self, vin: str, what: str, value: Any, at: datetime | None = None
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        at = at or now
         self._written.setdefault(vin, {})[what] = (
             value,
-            datetime.now(timezone.utc),
-            monotonic(),
+            at,
+            monotonic() - max((now - at).total_seconds(), 0.0),
         )
 
     def _written_value(
@@ -1041,27 +1074,94 @@ class Client:
         if level is not None:
             vehicle.charging_level_preference = level
 
-    def _remember_lock(self, vin: str, command: str) -> None:
-        """Shows a lock state the vehicle confirmed until it reports one."""
+    def _remember_lock(
+        self, vin: str, command: str, sent: datetime | None = None
+    ) -> None:
+        """Shows a lock state the vehicle confirmed until it reports one.
+
+        Any report made after the command was sent replaces it: doors opened
+        by key while the cloud confirmed the lock are reported with a time
+        before the confirmation.
+        """
 
         attrs, locked = LOCK_COMMAND_STATES[command]
         vehicle = self.vehicles.get(vin)
         if vehicle is None:
             return
-        # Parts the vehicle does not report stay unknown
-        known = [a for a in attrs if getattr(vehicle, a, None) is not None] or list(attrs[:1])
+        # Parts the vehicle does not report stay unknown. Those it reported but
+        # that are unknown since it was switched off are set as well.
+        parts = self._remote_parts.get(vin, set())
+        known = [
+            a for a in attrs if a in parts or getattr(vehicle, a, None) is not None
+        ] or list(attrs[:1])
         for attr in known:
             setattr(vehicle, attr, locked)
-        self._remember(vin, f"lock:{','.join(attrs)}", {a: locked for a in known})
+        self._remember(vin, f"lock:{','.join(attrs)}", {a: locked for a in known}, sent)
 
-    def _apply_written_locks(self, vin: str, vehicle: "Vehicle") -> None:
+    def _drop_states_reported_while_on(self, vin: str, vehicle: "Vehicle") -> None:
+        """Leaves out the remote states the vehicle reported while it was on,
+        once it uploaded that it was switched off since.
+
+        The doors lock while driving and can unlock on getting out. The vehicle
+        mostly reports its states again when switched off, but not always: the
+        doors locked during the drive were then shown as the state of the
+        parked car, and nothing reminded of locking it. The states are unknown
+        until the vehicle reports them again or confirms a lock command.
+        """
+
+        reported = vehicle.timestamp_status
+        if reported is None:
+            return
+        if self._reported_before_off.get(vin) != reported:
+            self._reported_before_off.pop(vin, None)
+            info = self._last_status.get(vin)
+            ev = info.get("evInfo") if isinstance(info, dict) else None
+            switched_off = _ms_timestamp(sg(ev, "timestamp"))
+            if not (
+                vehicle.ev_running
+                and switched_off is not None
+                and switched_off > reported
+                and (sg_str(ev, "ignitionStatus") or "").upper() == "OFF"
+            ):
+                return
+            # Kept until a newer report: an upload after switching on again,
+            # or one without the ignition, would bring the states back
+            self._reported_before_off[vin] = reported
+        for attrs in REMOTE_STATE_GROUPS.values():
+            for attr in attrs:
+                setattr(vehicle, attr, None)
+
+    def reported_parts(self, vin: str) -> set[str]:
+        """The states the last remote status of a vehicle reported, also those
+        that are unknown since, see _drop_states_reported_while_on."""
+
+        return set(self._remote_parts.get(vin, ()))
+
+    def _apply_written_locks(
+        self, vin: str, vehicle: "Vehicle", fetched: set[str]
+    ) -> None:
+        """Shows the confirmed locks, see _remember_lock.
+
+        fetched are the groups the remote status reported in this poll.
+        """
+
         uploaded = getattr(vehicle, "timestamp_status", None)
         for attrs, _ in {v[0]: v for v in LOCK_COMMAND_STATES.values()}.values():
             what = f"lock:{','.join(attrs)}"
             if what not in self._written.get(vin, {}):
                 continue
             states = self._written[vin][what][0]
-            reported = {a: getattr(vehicle, a, None) for a in states}
+            # With a time, only a newer report replaces the lock. An older one
+            # that happens to show it, or the states kept while the remote
+            # status failed, would drop it, and the drive's states left out
+            # later would leave the lock unknown although it was confirmed.
+            # A report without a time replaces it once it shows the lock.
+            group = next((g for g, a in REMOTE_STATE_GROUPS.items() if a == attrs), None)
+            reported = (
+                {a: getattr(vehicle, a, None) for a in states}
+                if uploaded is None and group in fetched
+                else None
+            )
             written = self._written_value(
                 vin, what, reported, uploaded, LOCK_OVERRIDE_MAX_AGE
             )
@@ -1183,10 +1283,11 @@ class Client:
     ) -> bool:
         """Execute a given command against a car with a given VIN and poll for the status"""
 
+        sent = datetime.now(timezone.utc)
         id = self.command(vin, cmd)
         result = self._poll_correlation_id(vin, id)
         if result and cmd.name in LOCK_COMMAND_STATES:
-            self._remember_lock(vin, cmd.name)
+            self._remember_lock(vin, cmd.name, sent)
         return result
 
     def get_stolen_vehicle_status(self, vin: str) -> dict:

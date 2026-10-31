@@ -672,3 +672,22 @@ async def test_lock_icons_follow_the_state(hass, config_entry, mock_client, vehi
     assert (lock_state.state, lock_state.attributes["icon"]) == (
         "unknown", "mdi:lock-question"
     )
+
+
+async def test_sensors_of_states_unknown_at_setup_are_created(
+    hass, config_entry, mock_client, vehicle
+):
+    from homeassistant.helpers import entity_registry as er
+
+    # Reported by the vehicle, but unknown since it was switched off
+    vehicle.door_driver_locked = None
+    mock_client.reported_parts.return_value = {"door_driver_locked"}
+    config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    door = er.async_get(hass).async_get_entity_id(
+        "binary_sensor", DOMAIN, f"{DOMAIN}_{VIN}_door_driver_locked"
+    )
+    assert door is not None
+    assert hass.states.get(door).state == "unknown"
