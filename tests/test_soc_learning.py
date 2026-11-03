@@ -310,9 +310,14 @@ async def test_same_reading_uploaded_again_holds_the_charge_estimate(
     assert parked._state.has_measured_rate
     assert parked._state.charging_rate_pct_per_hour == pytest.approx(20)
 
-    # The charge stalls, the vehicle keeps uploading 67
+    # The charge stalls, the vehicle keeps uploading 67. Coming late, the
+    # first repeat may be the old values sent again before the new ones.
     await report(
         hass, freezer, setup_integration, vehicle, 0.5, timestamp_ev_info=uploaded(0.5)
+    )
+    assert parked.native_value == pytest.approx(77, abs=0.1)
+    await report(
+        hass, freezer, setup_integration, vehicle, 0.05, timestamp_ev_info=uploaded(0.05)
     )
     assert parked.native_value == pytest.approx(67, abs=0.1)
 
@@ -320,6 +325,45 @@ async def test_same_reading_uploaded_again_holds_the_charge_estimate(
     await report(hass, freezer, setup_integration, vehicle, 0.1)
     assert parked.native_value == pytest.approx(69, abs=0.1)
     assert parked._state.charging_rate_pct_per_hour == pytest.approx(20)
+
+
+async def test_old_values_sent_again_before_the_new_ones_are_passed_over(
+    hass, freezer, setup_integration, vehicle, parked
+):
+    def uploaded(hours: float):
+        return dt_util.utcnow() + timedelta(hours=hours)
+
+    await report(
+        hass, freezer, setup_integration, vehicle, 1,
+        charging=True, timestamp_ev_info=uploaded(1),
+    )
+    await report(
+        hass, freezer, setup_integration, vehicle, 0.5,
+        state_of_charge=65, timestamp_ev_info=uploaded(0.5),
+    )
+    await report(
+        hass, freezer, setup_integration, vehicle, 0.1,
+        state_of_charge=67, timestamp_ev_info=uploaded(0.1),
+    )
+
+    # As on 03.11. at 14:10: a deep refresh after a quarter of an hour first
+    # brings the old 67 with a new time, the new reading seconds later
+    await report(
+        hass, freezer, setup_integration, vehicle, 0.25, timestamp_ev_info=uploaded(0.25)
+    )
+    assert parked.native_value == pytest.approx(72, abs=0.1)
+    await report(
+        hass, freezer, setup_integration, vehicle, 0.002,
+        state_of_charge=72, timestamp_ev_info=uploaded(0.002),
+    )
+    assert parked.native_value == pytest.approx(72, abs=0.1)
+    assert not parked._state.soc_repeat_held
+
+    # A repeat soon after the reading, the next percent not due yet, holds
+    await report(
+        hass, freezer, setup_integration, vehicle, 0.05, timestamp_ev_info=uploaded(0.05)
+    )
+    assert parked.native_value == pytest.approx(72, abs=0.1)
 
 
 async def test_stalled_charge_is_held_once_the_refreshes_gave_up(
@@ -342,6 +386,9 @@ async def test_stalled_charge_is_held_once_the_refreshes_gave_up(
     )
     await report(
         hass, freezer, setup_integration, vehicle, 0.5, timestamp_ev_info=uploaded(0.5)
+    )
+    await report(
+        hass, freezer, setup_integration, vehicle, 0.05, timestamp_ev_info=uploaded(0.05)
     )
     # The last refreshes brought the same 67 too, and no more are sent
     async_get_wake_guard(hass).session(VIN).without_progress = (

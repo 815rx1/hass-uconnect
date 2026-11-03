@@ -58,6 +58,9 @@ MAX_CORRECTION_FACTOR = 1.5  # Maximum allowed correction factor
 CORRECTION_EMA_ALPHA = 0.3  # Exponential moving average factor for correction learning
 MIN_TIME_FOR_LEARNING_HOURS = 0.05  # Minimum 3 minutes for learning
 MIN_SOC_CHANGE_FOR_LEARNING = 0.5  # Minimum 0.5% SOC change for learning
+# The same reading uploaded again while charging, when by the charging rate
+# this much more was due since it, is held back until it comes once more
+REPEAT_DUE_PERCENT = 1.5
 CHARGING_RATE_WINDOW = timedelta(minutes=60)  # Sliding window for rate computation
 
 # Constants for idle drain estimation
@@ -104,6 +107,9 @@ class SocEstimationState:
     last_vehicle_soc_uploaded: datetime | None = None
     # When a newer upload confirmed the baseline reading during a charge
     soc_confirmed_time: datetime | None = None
+    # A late repeat of the baseline reading was not taken yet, see
+    # REPEAT_DUE_PERCENT
+    soc_repeat_held: bool = False
     is_charging: bool = False
     is_idle: bool = False  # Not charging and ignition off
     charging_rate_pct_per_hour: float = 0.0
@@ -863,6 +869,7 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
             self._state.last_odometer = getattr(self.vehicle, "odometer", None)
             self._state.last_vehicle_soc_uploaded = uploaded
             self._state.soc_confirmed_time = None
+            self._state.soc_repeat_held = False
             self._state.charged_since_reading = False
         elif was_charging and not self._state.is_charging:
             self._state.charged_since_reading = True
@@ -881,7 +888,31 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
                 and self._state.last_vehicle_soc_uploaded is not None
                 and uploaded > self._state.last_vehicle_soc_uploaded
             ):
-                self._state.soc_confirmed_time = now
+                # Right after a deep refresh the vehicle now and then uploads
+                # its last values again first and the new ones seconds later.
+                # A repeat coming later than the next percent was due is taken
+                # only once it comes again: a charge that really stalled.
+                expected = (
+                    self._state.charging_rate_pct_per_hour
+                    * (
+                        1.0
+                        if self._state.has_measured_rate
+                        else self._state.learned_correction_factor
+                    )
+                    * (uploaded - self._state.last_vehicle_soc_uploaded).total_seconds()
+                    / 3600.0
+                )
+                if expected < REPEAT_DUE_PERCENT or self._state.soc_repeat_held:
+                    self._state.soc_confirmed_time = now
+                    self._state.soc_repeat_held = False
+                else:
+                    self._state.soc_repeat_held = True
+                    _LOGGER.debug(
+                        "Same state of charge uploaded again for %s after %.1f%% "
+                        "were due, waiting for the next upload",
+                        self.vehicle.vin,
+                        expected,
+                    )
             if (
                 self._state.last_vehicle_soc_uploaded is None
                 or uploaded > self._state.last_vehicle_soc_uploaded
