@@ -1683,12 +1683,20 @@ def test_unlock_with_an_unknown_outcome_leaves_the_doors_unknown(outcome):
     assert remote_states(client.vehicles[VIN])[:4] == [False] * 4
 
 
-def test_unlock_refused_before_it_was_sent_keeps_the_doors():
+@pytest.mark.parametrize(
+    "refusal",
+    [
+        requests.HTTPError("400", response=MagicMock(status_code=400)),
+        # The PIN authentication timed out or answered without a token
+        PinAuthError("PIN authentication failed: ReadTimeout"),
+        PinAuthError("PIN authentication failed: no token in the answer"),
+    ],
+)
+def test_unlock_refused_before_it_was_sent_keeps_the_doors(refusal):
     from custom_components.uconnect.pyuconnect.command import COMMAND_DOORS_UNLOCK
 
     client = locked_by_home_assistant()
-    refused = MagicMock(status_code=400)
-    client.api.command.side_effect = requests.HTTPError("400", response=refused)
+    client.api.command.side_effect = refusal
     with pytest.raises(requests.HTTPError):
         client.command_verify(VIN, COMMAND_DOORS_UNLOCK)
     client.refresh()

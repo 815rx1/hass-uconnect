@@ -1190,8 +1190,10 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
     async def _async_finish_action(self, what: str, record, result: Any) -> None:
         if result and record is not None:
             async_get_wake_guard(self.hass).command_confirmed(record)
-        if result:
-            await self._async_save_confirmed_states()
+        # Also when not confirmed: an unlock that timed out may still go
+        # through, and the doors it left unknown must outlive a restart even
+        # if the poll below fails
+        await self._async_save_confirmed_states()
 
         await self.async_refresh()
 

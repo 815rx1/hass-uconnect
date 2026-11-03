@@ -485,6 +485,31 @@ async def test_command_with_an_unknown_outcome_is_saved_and_read_again(
     assert mock_client.refresh.call_count == polls + 2
 
 
+async def test_command_not_confirmed_is_saved_when_the_poll_fails(
+    hass, hass_storage, config_entry, mock_client
+):
+    """An unlock the cloud reports as timed out may still go through: the doors
+    shown unknown are kept, so a restart does not bring back locked."""
+    from custom_components.uconnect.coordinator import CONFIRMED_STATES_STORAGE_KEY
+
+    config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    unknown = {VIN: {"lock:x": {"value": {"door_driver_locked": None}, "at": "2026-10-22T20:10:00+00:00"}}}
+
+    def timed_out(vin, cmd):
+        mock_client.confirmed_states.return_value = unknown
+        return False
+
+    mock_client.command_verify.side_effect = timed_out
+    mock_client.refresh.side_effect = Exception("cloud slow")
+    with pytest.raises(HomeAssistantError, match="not confirmed"):
+        await hass.services.async_call(DOMAIN, "doors_lock", {}, blocking=True)
+    await hass.async_block_till_done()
+    assert hass_storage[CONFIRMED_STATES_STORAGE_KEY]["data"] == unknown
+
+
 async def test_reload_waits_for_a_command_still_running(
     hass, config_entry, mock_client
 ):

@@ -27,9 +27,11 @@ from .wake_guard import async_get_wake_guard, async_setup_wake_guard
 
 _LOGGER = logging.getLogger(__name__)
 
-# How long an unload waits for a command still running, which takes up to a
-# minute to be confirmed
-ACTIONS_UNLOAD_TIMEOUT = 90
+# How long an unload waits for a command still running: with the cloud slow,
+# the PIN authentication and the command take a request each, and the status
+# poll runs out after a last wait of up to 5 s and two more requests. Each
+# request can take DEFAULT_TIMEOUT, a poll the command waits for comes on top.
+ACTIONS_UNLOAD_TIMEOUT = 5 * 60
 
 type UconnectConfigEntry = ConfigEntry[UconnectDataUpdateCoordinator]
 

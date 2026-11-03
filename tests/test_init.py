@@ -495,3 +495,16 @@ async def test_placeholder_is_not_told_again_after_a_reload(
     await setup_integration.runtime_data.async_refresh()
     await hass.async_block_till_done()
     assert len(events) == 1
+
+
+def test_unload_waits_as_long_as_a_command_can_run():
+    """Given up earlier, a reload would save the states from before an unlock
+    over what it left, e.g. locked over doors that may be open."""
+    from custom_components.uconnect import ACTIONS_UNLOAD_TIMEOUT
+    from custom_components.uconnect.pyuconnect.api import DEFAULT_TIMEOUT
+    from custom_components.uconnect.pyuconnect.client import COMMAND_STATUS_TIMEOUT
+
+    # PIN authentication, the command and the last two status requests
+    requests = 4 * sum(DEFAULT_TIMEOUT)
+    longest = COMMAND_STATUS_TIMEOUT.total_seconds() + 5 + requests
+    assert ACTIONS_UNLOAD_TIMEOUT >= longest

@@ -13,6 +13,7 @@ from .api import (
     ChargingLevel,
     DEFAULT_TIMEOUT,
     LoginError,
+    PinAuthError,
     PinRejectedError,
     _masked_vin,
 )
@@ -743,12 +744,18 @@ LOCK_COMMAND_STATES: dict[str, tuple[tuple[str, ...], bool]] = {
     "ROLIFTGATEUNLOCK": (("liftgate_locked",), False),
 }
 
+# How long the final status of a command is polled for
+COMMAND_STATUS_TIMEOUT = timedelta(seconds=60)
+
 
 def _refused_before_sent(err: BaseException) -> bool:
     """Whether a command failed before anything reached the vehicle: the login
-    or the PIN failed, or the cloud refused it outright with a 4xx answer."""
+    or the PIN authentication failed, whatever the answer, or the cloud refused
+    it outright with a 4xx answer."""
 
-    if isinstance(err, (AuthenticationError, LoginError, PinRejectedError)):
+    if isinstance(
+        err, (AuthenticationError, LoginError, PinAuthError, PinRejectedError)
+    ):
         return True
     status = getattr(getattr(err, "response", None), "status_code", None)
     return isinstance(status, int) and 400 <= status < 500
@@ -1431,7 +1438,7 @@ class Client:
         self,
         vin: str,
         id: str,
-        timeout: timedelta = timedelta(seconds=60),
+        timeout: timedelta = COMMAND_STATUS_TIMEOUT,
         interval: timedelta = timedelta(seconds=2),
     ) -> bool:
         return self._poll_command_status(vin, id, timeout, interval) in TERMINAL_SUCCESS
@@ -1440,7 +1447,7 @@ class Client:
         self,
         vin: str,
         id: str,
-        timeout: timedelta = timedelta(seconds=60),
+        timeout: timedelta = COMMAND_STATUS_TIMEOUT,
         interval: timedelta = timedelta(seconds=2),
     ) -> str:
         """The final status of a command, one of TERMINAL_SUCCESS or
