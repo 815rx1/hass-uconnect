@@ -408,6 +408,106 @@ async def test_confirmed_states_are_kept_over_a_restart(
     assert hass_storage[CONFIRMED_STATES_STORAGE_KEY]["data"] == saved
 
 
+async def test_command_with_an_unknown_outcome_is_saved_and_read_again(
+    hass, hass_storage, config_entry, mock_client
+):
+    """The vehicle may still carry it out, e.g. an unlock the client now shows
+    as unknown."""
+    import requests
+
+    from custom_components.uconnect.coordinator import CONFIRMED_STATES_STORAGE_KEY
+    from homeassistant.helpers import entity_registry as er
+
+    config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    unknown = {VIN: {"lock:x": {"value": {"door_driver_locked": None}, "at": "2026-10-22T20:10:00+00:00"}}}
+
+    def timed_out(vin, cmd):
+        mock_client.confirmed_states.return_value = unknown
+        raise Exception("unable to obtain execution status: timed out")
+
+    mock_client.command_verify.side_effect = timed_out
+    polls = mock_client.refresh.call_count
+    with pytest.raises(HomeAssistantError, match="timed out"):
+        await hass.services.async_call(DOMAIN, "doors_lock", {}, blocking=True)
+    await hass.async_block_till_done()
+    assert hass_storage[CONFIRMED_STATES_STORAGE_KEY]["data"] == unknown
+    assert mock_client.refresh.call_count == polls + 1
+
+    # Refused outright, nothing reached the vehicle and nothing is read again
+    answer = requests.Response()
+    answer.status_code = 400
+    mock_client.command_verify.side_effect = requests.HTTPError("400", response=answer)
+    with pytest.raises(HomeAssistantError):
+        await hass.services.async_call(DOMAIN, "doors_lock", {}, blocking=True)
+    await hass.async_block_till_done()
+    assert mock_client.refresh.call_count == polls + 1
+
+    # A schedule write whose answer was lost is read again as well
+    mock_client.send_charge_schedules_emea.side_effect = requests.exceptions.ReadTimeout("x")
+    device_id = next(iter(er.async_get(hass).entities.values())).device_id
+    with pytest.raises(HomeAssistantError, match="schedule failed"):
+        await hass.services.async_call(
+            DOMAIN,
+            "set_charge_schedule_slot",
+            {"device_id": device_id, "slot": 3, "start_time": "22:15"},
+            blocking=True,
+        )
+    # After the cooldown of the requested refreshes
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=15))
+    await hass.async_block_till_done()
+    assert mock_client.refresh.call_count == polls + 2
+
+
+async def test_reload_waits_for_a_command_still_running(
+    hass, config_entry, mock_client
+):
+    """Set up again with the states from before the command, the new client
+    would show those and save them over what the command confirmed."""
+    import asyncio
+
+    config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    confirmed = {VIN: {"lock:x": {"value": {"door_driver_locked": False}, "at": "2026-10-22T20:10:00+00:00"}}}
+    started = asyncio.Event()
+    confirm = asyncio.Event()
+
+    async def slow(func, *args, on_request=False):
+        started.set()
+        await confirm.wait()
+        mock_client.confirmed_states.return_value = confirmed
+        return True
+
+    restored = []
+    mock_client.restore_confirmed_states.side_effect = lambda states: restored.append(
+        json.loads(json.dumps(states))
+    )
+    with patch.object(config_entry.runtime_data, "async_run", side_effect=slow):
+        action = hass.async_create_task(
+            hass.services.async_call(DOMAIN, "doors_lock", {}, blocking=True)
+        )
+        await started.wait()
+        reload = hass.async_create_task(
+            hass.config_entries.async_reload(config_entry.entry_id)
+        )
+        # Without waiting, the entry would be set up again in the meantime
+        for _ in range(50):
+            if restored:
+                break
+            await asyncio.sleep(0.01)
+        confirm.set()
+        await action
+        assert await reload
+    await hass.async_block_till_done()
+
+    assert config_entry.state is ConfigEntryState.LOADED
+    assert restored == [confirmed]
+
+
 async def test_stores_keep_the_vehicles_of_other_entries(
     hass, hass_storage, freezer, config_entry, mock_client
 ):

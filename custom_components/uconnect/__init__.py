@@ -26,6 +26,10 @@ from .wake_guard import async_get_wake_guard, async_setup_wake_guard
 
 _LOGGER = logging.getLogger(__name__)
 
+# How long an unload waits for a command still running, which takes up to a
+# minute to be confirmed
+ACTIONS_UNLOAD_TIMEOUT = 90
+
 type UconnectConfigEntry = ConfigEntry[UconnectDataUpdateCoordinator]
 
 PLATFORMS: list[str] = [
@@ -180,6 +184,10 @@ async def async_unload_entry(
 ) -> bool:
     """Unload a config entry."""
 
+    # Set up again right after, the entry restores the confirmed states from
+    # the store, so a command still running has to save its outcome first
+    if (coordinator := getattr(config_entry, "runtime_data", None)) is not None:
+        await coordinator.async_wait_for_actions(ACTIONS_UNLOAD_TIMEOUT)
     return await hass.config_entries.async_unload_platforms(config_entry, PLATFORMS)
 
 

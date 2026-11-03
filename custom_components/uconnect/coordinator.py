@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+import contextlib
 from datetime import datetime, timedelta
 import hmac
 import logging
@@ -250,6 +251,10 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
         # command and a poll running in two executor threads at once could log
         # in twice or update a vehicle while it is read
         self._client_lock = asyncio.Lock()
+        # Vehicle actions still running, see async_wait_for_actions
+        self._actions = 0
+        self._actions_done = asyncio.Event()
+        self._actions_done.set()
 
         self.consecutive_failures: int = 0
         # The placeholder status of each vehicle automations were told about
@@ -593,49 +598,56 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
         self._check_can_send(vin)
         what = "Set charge schedule"
 
-        async with self._client_lock:
-            try:
-                schedules = await self._async_run_locked(
-                    self.client.plan_charge_schedule_emea,
-                    vin,
-                    slot,
-                    changes,
-                    on_request=True,
-                )
-            except ValueError as err:
-                raise HomeAssistantError(f"{what} failed: {err}") from err
-            except Exception as err:
-                if is_auth_error(err):
-                    self.auth_failed = True
-                raise UconnectRequestError(f"{what} failed: {err}") from err
+        async with self._action_running():
+            async with self._client_lock:
+                try:
+                    schedules = await self._async_run_locked(
+                        self.client.plan_charge_schedule_emea,
+                        vin,
+                        slot,
+                        changes,
+                        on_request=True,
+                    )
+                except ValueError as err:
+                    raise HomeAssistantError(f"{what} failed: {err}") from err
+                except Exception as err:
+                    if is_auth_error(err):
+                        self.auth_failed = True
+                    raise UconnectRequestError(f"{what} failed: {err}") from err
 
-            if schedules is None:
-                return
+                if schedules is None:
+                    return
 
-            if (record := await self._async_record_manual(vin, SCHEDULE_COMMAND)) is None:
-                return
-            try:
-                result = await self._async_run_locked(
-                    self.client.send_charge_schedules_emea,
-                    vin,
-                    schedules,
-                    True,
-                    on_request=True,
-                )
-            except PinRejectedError as err:
-                async_get_wake_guard(self.hass).forget(vin, record)
-                await self._async_save_pin_rejection()
-                raise PinRejected(self.client.api.pin_locked) from err
-            except Exception as err:
-                # As for any other command: rejected credentials stop further
-                # attempts, and a write refused outright never woke the car
-                if is_auth_error(err):
-                    self.auth_failed = True
-                if _refused_before_queued(err):
+                if (record := await self._async_record_manual(vin, SCHEDULE_COMMAND)) is None:
+                    return
+                try:
+                    result = await self._async_run_locked(
+                        self.client.send_charge_schedules_emea,
+                        vin,
+                        schedules,
+                        True,
+                        on_request=True,
+                    )
+                except PinRejectedError as err:
                     async_get_wake_guard(self.hass).forget(vin, record)
-                raise UconnectRequestError(f"{what} failed: {err}") from err
+                    await self._async_save_pin_rejection()
+                    raise PinRejected(self.client.api.pin_locked) from err
+                except Exception as err:
+                    # As for any other command: rejected credentials stop further
+                    # attempts, and a write refused outright never woke the car
+                    if is_auth_error(err):
+                        self.auth_failed = True
+                    if _refused_before_queued(err):
+                        async_get_wake_guard(self.hass).forget(vin, record)
+                    elif not self.auth_failed:
+                        # It may have gone through, see _async_vehicle_action.
+                        # Not awaited, the refresh waits for the client lock.
+                        self.config_entry.async_create_task(
+                            self.hass, self.async_request_refresh()
+                        )
+                    raise UconnectRequestError(f"{what} failed: {err}") from err
 
-        await self._async_finish_action(what, record, result)
+            await self._async_finish_action(what, record, result)
 
     async def async_command(
         self,
@@ -755,44 +767,77 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
         """
 
         self._check_can_send(vin)
-        record = None
-        if not automatic:
-            if (record := await self._async_record_manual(vin, command)) is None:
-                return
+        async with self._action_running():
+            record = None
+            if not automatic:
+                if (record := await self._async_record_manual(vin, command)) is None:
+                    return
 
+            try:
+                result = await self.async_run(func, *args, on_request=not automatic)
+            except HomeAssistantError:
+                raise
+            except PinRejectedError as err:
+                # Only the PIN went out, the vehicle was not reached
+                if record is not None:
+                    async_get_wake_guard(self.hass).forget(vin, record)
+                await self._async_save_pin_rejection()
+                raise PinRejected(self.client.api.pin_locked) from err
+            except Exception as err:
+                if is_auth_error(err):
+                    self.auth_failed = True
+                # Refused by the cloud before it was queued, e.g. a deep refresh
+                # of a 500e that is not plugged in, or stopped at the PIN
+                # authentication: it never reached the vehicle, so it holds back
+                # no later command
+                refused = _refused_before_queued(err)
+                if record is not None and refused:
+                    async_get_wake_guard(self.hass).forget(vin, record)
+                if not refused:
+                    # The vehicle may still carry it out: what the client now
+                    # shows, e.g. the doors unknown after an unlock, is kept and
+                    # read again at once rather than at the next poll
+                    await self._async_save_confirmed_states()
+                    if not self.auth_failed:
+                        await self.async_request_refresh()
+                vehicle = self.client.get_vehicles().get(vin)
+                # Only the command itself: a PIN authentication refused (rate
+                # limit, service down) has nothing to do with the plug
+                if (
+                    refused
+                    and not isinstance(err, PinAuthError)
+                    and command in DEEP_REFRESH_COMMANDS
+                    and getattr(vehicle, "plugged_in", None) is False
+                ):
+                    raise RefreshNeedsPlug from err
+                raise UconnectRequestError(f"{what} failed: {err}") from err
+
+            await self._async_finish_action(what, record, result)
+
+    @contextlib.asynccontextmanager
+    async def _action_running(self) -> AsyncIterator[None]:
+        self._actions += 1
+        self._actions_done.clear()
         try:
-            result = await self.async_run(func, *args, on_request=not automatic)
-        except HomeAssistantError:
-            raise
-        except PinRejectedError as err:
-            # Only the PIN went out, the vehicle was not reached
-            if record is not None:
-                async_get_wake_guard(self.hass).forget(vin, record)
-            await self._async_save_pin_rejection()
-            raise PinRejected(self.client.api.pin_locked) from err
-        except Exception as err:
-            if is_auth_error(err):
-                self.auth_failed = True
-            # Refused by the cloud before it was queued, e.g. a deep refresh
-            # of a 500e that is not plugged in, or stopped at the PIN
-            # authentication: it never reached the vehicle, so it holds back
-            # no later command
-            refused = _refused_before_queued(err)
-            if record is not None and refused:
-                async_get_wake_guard(self.hass).forget(vin, record)
-            vehicle = self.client.get_vehicles().get(vin)
-            # Only the command itself: a PIN authentication refused (rate
-            # limit, service down) has nothing to do with the plug
-            if (
-                refused
-                and not isinstance(err, PinAuthError)
-                and command in DEEP_REFRESH_COMMANDS
-                and getattr(vehicle, "plugged_in", None) is False
-            ):
-                raise RefreshNeedsPlug from err
-            raise UconnectRequestError(f"{what} failed: {err}") from err
+            yield
+        finally:
+            self._actions -= 1
+            if not self._actions:
+                self._actions_done.set()
 
-        await self._async_finish_action(what, record, result)
+    async def async_wait_for_actions(self, timeout: float) -> None:
+        """Wait for the vehicle actions still running and save what they
+        confirmed.
+
+        Unloading does not stop them. Reloaded, the new client would restore
+        the states from before such an action, and its polls would save them
+        over what the action confirmed, e.g. locked over a confirmed unlock.
+        """
+
+        with contextlib.suppress(TimeoutError):
+            async with asyncio.timeout(timeout):
+                await self._actions_done.wait()
+        await self._async_save_confirmed_states()
 
     async def async_restore_confirmed_states(self) -> None:
         """Take back the changes confirmed before the last restart."""

@@ -7,7 +7,15 @@ import logging
 
 from requests.exceptions import HTTPError, RequestException
 
-from .api import API, ChargingLevel, DEFAULT_TIMEOUT, _masked_vin
+from .api import (
+    API,
+    AuthenticationError,
+    ChargingLevel,
+    DEFAULT_TIMEOUT,
+    LoginBackoffError,
+    PinRejectedError,
+    _masked_vin,
+)
 from .brands import Brand
 from .command import (
     COMMAND_CHARGE,
@@ -624,6 +632,8 @@ def _merge_status(
 
 TERMINAL_SUCCESS = ("success", "succeeded", "completed", "complete")
 TERMINAL_FAILURE = ("failure", "failed", "error", "rejected", "timeout")
+# Failures after which the vehicle may still have carried the command out
+TERMINAL_UNKNOWN = ("timeout",)
 
 # States the remote status stopped reporting are kept for at most this long.
 # Shown as locked for days while the status call fails, a lock would be
@@ -664,6 +674,16 @@ LOCK_COMMAND_STATES: dict[str, tuple[tuple[str, ...], bool]] = {
     "ROLIFTGATELOCK": (("liftgate_locked",), True),
     "ROLIFTGATEUNLOCK": (("liftgate_locked",), False),
 }
+
+
+def _refused_before_sent(err: BaseException) -> bool:
+    """Whether a command failed before anything reached the vehicle: the login
+    or the PIN failed, or the cloud refused it outright with a 4xx answer."""
+
+    if isinstance(err, (AuthenticationError, LoginBackoffError, PinRejectedError)):
+        return True
+    status = getattr(getattr(err, "response", None), "status_code", None)
+    return isinstance(status, int) and 400 <= status < 500
 
 
 class Client:
@@ -1075,16 +1095,22 @@ class Client:
             vehicle.charging_level_preference = level
 
     def _remember_lock(
-        self, vin: str, command: str, sent: datetime | None = None
+        self,
+        vin: str,
+        command: str,
+        sent: datetime | None = None,
+        confirmed: bool = True,
     ) -> None:
         """Shows a lock state the vehicle confirmed until it reports one.
 
-        Any report made after the command was sent replaces it: doors opened
-        by key while the cloud confirmed the lock are reported with a time
-        before the confirmation.
+        Any report made after sent replaces it: doors opened by key while the
+        cloud confirmed the lock are reported with a time before the
+        confirmation. Not confirmed, the states are unknown until such a report.
         """
 
         attrs, locked = LOCK_COMMAND_STATES[command]
+        if not confirmed:
+            locked = None
         vehicle = self.vehicles.get(vin)
         if vehicle is None:
             return
@@ -1195,6 +1221,18 @@ class Client:
         timeout: timedelta = timedelta(seconds=60),
         interval: timedelta = timedelta(seconds=2),
     ) -> bool:
+        return self._poll_command_status(vin, id, timeout, interval) in TERMINAL_SUCCESS
+
+    def _poll_command_status(
+        self,
+        vin: str,
+        id: str,
+        timeout: timedelta = timedelta(seconds=60),
+        interval: timedelta = timedelta(seconds=2),
+    ) -> str:
+        """The final status of a command, one of TERMINAL_SUCCESS or
+        TERMINAL_FAILURE."""
+
         # Monotonic, so a clock change during the poll neither stretches it,
         # holding the client for an hour, nor cuts it short
         deadline = monotonic() + timeout.total_seconds()
@@ -1216,11 +1254,8 @@ class Client:
                 if isinstance(result, str):
                     result = result.lower()
 
-                    if result in TERMINAL_SUCCESS:
-                        return True
-
-                    if result in TERMINAL_FAILURE:
-                        return False
+                    if result in TERMINAL_SUCCESS + TERMINAL_FAILURE:
+                        return result
 
             except (ConnectionError, TimeoutError, ValueError, RequestException) as err:
                 # Some brands/regions return 404 for the remote-operation status
@@ -1241,10 +1276,8 @@ class Client:
                     continue
 
                 # A notification can also report the command as still running
-                if r.get(id) in TERMINAL_SUCCESS:
-                    return True
-                if r.get(id) in TERMINAL_FAILURE:
-                    return False
+                if r.get(id) in TERMINAL_SUCCESS + TERMINAL_FAILURE:
+                    return r[id]
 
         raise Exception(
             f"unable to obtain execution status: timed out "
@@ -1284,10 +1317,30 @@ class Client:
         """Execute a given command against a car with a given VIN and poll for the status"""
 
         sent = datetime.now(timezone.utc)
-        id = self.command(vin, cmd)
-        result = self._poll_correlation_id(vin, id)
+        # Shown locked while the vehicle may have unlocked would be the worst
+        # error, so an unlock with an unknown outcome leaves the doors unknown
+        unlock = cmd.name in LOCK_COMMAND_STATES and not LOCK_COMMAND_STATES[cmd.name][1]
+        try:
+            id = self.command(vin, cmd)
+        except Exception as err:
+            if unlock and not _refused_before_sent(err):
+                self._remember_lock(vin, cmd.name, sent, confirmed=False)
+            raise
+        try:
+            status = self._poll_command_status(vin, id)
+        except Exception:
+            if unlock:
+                self._remember_lock(vin, cmd.name, sent, confirmed=False)
+            raise
+
+        result = status in TERMINAL_SUCCESS
         if result and cmd.name in LOCK_COMMAND_STATES:
-            self._remember_lock(vin, cmd.name, sent)
+            # A lock from the time it was sent, see _remember_lock. An unlock
+            # from its confirmation: a report made in between may still show
+            # the doors locked.
+            self._remember_lock(vin, cmd.name, None if unlock else sent)
+        elif unlock and status in TERMINAL_UNKNOWN:
+            self._remember_lock(vin, cmd.name, sent, confirmed=False)
         return result
 
     def get_stolen_vehicle_status(self, vin: str) -> dict:

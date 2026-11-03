@@ -1102,6 +1102,114 @@ def test_doors_opened_while_the_lock_was_confirmed_are_shown():
     assert client.vehicles[VIN].door_driver_locked is False
 
 
+def locked_by_home_assistant():
+    """Locked from Home Assistant, and the cloud still reports the doors
+    locked from before."""
+    earlier = datetime.now(timezone.utc) - timedelta(minutes=30)
+    client = make_client(
+        [ev_upload("OFF", earlier)] * 4, remote=remote_report(earlier, running="OFF")
+    )
+    client.refresh()
+    client.api.command.return_value = "corr"
+    client.api.get_remote_operation_status.return_value = {"status": "SUCCESS"}
+    with patch("custom_components.uconnect.pyuconnect.client.sleep"):
+        assert client.command_verify(VIN, COMMAND_DOORS_LOCK) is True
+    return client
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        {"status": "PENDING"},
+        {"status": "TIMEOUT"},
+        requests.exceptions.ReadTimeout("x"),
+    ],
+)
+def test_unlock_with_an_unknown_outcome_leaves_the_doors_unknown(outcome):
+    """The vehicle may have unlocked: shown locked would be the worst error."""
+    from custom_components.uconnect.pyuconnect.command import COMMAND_DOORS_UNLOCK
+
+    client = locked_by_home_assistant()
+    if isinstance(outcome, Exception):
+        client.api.command.side_effect = outcome
+    else:
+        client.api.get_remote_operation_status.return_value = outcome
+        client.api.get_vehicle_notifications.return_value = {}
+    # The status poll gives up after its first attempt
+    start = client_module.monotonic()
+    late = iter([start, start])
+    with (
+        patch("custom_components.uconnect.pyuconnect.client.sleep"),
+        patch(
+            "custom_components.uconnect.pyuconnect.client.monotonic",
+            side_effect=lambda: next(late, start + 61),
+        ),
+    ):
+        try:
+            assert client.command_verify(VIN, COMMAND_DOORS_UNLOCK) is False
+        except Exception as err:
+            assert "timed out" in str(err) or isinstance(err, requests.ReadTimeout)
+
+    assert remote_states(client.vehicles[VIN])[:4] == [None] * 4
+    client.refresh()
+    assert remote_states(client.vehicles[VIN])[:4] == [None] * 4
+    saved = json.loads(json.dumps(client.confirmed_states()))
+    restarted = make_client([ev_upload("OFF", datetime.now(timezone.utc))])
+    restarted.api.get_vehicle_status.return_value = client.api.get_vehicle_status.return_value
+    restarted.restore_confirmed_states(saved)
+    restarted.refresh()
+    assert remote_states(restarted.vehicles[VIN])[:4] == [None] * 4
+
+    # Until the vehicle reports again
+    client.api.get_vehicle_status.return_value = remote_report(
+        datetime.now(timezone.utc) + timedelta(seconds=5), doors="UNLOCKED", running="OFF"
+    )
+    client.refresh()
+    assert remote_states(client.vehicles[VIN])[:4] == [False] * 4
+
+
+def test_unlock_refused_before_it_was_sent_keeps_the_doors():
+    from custom_components.uconnect.pyuconnect.command import COMMAND_DOORS_UNLOCK
+
+    client = locked_by_home_assistant()
+    refused = MagicMock(status_code=400)
+    client.api.command.side_effect = requests.HTTPError("400", response=refused)
+    with pytest.raises(requests.HTTPError):
+        client.command_verify(VIN, COMMAND_DOORS_UNLOCK)
+    client.refresh()
+    assert remote_states(client.vehicles[VIN])[:4] == [True] * 4
+
+
+def test_confirmed_unlock_outlives_a_report_made_before_the_confirmation():
+    """The vehicle uploaded the doors still locked while the cloud waited for
+    the unlock, or with its clock a few seconds ahead."""
+    import time
+
+    from custom_components.uconnect.pyuconnect.command import COMMAND_DOORS_UNLOCK
+
+    client = locked_by_home_assistant()
+    sent = []
+
+    def send(vin, cmd):
+        sent.append(datetime.now(timezone.utc))
+        return "corr"
+
+    def confirm(vin, correlation_id):
+        time.sleep(0.05)
+        return {"status": "SUCCESS"}
+
+    client.api.command.side_effect = send
+    client.api.get_remote_operation_status.side_effect = confirm
+    with patch("custom_components.uconnect.pyuconnect.client.sleep"):
+        assert client.command_verify(VIN, COMMAND_DOORS_UNLOCK) is True
+
+    client.api.get_vehicle_status.return_value = remote_report(
+        sent[0] + timedelta(milliseconds=20), running="OFF"
+    )
+    client.refresh()
+    assert remote_states(client.vehicles[VIN])[:4] == [False] * 4
+
+
 def test_lock_confirmed_before_the_switch_off_shows_is_kept():
     """Locked right after parking, before the cloud has the switch-off: the
     report from the drive shows the doors locked as well."""
