@@ -127,6 +127,28 @@ async def test_start_that_cannot_be_saved_has_the_startup_grace(hass, hass_stora
         assert begin(guard, 3).decision is Decision.WAIT
 
 
+async def test_start_is_saved_with_the_history(hass, hass_storage):
+    wake = (dt_util.utcnow() - timedelta(minutes=2)).isoformat()
+    hass_storage[STORAGE_KEY] = {
+        "version": 1,
+        "key": STORAGE_KEY,
+        "data": {
+            "migrations": ["unexposed:abc"],
+            "vehicles": {
+                VIN: {"wakes": [{"at": wake, "command": "DEEPREFRESH", "automatic": True}]}
+            },
+            "starts": [],
+        },
+    }
+    guard = WakeGuard(hass)
+    await guard.async_load()
+
+    data = hass_storage[STORAGE_KEY]["data"]
+    assert data["migrations"] == ["unexposed:abc"]
+    assert [w["at"] for w in data["vehicles"][VIN]["wakes"]] == [wake]
+    assert len(data["starts"]) == 1
+
+
 async def test_third_start_within_the_hour_has_the_startup_grace(hass, hass_storage):
     now = dt_util.utcnow()
     hass_storage[STORAGE_KEY] = {

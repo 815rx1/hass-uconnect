@@ -302,6 +302,9 @@ class WakeGuard:
             _LOGGER.warning("Unable to read the wake-up history: %s", err)
             data = None
 
+        # The start is written with the history, so it must be read first
+        self._load_history(data)
+
         now = _utcnow()
         starts = data.get("starts") if isinstance(data, dict) else None
         self._starts = [
@@ -319,6 +322,8 @@ class WakeGuard:
             or self._store.write_failed
         )
 
+    def _load_history(self, data: Any) -> None:
+        """Take over the migrations and vehicles of the history read."""
         migrations = data.get("migrations") if isinstance(data, dict) else None
         if isinstance(migrations, list):
             self._migrations = {m for m in migrations if isinstance(m, str)}
