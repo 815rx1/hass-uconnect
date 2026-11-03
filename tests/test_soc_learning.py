@@ -366,6 +366,41 @@ async def test_old_values_sent_again_before_the_new_ones_are_passed_over(
     assert parked.native_value == pytest.approx(72, abs=0.1)
 
 
+async def test_repeat_passed_over_before_a_pause_is_not_counted_after_it(
+    hass, freezer, setup_integration, vehicle, parked
+):
+    def uploaded(hours: float):
+        return dt_util.utcnow() + timedelta(hours=hours)
+
+    await report(
+        hass, freezer, setup_integration, vehicle, 1,
+        charging=True, timestamp_ev_info=uploaded(1),
+    )
+    await report(
+        hass, freezer, setup_integration, vehicle, 0.5,
+        state_of_charge=65, timestamp_ev_info=uploaded(0.5),
+    )
+    await report(
+        hass, freezer, setup_integration, vehicle, 0.1,
+        state_of_charge=67, timestamp_ev_info=uploaded(0.1),
+    )
+    await report(
+        hass, freezer, setup_integration, vehicle, 0.25, timestamp_ev_info=uploaded(0.25)
+    )
+    assert parked._state.soc_repeat_held
+
+    # The charge pauses without a new percent and goes on
+    await report(hass, freezer, setup_integration, vehicle, 0.05, charging=False)
+    await report(hass, freezer, setup_integration, vehicle, 0.15, charging=True)
+    assert not parked._state.soc_repeat_held
+
+    # Old values sent again a quarter of an hour into it are passed over too
+    await report(
+        hass, freezer, setup_integration, vehicle, 0.25, timestamp_ev_info=uploaded(0.25)
+    )
+    assert parked.native_value > 70
+
+
 async def test_stalled_charge_is_held_once_the_refreshes_gave_up(
     hass, freezer, setup_integration, vehicle, parked
 ):
@@ -494,8 +529,11 @@ async def test_state_is_restored_although_stored_unavailable(
 
 def test_upload_times_are_kept():
     at = dt_util.utcnow()
-    state = SocEstimationState(last_vehicle_soc_uploaded=at, soc_confirmed_time=at)
+    state = SocEstimationState(
+        last_vehicle_soc_uploaded=at, soc_confirmed_time=at, soc_repeat_held=True
+    )
 
     restored = SocEstimationState.from_dict(state.to_dict())
     assert restored.last_vehicle_soc_uploaded == at
     assert restored.soc_confirmed_time == at
+    assert restored.soc_repeat_held

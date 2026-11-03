@@ -137,6 +137,7 @@ class SocEstimationState:
                 if self.soc_confirmed_time
                 else None
             ),
+            "soc_repeat_held": self.soc_repeat_held,
             "last_actual_soc_time": (
                 self.last_actual_soc_time.isoformat()
                 if self.last_actual_soc_time
@@ -237,6 +238,7 @@ class SocEstimationState:
                 data.get("last_vehicle_soc_uploaded")
             ),
             soc_confirmed_time=_parse_aware_datetime(data.get("soc_confirmed_time")),
+            soc_repeat_held=data.get("soc_repeat_held") is True,
             is_charging=bool(data.get("is_charging", False)),
             is_idle=bool(data.get("is_idle", False)),
             charging_rate_pct_per_hour=float(charging_rate),
@@ -899,7 +901,15 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
                         if self._state.has_measured_rate
                         else self._state.learned_correction_factor
                     )
-                    * (uploaded - self._state.last_vehicle_soc_uploaded).total_seconds()
+                    # Counted from the charge start at the earliest: parked
+                    # before it, nothing was due
+                    * (
+                        uploaded
+                        - max(
+                            self._state.last_vehicle_soc_uploaded,
+                            self._state.last_actual_soc_time or uploaded,
+                        )
+                    ).total_seconds()
                     / 3600.0
                 )
                 if expected < REPEAT_DUE_PERCENT or self._state.soc_repeat_held:
@@ -965,6 +975,7 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
             self._state.rate_baseline_stale = not soc_changed
             self._state.last_actual_soc_time = now
             self._state.soc_confirmed_time = None
+            self._state.soc_repeat_held = False
             # The odometer is uploaded apart from the charge data and can
             # arrive only with the charge, so a reading kept from the drive
             # would make the charge look like a new one at its next reading
