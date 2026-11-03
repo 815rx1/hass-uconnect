@@ -123,13 +123,15 @@ class UconnectOptionFlowHandler(config_entries.OptionsFlow):
         """Handle options init setup."""
 
         if user_input is not None:
-            # Saved with the same PIN, a rejected one is sent again. A blank
+            # Saved with the same PIN and nothing else changed, a rejected one
+            # is sent again; changing another option is no reason to. A blank
             # field keeps the PIN given at setup, as in the coordinator.
-            await async_retry_pin(
-                self.hass,
-                self.config_entry,
-                user_input.get(CONF_PIN) or self.config_entry.data.get(CONF_PIN, ""),
-            )
+            if _only_pin_may_differ(self.config_entry.options, user_input):
+                await async_retry_pin(
+                    self.hass,
+                    self.config_entry,
+                    user_input.get(CONF_PIN) or self.config_entry.data.get(CONF_PIN, ""),
+                )
             return self.async_create_entry(
                 title=self.config_entry.title, data=user_input
             )
@@ -314,6 +316,18 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             if self.source == SOURCE_RECONFIGURE
             else "reauth_successful"
         )
+
+
+def _only_pin_may_differ(options: Mapping[str, Any], user_input: dict[str, Any]) -> bool:
+    """Return whether the options were saved with no change but the PIN."""
+    for key in OPTIONS_SCHEMA.schema:
+        if key.schema == CONF_PIN:
+            continue
+        # Only the command entities have no default, they are off unless set
+        default = key.default() if callable(key.default) else False
+        if user_input.get(key.schema) != options.get(key.schema, default):
+            return False
+    return True
 
 
 def _options_with_pin(entry: ConfigEntry, user_input: dict[str, Any]) -> dict[str, Any]:

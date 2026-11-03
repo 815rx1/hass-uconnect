@@ -95,16 +95,14 @@ class UconnectCommandEntity(UconnectEntity):
     Home Assistant skips an unavailable entity without a word, even one named
     in an action. Commands do not depend on the status poll, so a cloud status
     outage would otherwise silently drop an automation locking the car at
-    night. The state it shows is unknown while the data is out of date.
+    night. The state it shows is unknown while the data is out of date. A
+    rejected login keeps it available too, so a command says why it is not
+    sent.
     """
 
     @property
     def available(self) -> bool:
-        coordinator = self.coordinator
-        return (
-            not coordinator.auth_failed
-            and self._vin in coordinator.client.get_vehicles()
-        )
+        return self._vin in self.coordinator.client.get_vehicles()
 
     @property
     def data_current(self) -> bool:

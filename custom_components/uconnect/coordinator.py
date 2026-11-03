@@ -215,7 +215,7 @@ class PinRejected(ServiceValidationError):
         if locked:
             super().__init__(
                 "The Uconnect PIN is locked. Unlock it in the official app, then "
-                "save the integration options once.",
+                "save the integration options once without changing them.",
                 translation_domain=DOMAIN,
                 translation_key="pin_locked",
             )
@@ -418,13 +418,32 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
         after failures: somebody locking the car must not wait for that. While
         the entry is set up nothing can bypass it, so it is shortened then,
         or the lock would stay unavailable long after the login works again.
+
+        A caller cancelled meanwhile, e.g. a script stopped, does not stop the
+        executor thread. The client stays held until the thread is done, and
+        what it changed is saved, as the caller's own handling is skipped: a
+        PIN rejected then would otherwise go out again after a restart.
         """
 
         api = self.client.api
         api.bypass_login_backoff = on_request
         api.setting_up = setting_up
         try:
-            return await self.hass.async_add_executor_job(func, *args)
+            job = self.hass.async_add_executor_job(func, *args)
+            # Unlike awaiting the job, waiting for it leaves it to finish. One
+            # done already is not waited for, which would yield to the loop.
+            if not job.done():
+                await asyncio.wait((job,))
+            return job.result()
+        except asyncio.CancelledError:
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.wait((job,))
+            if job.done() and not job.cancelled():
+                job.exception()  # Taken, or it is logged as never retrieved
+            if api.pin_rejected:
+                await self._async_save_pin_rejection()
+            await self._async_save_confirmed_states()
+            raise
         finally:
             api.bypass_login_backoff = False
             api.setting_up = False
@@ -869,32 +888,36 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
         self.client.restore_last_charges(await self._last_charge.async_load())
 
     async def async_restore_pin_rejection(self) -> None:
-        """Take back a rejection of the PIN set now from before the restart."""
+        """Take back a stored rejection of the PIN set now, e.g. from before
+        the restart or of a PIN set again."""
         entry_id = self.config_entry.entry_id
         stored = (await self._pin_rejection.async_load()).get(entry_id)
-        if stored is None:
-            return
         if isinstance(stored, dict):
             self.client.api.restore_pin_rejection(
                 stored.get("pin"), stored.get("locked"), entry_id
             )
-        # One for a PIN since replaced, e.g. at a reauthentication, would come
-        # back if that PIN were set again
-        if not self.client.api.pin_rejected:
-            await self._async_save_pin_rejection()
+        # Also one known only in memory, e.g. from a refresh still running
+        # while the entry reloaded, or from an entry removed and added again
+        await self._async_save_pin_rejection()
 
     async def _async_save_pin_rejection(self) -> None:
         api = self.client.api
         entry_id = self.config_entry.entry_id
-        entries = (
-            {entry_id: {"pin": api.pin_rejection_fingerprint(entry_id), "locked": api.pin_locked}}
-            if api.pin_rejected
-            else {}
-        )
+        fingerprint = api.pin_rejection_fingerprint(entry_id)
         try:
-            await self._pin_rejection.async_load()
-            if self._pin_rejection.update([entry_id], entries):
-                await self._pin_rejection.async_save()
+            stored = (await self._pin_rejection.async_load()).get(entry_id)
+            if api.pin_rejected:
+                entries = {entry_id: {"pin": fingerprint, "locked": api.pin_locked}}
+            elif isinstance(stored, dict) and stored.get("pin") != fingerprint:
+                # The rejection of a PIN since replaced stays: a blank PIN
+                # field brings the one given at setup back
+                entries = {entry_id: stored}
+            else:
+                entries = {}
+            self._pin_rejection.update([entry_id], entries)
+            # Written even when nothing changed: Home Assistant only logs a
+            # failed write, and the data in memory would pass for saved
+            await self._pin_rejection.async_save()
         except Exception as err:
             _LOGGER.debug("Unable to save the PIN rejection: %s", err)
 
@@ -919,10 +942,11 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
 
     async def _async_save_confirmed_states(self) -> None:
         try:
-            if self._confirmed_states.update(
+            self._confirmed_states.update(
                 list(self.client.vehicles), self.client.confirmed_states()
-            ):
-                await self._confirmed_states.async_save()
+            )
+            # Written even when nothing changed, see _async_save_pin_rejection
+            await self._confirmed_states.async_save()
         except Exception as err:
             _LOGGER.debug("Unable to save the confirmed states: %s", err)
 
@@ -947,11 +971,12 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
         new_pin = self._read_pin(config_entry)
         pin_changed = new_pin != self.client.api.pin
         # Under the lock, so a PIN authentication already running finishes
-        # with the old PIN before its token is dropped
+        # with the old PIN before its token is dropped, and no command sends
+        # the new one before a rejection of it from before is known
         async with self._client_lock:
             self.client.set_pin(new_pin)
-        if pin_changed:
-            await self._async_save_pin_rejection()
+            if pin_changed:
+                await self.async_restore_pin_rejection()
 
         # A dormant deep refresh schedule has nothing left to re-arm it, so a
         # charge already under way has to be told the options allow one now,
@@ -967,7 +992,8 @@ async def async_retry_pin(hass: HomeAssistant, entry: ConfigEntry, pin: str) -> 
     again: it may have been unlocked in the official app, and Home Assistant
     does not tell the entry about options saved unchanged. A new PIN takes
     the place of the rejected one once the options apply; releasing the old
-    one before that would let it go out once more.
+    one before that would let it go out once more. A PIN rejected before
+    stays so when it is set again, until saved once more.
     """
     pin = str(pin or "").strip()
     coordinator = getattr(entry, "runtime_data", None)

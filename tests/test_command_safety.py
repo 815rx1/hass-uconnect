@@ -5,11 +5,12 @@ from __future__ import annotations
 import dataclasses
 from datetime import timedelta
 import time
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from homeassistant.const import EntityCategory
-from homeassistant.exceptions import ServiceValidationError
+from homeassistant.config_entries import ConfigEntryState
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers import area_registry as ar
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
@@ -364,6 +365,37 @@ async def test_action_without_device_with_two_known_vehicles(
         DOMAIN, "doors_lock", {"device_id": device.id}, blocking=True
     )
     assert sent(mock_client) == ["RDL"]
+
+
+async def test_action_goes_to_an_account_that_can_send(
+    hass, config_entry, mock_client, vehicle
+):
+    # A second account sharing the car, loaded first, its login rejected
+    other = MockConfigEntry(
+        domain=DOMAIN, unique_id="other", data={}, options={},
+        state=ConfigEntryState.LOADED,
+    )
+    other.runtime_data = MagicMock(auth_failed=True)
+    other.runtime_data.client.vehicles = {VIN: vehicle}
+    other.add_to_hass(hass)
+    await setup(hass, config_entry)
+
+    await hass.services.async_call(DOMAIN, "doors_lock", {}, blocking=True)
+    assert sent(mock_client) == ["RDL"]
+    other.runtime_data.async_command.assert_not_called()
+
+
+async def test_rejected_login_is_reported_by_the_entities(
+    hass, config_entry, mock_client
+):
+    await setup(hass, config_entry)
+    config_entry.runtime_data.auth_failed = True
+    lock = entity_id(hass, "lock", "lock_doors")
+
+    # Not skipped as unavailable without a word: the automation learns why
+    with pytest.raises(HomeAssistantError, match="login was rejected"):
+        await hass.services.async_call("lock", "lock", {"entity_id": lock}, blocking=True)
+    assert sent(mock_client) == []
 
 
 async def test_vehicle_missing_from_the_update_is_not_replaced(

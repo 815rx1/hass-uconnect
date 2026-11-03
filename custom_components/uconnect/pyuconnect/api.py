@@ -501,9 +501,10 @@ class API:
         return self._backoff.next_attempt
 
     def set_pin(self, pin: str):
+        # The rejection of the old PIN stays: set again, e.g. as the one
+        # given at setup when the option is cleared, it is not sent again
         if pin != self.pin:
-            self.pin = pin
-            self.clear_pin_rejection()
+            self._pin_token = None
         self.pin = pin
 
     def _log_response(self, what: str, r: requests.Response) -> None:

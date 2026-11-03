@@ -593,6 +593,7 @@ async def test_rejected_pin_is_kept_over_a_restart(
 
     def restore(fingerprint, locked, salt):
         mock_client.api.pin_rejected = fingerprint == "fp"
+        mock_client.api.pin_locked = locked
 
     mock_client.api.restore_pin_rejection.side_effect = restore
     config_entry.add_to_hass(hass)
@@ -635,22 +636,166 @@ async def test_new_pin_in_the_options_does_not_release_the_old_one_early(
     mock_client.set_pin.assert_called_with("5678")
 
 
-async def test_rejection_of_a_replaced_pin_is_dropped(
+def pin_rejections(mock_client, hass_storage, config_entry, stored: dict | None):
+    """Let the mocked API reject PINs by fingerprint, as the real one does."""
+    from custom_components.uconnect.coordinator import PIN_REJECTION_STORAGE_KEY
+
+    if stored is not None:
+        hass_storage[PIN_REJECTION_STORAGE_KEY] = {
+            "version": 1, "minor_version": 1, "key": PIN_REJECTION_STORAGE_KEY,
+            "data": {config_entry.entry_id: stored},
+        }
+    api = mock_client.api
+    api.pin_rejection_fingerprint.side_effect = lambda salt: f"fp-{api.pin}"
+
+    def restore(fingerprint, locked, salt):
+        if fingerprint == f"fp-{api.pin}":
+            api.pin_rejected = True
+            api.pin_locked = locked is True
+
+    def set_pin(pin):
+        if pin != api.pin:
+            api.pin = pin
+            api.pin_rejected = api.pin_locked = False
+
+    api.restore_pin_rejection.side_effect = restore
+    mock_client.set_pin.side_effect = set_pin
+
+
+async def test_rejection_of_a_replaced_pin_stays_for_that_pin(
     hass, hass_storage, config_entry, mock_client
 ):
     from custom_components.uconnect.coordinator import PIN_REJECTION_STORAGE_KEY
 
-    hass_storage[PIN_REJECTION_STORAGE_KEY] = {
-        "version": 1, "minor_version": 1, "key": PIN_REJECTION_STORAGE_KEY,
-        "data": {config_entry.entry_id: {"pin": "of-the-old-pin", "locked": False}},
+    # The PIN given at setup was rejected, the one in the options replaced it
+    stored = {"pin": "fp-1234", "locked": True}
+    pin_rejections(mock_client, hass_storage, config_entry, stored)
+    mock_client.api.pin = "5678"
+    config_entry.add_to_hass(hass)
+    hass.config_entries.async_update_entry(
+        config_entry, options={**config_entry.options, "pin": "5678"}
+    )
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+    assert not mock_client.api.pin_rejected
+    assert hass_storage[PIN_REJECTION_STORAGE_KEY]["data"] == {
+        config_entry.entry_id: stored
     }
+
+    # Clearing the option brings the setup PIN back, which is not sent again
+    result = await hass.config_entries.options.async_init(config_entry.entry_id)
+    await hass.config_entries.options.async_configure(
+        result["flow_id"], {**config_entry.options, "pin": ""}
+    )
+    await hass.async_block_till_done()
+    mock_client.set_pin.assert_called_with("1234")
+    assert mock_client.api.pin_rejected and mock_client.api.pin_locked
+    with pytest.raises(HomeAssistantError):
+        await hass.services.async_call(DOMAIN, "doors_lock", {}, blocking=True)
+    mock_client.command_verify.assert_not_called()
+
+
+@pytest.mark.parametrize("pin", ["", "1234"])
+async def test_changing_another_option_does_not_send_a_rejected_pin_again(
+    hass, hass_storage, config_entry, mock_client, pin
+):
+    from custom_components.uconnect.coordinator import PIN_REJECTION_STORAGE_KEY
+
+    stored = {"pin": "fp-1234", "locked": True}
+    pin_rejections(mock_client, hass_storage, config_entry, stored)
     config_entry.add_to_hass(hass)
     assert await hass.config_entries.async_setup(config_entry.entry_id)
     await hass.async_block_till_done()
-    # The PIN set now was not the one rejected: nothing is held back, and
-    # setting the old one again later does not bring the rejection back
-    assert not mock_client.api.pin_rejected
-    assert hass_storage[PIN_REJECTION_STORAGE_KEY]["data"] == {}
+    assert mock_client.api.pin_rejected
+
+    result = await hass.config_entries.options.async_init(config_entry.entry_id)
+    await hass.config_entries.options.async_configure(
+        result["flow_id"], {**config_entry.options, "pin": pin, "scan_interval": 17}
+    )
+    await hass.async_block_till_done()
+    mock_client.api.clear_pin_rejection.assert_not_called()
+    assert mock_client.api.pin_rejected
+    assert hass_storage[PIN_REJECTION_STORAGE_KEY]["data"] == {
+        config_entry.entry_id: stored
+    }
+
+
+async def test_rejection_known_only_in_memory_is_saved_at_setup(
+    hass, hass_storage, config_entry, mock_client
+):
+    from custom_components.uconnect.coordinator import PIN_REJECTION_STORAGE_KEY
+
+    # Rejected while the entry reloaded, or before it was removed and added
+    # again: the API remembers it for the account, the store does not
+    mock_client.api.pin_rejected = True
+    config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+    assert hass_storage[PIN_REJECTION_STORAGE_KEY]["data"] == {
+        config_entry.entry_id: {"pin": "fp", "locked": False}
+    }
+
+
+async def test_failed_store_writes_are_tried_again(hass, config_entry, mock_client):
+    config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+    coordinator = config_entry.runtime_data
+
+    # Home Assistant only logs a failed write, the caller learns nothing
+    mock_client.api.pin_rejected = True
+    mock_client.confirmed_states.return_value = {VIN: {"doors": "locked"}}
+    for store in (coordinator._pin_rejection, coordinator._confirmed_states):
+        with patch.object(store._store, "async_save", AsyncMock()) as save:
+            for _ in range(2):
+                await coordinator._async_save_pin_rejection()
+                await coordinator._async_save_confirmed_states()
+        assert save.call_count == 2
+
+
+async def test_cancelled_command_keeps_the_client_and_saves_the_rejection(
+    hass, hass_storage, config_entry, mock_client
+):
+    import asyncio
+    import threading
+
+    from custom_components.uconnect.coordinator import PIN_REJECTION_STORAGE_KEY
+    from custom_components.uconnect.pyuconnect.api import PinRejectedError
+
+    config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+    coordinator = config_entry.runtime_data
+
+    started, answered = threading.Event(), threading.Event()
+
+    def rejected(*args):
+        started.set()
+        answered.wait(5)
+        mock_client.api.pin_rejected = True
+        raise PinRejectedError("rejected")
+
+    # Not a mock, which the test harness would run in the event loop
+    mock_client.command_verify = rejected
+    # E.g. the script sending it was stopped while the PIN was posted
+    call = asyncio.ensure_future(
+        hass.services.async_call(DOMAIN, "doors_lock", {}, blocking=True)
+    )
+    while not started.is_set():
+        await asyncio.sleep(0.01)
+    call.cancel()
+    for _ in range(5):
+        await asyncio.sleep(0)
+    # The thread still runs: nothing else may use the client meanwhile
+    assert coordinator._client_lock.locked()
+
+    answered.set()
+    with pytest.raises(asyncio.CancelledError):
+        await call
+    assert not coordinator._client_lock.locked()
+    assert hass_storage[PIN_REJECTION_STORAGE_KEY]["data"] == {
+        config_entry.entry_id: {"pin": "fp", "locked": False}
+    }
 
 
 @pytest.mark.parametrize("new_pin", [None, "5678"])
@@ -679,7 +824,7 @@ async def test_options_of_an_entry_not_loaded_let_the_pin_go_out(
 
     if new_pin:
         # Left as it is: the new PIN is not the rejected one, and the stored
-        # rejection is dropped at the next setup
+        # rejection stays for the old one
         assert _PIN_REJECTIONS
         assert hass_storage[PIN_REJECTION_STORAGE_KEY]["data"] == stored
     else:

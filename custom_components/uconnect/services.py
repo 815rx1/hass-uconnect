@@ -264,14 +264,7 @@ def _resolve_target(
             )
 
         vin = next(iter(known))
-        coordinator = next(
-            (
-                entry.runtime_data
-                for entry in loaded
-                if vin in entry.runtime_data.client.vehicles
-            ),
-            None,
-        )
+        coordinator = _pick_coordinator(loaded, vin)
         if coordinator is None:
             raise ServiceValidationError(f"Vehicle {vin} is currently not available")
         return coordinator, vin
@@ -289,12 +282,39 @@ def _resolve_target(
         entry_ids = {entry_id}
     else:
         entry_ids = set(device.config_entries)
-    entry = next((e for e in loaded if e.entry_id in entry_ids), None)
-    if vin is None or entry is None:
+    entries = [e for e in loaded if e.entry_id in entry_ids]
+    if vin is None or not entries:
         raise ServiceValidationError(f"Device {device_id} is not a loaded Uconnect vehicle")
 
-    coordinator: UconnectDataUpdateCoordinator = entry.runtime_data
-    if vin not in coordinator.client.vehicles:
+    coordinator = _pick_coordinator(entries, vin)
+    if coordinator is None:
         raise ServiceValidationError(f"Vehicle {vin} is currently not available")
 
     return coordinator, vin
+
+
+def _pick_coordinator(
+    entries: list, vin: str
+) -> UconnectDataUpdateCoordinator | None:
+    """Return the coordinator of the entries that has the vehicle.
+
+    Two accounts can share a car. One that can send commands is preferred,
+    so that a rejected login or PIN of the other does not keep a lock from
+    going out; without one, the first says why nothing is sent.
+    """
+
+    candidates: list[UconnectDataUpdateCoordinator] = [
+        entry.runtime_data
+        for entry in entries
+        if vin in entry.runtime_data.client.vehicles
+    ]
+    return next(
+        (
+            coordinator
+            for coordinator in candidates
+            if not coordinator.auth_failed
+            and coordinator.client.api.pin
+            and not coordinator.client.api.pin_rejected
+        ),
+        candidates[0] if candidates else None,
+    )

@@ -759,14 +759,16 @@ def test_pin_rejection_is_restored_only_for_the_same_pin():
     api.restore_pin_rejection(fingerprint, True, "entry1")
     assert api.pin_rejected and api.pin_locked
 
-    # A new PIN, or saving the options, lets it go out again
+    # A new PIN goes out, the rejected one set again does not, e.g. the setup
+    # PIN coming back when the option is cleared. Saving the options lets it.
     api.set_pin("5678")
-    assert not api.pin_rejected and not _PIN_REJECTIONS
+    assert not api.pin_rejected
     api.set_pin("1234")
-    api.restore_pin_rejection(fingerprint, False, "entry1")
-    assert api.pin_rejected and not api.pin_locked
+    assert api.pin_rejected and api.pin_locked
     api.clear_pin_rejection()
     assert not api.pin_rejected and not _PIN_REJECTIONS
+    api.restore_pin_rejection(fingerprint, False, "entry1")
+    assert api.pin_rejected and not api.pin_locked
 
 
 def no_json() -> requests.Response:
