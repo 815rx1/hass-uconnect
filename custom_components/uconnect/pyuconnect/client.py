@@ -1301,6 +1301,11 @@ class Client:
             and (off_at is None or off_at < on_at)
         ):
             self._switched_off_at[vin] = uploaded
+            # A lock confirmed while it was on is not known either, also when
+            # the drive brought no new report
+            for what, (_, at, _) in list(self._written.get(vin, {}).items()):
+                if what.startswith("lock:") and at < uploaded:
+                    del self._written[vin][what]
 
     def _drop_states_reported_while_on(self, vin: str, vehicle: "Vehicle") -> None:
         """Leaves out the remote states the vehicle reported while it was on,
@@ -1352,10 +1357,13 @@ class Client:
                     if what.startswith("lock:") and at < switched_off:
                         del self._written[vin][what]
             elif (
-                off_at is not None
-                and abs((off_at - reported).total_seconds())
-                <= SWITCH_OFF_REPORT_WINDOW
+                on_at is not None
+                and off_at is not None
+                and on_at < reported
+                and (reported - off_at).total_seconds() <= SWITCH_OFF_REPORT_WINDOW
             ):
+                # Made after it was last seen on, and before or right after
+                # the first upload seen off, which may be a later one parked
                 self._reported_at_off[vin] = reported
                 at_off = True
             else:

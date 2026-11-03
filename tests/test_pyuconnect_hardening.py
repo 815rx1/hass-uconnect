@@ -1333,6 +1333,22 @@ def test_locked_states_reported_at_the_switch_off_are_unknown():
     assert remote_states(v) == [True] * 7 + [False]
 
 
+def test_locked_states_reported_at_the_switch_off_stay_unknown_after_a_parked_upload():
+    """The switch-off upload was not polled, only a later one of the parked
+    car: the report at the switch-off is still left out."""
+    start = datetime.now(timezone.utc) - timedelta(hours=2)
+    parked = start + timedelta(minutes=18)
+    client = make_client(
+        [ev_upload("ON", start)] + [ev_upload("OFF", parked + timedelta(minutes=2))] * 2,
+        remote=remote_report(start + timedelta(seconds=53)),
+    )
+    client.refresh()
+    v = client.vehicles[VIN]
+    client.api.get_vehicle_status.return_value = remote_report(parked, running="OFF")
+    client.refresh()
+    assert remote_states(v) == [None] * 7 + [False]
+
+
 def test_unlocked_states_reported_at_the_switch_off_are_shown():
     start = datetime.now(timezone.utc) - timedelta(hours=2)
     parked = start + timedelta(minutes=18)
@@ -1500,6 +1516,40 @@ def test_lock_confirmed_while_on_is_unknown_once_switched_off():
     assert remote_states(v) == [None] * 8
     assert client.confirmed_states()[VIN].keys() == {"reported_before_switch_off"}
     client.refresh()
+    assert remote_states(v) == [None] * 8
+
+
+def test_lock_confirmed_while_on_in_a_drive_without_report_is_unknown():
+    """The report is already left out from the drive before. The next drive
+    brings no report, and a lock confirmed while on is no longer known once
+    switched off."""
+    now = datetime.now(timezone.utc)
+    reported = now - timedelta(hours=10)
+    client = make_client(
+        [
+            ev_upload("ON", reported - timedelta(minutes=1)),
+            ev_upload("OFF", reported + timedelta(minutes=10)),
+            ev_upload("ON", now - timedelta(minutes=5)),
+            ev_upload("ON", now - timedelta(minutes=5)),
+            ev_upload("OFF", now + timedelta(minutes=1)),
+            ev_upload("OFF", now + timedelta(minutes=1)),
+        ],
+        remote=remote_report(reported),
+    )
+    client.refresh()
+    client.refresh()
+    v = client.vehicles[VIN]
+    assert remote_states(v) == [None] * 8
+    client.refresh()
+    client.api.command.return_value = "corr"
+    client.api.get_remote_operation_status.return_value = {"status": "SUCCESS"}
+    with patch("custom_components.uconnect.pyuconnect.client.sleep"):
+        assert client.command_verify(VIN, COMMAND_DOORS_LOCK) is True
+    client.refresh()
+    assert remote_states(v)[:4] == [True] * 4
+
+    client.refresh()
+    assert v.ignition_on is False
     assert remote_states(v) == [None] * 8
 
 
