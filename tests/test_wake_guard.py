@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import pytest
 from homeassistant.util import dt as dt_util
+from homeassistant.util.file import WriteError
 from pytest_homeassistant_custom_component.common import async_fire_time_changed
 
 from custom_components.uconnect.wake_guard import (
@@ -102,6 +103,28 @@ async def test_single_restart_with_its_history_has_no_startup_grace(hass, hass_s
         clock[0] += 180
         guard.check_automatic_command(VIN, "VF", at(3))
         assert begin(guard, 3).decision is Decision.ALLOWED
+
+
+async def test_start_that_cannot_be_saved_has_the_startup_grace(hass, hass_storage):
+    # A full disk: the old history reads, but no start or wake-up is kept
+    hass_storage[STORAGE_KEY] = {
+        "version": 1,
+        "key": STORAGE_KEY,
+        "data": {"vehicles": {}, "starts": []},
+    }
+    clock = [1000.0]
+    with (
+        patch("custom_components.uconnect.wake_guard.monotonic", lambda: clock[0]),
+        patch(
+            "homeassistant.helpers.storage.Store._async_write_data",
+            side_effect=WriteError("No space left on device"),
+        ),
+    ):
+        guard = WakeGuard(hass)
+        await guard.async_load()
+        guard.charging_started(VIN, at(0))
+        clock[0] += 180
+        assert begin(guard, 3).decision is Decision.WAIT
 
 
 async def test_third_start_within_the_hour_has_the_startup_grace(hass, hass_storage):

@@ -259,11 +259,26 @@ def _minutes(delta: timedelta) -> int:
     return max(int(delta.total_seconds() // 60) + 1, 1)
 
 
+class _HistoryStore(Store[dict[str, Any]]):
+    """Tells whether the last write worked: Home Assistant only logs a
+    failed one, e.g. on a full disk."""
+
+    write_failed = False
+
+    async def _async_write_data(self, data: dict) -> None:
+        try:
+            await super()._async_write_data(data)
+        except Exception:
+            self.write_failed = True
+            raise
+        self.write_failed = False
+
+
 class WakeGuard:
     """Per-vehicle wake-up history and the limits that use it."""
 
     def __init__(self, hass: HomeAssistant) -> None:
-        self._store: Store[dict[str, Any]] = Store(
+        self._store = _HistoryStore(
             hass, STORAGE_VERSION, STORAGE_KEY, atomic_writes=True
         )
         self._vehicles: dict[str, VehicleWakes] = {}
@@ -294,11 +309,15 @@ class WakeGuard:
             for at in (_parse(x) for x in (starts if isinstance(starts, list) else []))
             if at is not None and now - STARTUP_LOOP_WINDOW <= at <= now + FUTURE_TOLERANCE
         ][-STARTUP_LOOP_STARTS:]
-        self._startup_grace = (
-            not isinstance(data, dict) or len(self._starts) + 1 >= STARTUP_LOOP_STARTS
-        )
         self._starts.append(now)
-        self._save()
+        # A start that could not be saved is not counted by the next one,
+        # neither are the wake-ups of this run: a loop would go unnoticed
+        await self.async_flush()
+        self._startup_grace = (
+            not isinstance(data, dict)
+            or len(self._starts) >= STARTUP_LOOP_STARTS
+            or self._store.write_failed
+        )
 
         migrations = data.get("migrations") if isinstance(data, dict) else None
         if isinstance(migrations, list):
@@ -405,6 +424,8 @@ class WakeGuard:
         except Exception as err:
             # The in-memory limits still apply, only a crash could lose this
             _LOGGER.warning("Unable to save the wake-up history: %s", err)
+        if self._store.write_failed:
+            _LOGGER.warning("Unable to save the wake-up history, see the error before")
 
     @callback
     def _vehicle(self, vin: str, now: datetime) -> VehicleWakes:
