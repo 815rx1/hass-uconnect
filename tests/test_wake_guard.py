@@ -88,6 +88,53 @@ async def test_startup_grace(hass):
         assert begin(guard, 15).decision is Decision.ALLOWED
 
 
+async def test_single_restart_with_its_history_has_no_startup_grace(hass, hass_storage):
+    hass_storage[STORAGE_KEY] = {
+        "version": 1,
+        "key": STORAGE_KEY,
+        "data": {"vehicles": {}, "starts": [dt_util.utcnow().isoformat()]},
+    }
+    clock = [1000.0]
+    with patch("custom_components.uconnect.wake_guard.monotonic", lambda: clock[0]):
+        guard = WakeGuard(hass)
+        await guard.async_load()
+        guard.charging_started(VIN, at(0))
+        clock[0] += 180
+        guard.check_automatic_command(VIN, "VF", at(3))
+        assert begin(guard, 3).decision is Decision.ALLOWED
+
+
+async def test_third_start_within_the_hour_has_the_startup_grace(hass, hass_storage):
+    now = dt_util.utcnow()
+    hass_storage[STORAGE_KEY] = {
+        "version": 1,
+        "key": STORAGE_KEY,
+        "data": {
+            "vehicles": {},
+            "starts": [
+                (now - timedelta(hours=2)).isoformat(),
+                (now - timedelta(minutes=40)).isoformat(),
+                (now - timedelta(minutes=10)).isoformat(),
+            ],
+        },
+    }
+    clock = [1000.0]
+    with patch("custom_components.uconnect.wake_guard.monotonic", lambda: clock[0]):
+        guard = WakeGuard(hass)
+        await guard.async_load()
+        guard.charging_started(VIN, at(0))
+        clock[0] += 180
+        assert begin(guard, 3).decision is Decision.WAIT
+        with pytest.raises(Blocked):
+            guard.check_automatic_command(VIN, "VF", at(3))
+
+    # Only the starts within the hour are kept, this one included
+    await guard.async_flush()
+    starts = hass_storage[STORAGE_KEY]["data"]["starts"]
+    assert len(starts) == 3
+    assert starts[0] == (now - timedelta(minutes=40)).isoformat()
+
+
 async def test_startup_grace_survives_a_clock_step(hass):
     # Booted with a clock two hours behind, which NTP then corrected
     clock = [1000.0]

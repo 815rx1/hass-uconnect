@@ -114,7 +114,7 @@ Every remote command wakes the vehicle's telematics unit, which draws on its 12 
 
 - the last poll worked and reports the vehicle as charging and not unplugged, with a known state of charge below 100 %
 - the vehicle uploaded its charge data less than an hour ago for the first refresh of a charge, and less than 12 hours ago for the later ones. After a gap without refreshes, such as Home Assistant or the cloud being down, the next one counts as a first one again. A charge reported long ago may have ended without the end reaching the cloud
-- at least 15 minutes passed since Home Assistant started, at least 5 minutes since any command was sent to the vehicle, and the step described above since the last refresh of this charge
+- at least 15 minutes passed since Home Assistant started, if the wake-up history could not be read or it started for the third time within an hour (a single restart keeps the limits of the history), at least 5 minutes since any command was sent to the vehicle, and the step described above since the last refresh of this charge
 - fewer than 72 automatic refreshes in the last 24 hours
 - not 3 refreshes in a row without new charge data at the longest step, and not 3 failures in a row; otherwise there are none until the next charge. A rejected PIN also ends them, until it is changed
 

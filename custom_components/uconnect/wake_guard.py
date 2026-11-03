@@ -65,9 +65,13 @@ AUTO_REFRESH_MAX_WITHOUT_PROGRESS = 3
 # A vehicle that does not answer holds the request open for a minute, so the
 # session gives up after this many failures in a row
 AUTO_REFRESH_MAX_FAILURES = 3
-# No automatic refresh right after Home Assistant started. This bounds the
-# wake-ups of a crash loop even if the history could not be read.
+# No automatic refresh right after Home Assistant started, when the history
+# could not be read or it started this often within the window: this bounds
+# the wake-ups of a crash loop. A single restart, e.g. for an update during a
+# charge, keeps the limits of the history read and needs no pause.
 STARTUP_GRACE = timedelta(minutes=15)
+STARTUP_LOOP_STARTS = 3
+STARTUP_LOOP_WINDOW = timedelta(hours=1)
 # Charging that resumes within this time after it stopped continues the same
 # session, so a wallbox switching on and off with solar surplus, or a charging
 # flag flickering in the cloud data, does not start a new session each time
@@ -269,6 +273,11 @@ class WakeGuard:
         # Monotonic, so a clock stepped forward after the boot does not end
         # the startup grace at once
         self._started = monotonic()
+        # Whether the startup grace applies, see STARTUP_GRACE: until the
+        # history is read it does
+        self._startup_grace = True
+        # When Home Assistant started within STARTUP_LOOP_WINDOW, this run too
+        self._starts: list[datetime] = []
 
     async def async_load(self) -> None:
         """Load the history saved by earlier runs."""
@@ -277,6 +286,19 @@ class WakeGuard:
         except Exception as err:  # A damaged file must not stop the setup
             _LOGGER.warning("Unable to read the wake-up history: %s", err)
             data = None
+
+        now = _utcnow()
+        starts = data.get("starts") if isinstance(data, dict) else None
+        self._starts = [
+            at
+            for at in (_parse(x) for x in (starts if isinstance(starts, list) else []))
+            if at is not None and now - STARTUP_LOOP_WINDOW <= at <= now + FUTURE_TOLERANCE
+        ][-STARTUP_LOOP_STARTS:]
+        self._startup_grace = (
+            not isinstance(data, dict) or len(self._starts) + 1 >= STARTUP_LOOP_STARTS
+        )
+        self._starts.append(now)
+        self._save()
 
         migrations = data.get("migrations") if isinstance(data, dict) else None
         if isinstance(migrations, list):
@@ -334,6 +356,7 @@ class WakeGuard:
     def _data_to_save(self) -> dict[str, Any]:
         return {
             "migrations": sorted(self._migrations),
+            "starts": [_iso(at) for at in self._starts],
             "vehicles": {
                 vin: {
                     "wakes": [
@@ -623,7 +646,7 @@ class WakeGuard:
         """
         now = now or _utcnow()
         since_start = timedelta(seconds=monotonic() - self._started)
-        if since_start < STARTUP_GRACE:
+        if self._startup_grace and since_start < STARTUP_GRACE:
             raise Blocked(
                 "Home Assistant started less than 15 minutes ago",
                 "startup_grace",
@@ -737,7 +760,7 @@ class WakeGuard:
             )
 
         since_start = timedelta(seconds=monotonic() - self._started)
-        if since_start < STARTUP_GRACE:
+        if self._startup_grace and since_start < STARTUP_GRACE:
             return AutoRefreshDecision(
                 Decision.WAIT,
                 wait=STARTUP_GRACE - max(since_start, timedelta(0)),
