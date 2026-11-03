@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import timedelta
 import logging
 from pathlib import Path
@@ -25,6 +26,10 @@ _LOGGER = logging.getLogger(__name__)
 
 CACHE_DIR = ".storage/uconnect"
 IMAGE_RETRY_AFTER = timedelta(hours=1)
+# Home Assistant gives up on an image after 10 s and cancels the download, so
+# the cached image and the retry pause above would never apply. Both header
+# sets together stay below that.
+IMAGE_FETCH_TIMEOUT = 8
 
 # The image CDNs are fronted by Akamai, which rejects some User-Agents with a
 # 403: the Ram one blocks non-browser agents (#116), the Fiat one blocks the
@@ -189,28 +194,29 @@ class UconnectVehicleImage(UconnectEntity, ImageEntity):
         """Download image from URL."""
         try:
             session = async_get_clientsession(self.hass)
-            for headers in FETCH_HEADERS:
-                async with session.get(
-                    url, headers=headers, timeout=aiohttp.ClientTimeout(total=30)
-                ) as resp:
-                    if resp.status == 403:
-                        _LOGGER.debug(
-                            "Vehicle image rejected with HTTP 403 for User-Agent %s",
-                            headers.get("User-Agent", "default"),
-                        )
-                        continue
-                    if resp.status != 200:
-                        _LOGGER.warning(
-                            "Failed to fetch vehicle image: HTTP %s", resp.status
-                        )
-                        return None
-                    data = await resp.read()
-                    # Missing headers are reported as application/octet-stream
-                    if resp.content_type and resp.content_type.startswith("image/"):
-                        self._attr_content_type = resp.content_type
-                    else:
-                        self._attr_content_type = _sniff_content_type(data)
-                    return data
+            async with asyncio.timeout(IMAGE_FETCH_TIMEOUT):
+                for headers in FETCH_HEADERS:
+                    async with session.get(
+                        url, headers=headers, timeout=aiohttp.ClientTimeout(total=30)
+                    ) as resp:
+                        if resp.status == 403:
+                            _LOGGER.debug(
+                                "Vehicle image rejected with HTTP 403 for User-Agent %s",
+                                headers.get("User-Agent", "default"),
+                            )
+                            continue
+                        if resp.status != 200:
+                            _LOGGER.warning(
+                                "Failed to fetch vehicle image: HTTP %s", resp.status
+                            )
+                            return None
+                        data = await resp.read()
+                        # Missing headers are reported as application/octet-stream
+                        if resp.content_type and resp.content_type.startswith("image/"):
+                            self._attr_content_type = resp.content_type
+                        else:
+                            self._attr_content_type = _sniff_content_type(data)
+                        return data
         except Exception:
             _LOGGER.exception("Error fetching vehicle image")
             return None

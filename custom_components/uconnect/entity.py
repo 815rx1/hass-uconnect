@@ -41,7 +41,7 @@ def schedule_slot_count(hass: HomeAssistant, vehicle: Vehicle) -> int:
     registered = sum(
         1
         for slot in range(1, 4)
-        if was_added(hass, "switch", vehicle.vin, f"charge_schedule_{slot}")
+        if was_added(hass, "select", vehicle.vin, f"charge_schedule_{slot}")
     )
     return max(reported, registered)
 

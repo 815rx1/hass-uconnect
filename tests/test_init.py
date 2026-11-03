@@ -44,7 +44,7 @@ async def test_setup_creates_entities(hass, setup_integration):
 
     # Command entities and the EMEA schedules
     assert entity_id(hass, "lock", "lock_doors") or entity_id(hass, "lock", "doors")
-    schedule = hass.states.get(entity_id(hass, "switch", "charge_schedule_1"))
+    schedule = hass.states.get(entity_id(hass, "select", "charge_schedule_1"))
     assert schedule.state == "on"
     assert schedule.attributes["days"] == [
         "monday",
@@ -166,7 +166,7 @@ async def test_vehicle_dropping_out_makes_entities_unavailable(
 
 async def test_disabling_command_entities_removes_them(hass, setup_integration):
     registry = er.async_get(hass)
-    switch_id = entity_id(hass, "switch", "charge_schedule_1")
+    switch_id = entity_id(hass, "select", "charge_schedule_1")
     assert switch_id is not None
 
     hass.config_entries.async_update_entry(
@@ -188,7 +188,7 @@ async def test_disabling_command_entities_removes_them(hass, setup_integration):
         options={**setup_integration.options, CONF_ADD_COMMAND_ENTITIES: True},
     )
     await hass.async_block_till_done()
-    assert hass.states.get(entity_id(hass, "switch", "charge_schedule_1")).state == "on"
+    assert hass.states.get(entity_id(hass, "select", "charge_schedule_1")).state == "on"
 
 
 async def test_interval_change_applies_without_reload(hass, setup_integration, mock_client):
@@ -203,10 +203,14 @@ async def test_interval_change_applies_without_reload(hass, setup_integration, m
     assert coordinator.update_interval == timedelta(minutes=15)
 
 
-async def test_schedule_switch_writes_full_list(hass, setup_integration, mock_client):
-    switch_id = entity_id(hass, "switch", "charge_schedule_2")
+async def test_schedule_select_writes_full_list(
+    hass, setup_integration, mock_client, cloud_status
+):
+    # Days set in the app, without enabling the slot
+    cloud_status["evInfo"]["schedules"][1]["scheduledDays"]["saturday"] = True
+    select_id = entity_id(hass, "select", "charge_schedule_2")
     await hass.services.async_call(
-        "switch", "turn_on", {"entity_id": switch_id}, blocking=True
+        "select", "select_option", {"entity_id": select_id, "option": "on"}, blocking=True
     )
 
     vin, schedules, verify = mock_client.send_charge_schedules_emea.call_args.args
@@ -415,7 +419,7 @@ async def test_registered_entities_survive_missing_values(
         ("sensor", "trip_a_distance"),
         ("sensor", "extrapolated_soc"),
         ("select", "charging_level_preference"),
-        ("switch", "charge_schedule_2"),
+        ("select", "charge_schedule_2"),
         ("time", "charge_schedule_2_start_time"),
         ("device_tracker", "location"),
     }

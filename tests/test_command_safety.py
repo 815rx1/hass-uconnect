@@ -9,6 +9,7 @@ import time
 from unittest.mock import MagicMock, patch
 
 import pytest
+import voluptuous as vol
 from homeassistant.const import EntityCategory
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
@@ -16,6 +17,7 @@ from homeassistant.helpers import area_registry as ar
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.setup import async_setup_component
+from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.uconnect.const import CONF_UNLOCK_REQUIRES_PIN, DOMAIN
@@ -242,9 +244,9 @@ async def test_turning_off_disabled_schedules_sends_nothing(
     await setup(hass, config_entry)
     for slot in (2, 3):
         await hass.services.async_call(
-            "switch",
-            "turn_off",
-            {"entity_id": entity_id(hass, "switch", f"charge_schedule_{slot}")},
+            "select",
+            "select_option",
+            {"entity_id": entity_id(hass, "select", f"charge_schedule_{slot}"), "option": "off"},
             blocking=True,
         )
     mock_client.send_charge_schedules_emea.assert_not_called()
@@ -254,6 +256,7 @@ async def test_known_state_is_not_sent_again(hass, config_entry, mock_client, ve
     vehicle.supported_commands += ["REON", "REOFF", "CNOW"]
     vehicle.ignition_on = True
     vehicle.charging = True
+    vehicle.timestamp_ev_info = dt_util.now() - timedelta(minutes=2)
     await setup(hass, config_entry)
 
     for key in ("switch_engine", "switch_charging"):
@@ -271,6 +274,25 @@ async def test_known_state_is_not_sent_again(hass, config_entry, mock_client, ve
         blocking=True,
     )
     assert sent(mock_client) == ["REOFF"]
+
+
+async def test_state_reported_on_long_ago_does_not_hold_back_turning_on(
+    hass, config_entry, mock_client, vehicle
+):
+    # The cloud may go on reporting the climate on after it was turned off,
+    # until the vehicle uploads again
+    vehicle.supported_commands += ["ROHVACON", "ROHVACOFF"]
+    vehicle.hvac_on = True
+    vehicle.timestamp_status = dt_util.now() - timedelta(minutes=2)
+    await setup(hass, config_entry)
+    hvac = entity_id(hass, "switch", "switch_hvac")
+
+    await hass.services.async_call("switch", "turn_on", {"entity_id": hvac}, blocking=True)
+    assert sent(mock_client) == []
+
+    vehicle.timestamp_status = dt_util.now() - timedelta(hours=10)
+    await hass.services.async_call("switch", "turn_on", {"entity_id": hvac}, blocking=True)
+    assert sent(mock_client) == ["ROHVACON"]
 
 
 async def test_charging_level_already_set_is_not_sent(hass, config_entry, mock_client):
@@ -300,7 +322,7 @@ async def test_entity_categories(hass, config_entry, mock_client, vehicle):
         return registry.async_get(entity_id(hass, platform, key)).entity_category
 
     assert category("switch", "switch_precondition") is EntityCategory.CONFIG
-    assert category("switch", "charge_schedule_1") is EntityCategory.CONFIG
+    assert category("select", "charge_schedule_1") is EntityCategory.CONFIG
     assert category("time", "charge_schedule_1_start_time") is EntityCategory.CONFIG
     assert category("select", "charging_level_preference") is EntityCategory.CONFIG
     assert category("button", "button_deep_refresh") is EntityCategory.DIAGNOSTIC
@@ -522,6 +544,54 @@ async def test_turning_off_all_switches_does_not_stop_a_script(
     await setup(hass, config_entry)
     await hass.services.async_call("switch", "turn_off", {"entity_id": "all"}, blocking=True)
     assert "CNOW" not in sent(mock_client)
+
+
+async def test_all_switches_leave_the_charge_schedules_alone(
+    hass, config_entry, mock_client
+):
+    # "Good night" turning off every switch, configuration ones included,
+    # must not disable the schedule, nor turning all on enable unused slots
+    await setup(hass, config_entry)
+    for service in ("turn_off", "turn_on"):
+        await hass.services.async_call("switch", service, {"entity_id": "all"}, blocking=True)
+    mock_client.send_charge_schedules_emea.assert_not_called()
+    assert hass.states.get(entity_id(hass, "select", "charge_schedule_1")).state == "on"
+
+
+async def test_charge_schedule_switches_become_selects(hass, config_entry, mock_client):
+    from homeassistant.helpers.entity_registry import RegistryEntryDisabler
+
+    config_entry.add_to_hass(hass)
+    registry = er.async_get(hass)
+    for slot in (1, 2):
+        registry.async_get_or_create(
+            "switch",
+            DOMAIN,
+            f"{DOMAIN}_{VIN}_charge_schedule_{slot}",
+            suggested_object_id=f"fiat_500e_charge_schedule_{slot}",
+            config_entry=config_entry,
+            disabled_by=RegistryEntryDisabler.USER if slot == 2 else None,
+        )
+    registry.async_update_entity(
+        "switch.fiat_500e_charge_schedule_1", name="Night charging", icon="mdi:moon"
+    )
+    await setup(hass, config_entry)
+
+    assert entity_id(hass, "switch", "charge_schedule_1") is None
+    # The settings of the switch are kept
+    select = registry.async_get(entity_id(hass, "select", "charge_schedule_1"))
+    assert select.entity_id == "select.fiat_500e_charge_schedule_1"
+    assert (select.name, select.icon) == ("Night charging", "mdi:moon")
+    assert hass.states.get(select.entity_id).state == "on"
+    assert registry.async_get(entity_id(hass, "select", "charge_schedule_2")).disabled_by
+    await hass.services.async_call(
+        "select",
+        "select_option",
+        {"entity_id": select.entity_id, "option": "off"},
+        blocking=True,
+    )
+    planned = mock_client.send_charge_schedules_emea.call_args.args[1]
+    assert planned[0]["enableScheduleType"] is False
 
 
 async def test_limit_reported_through_the_select(hass, config_entry, mock_client):
@@ -783,13 +853,16 @@ async def test_schedule_write_failures_are_handled_like_commands(
     from custom_components.uconnect.pyuconnect.api import AuthenticationError
 
     await setup(hass, config_entry)
-    switch = entity_id(hass, "switch", "charge_schedule_2")
+    schedule = entity_id(hass, "select", "charge_schedule_1")
 
     # Refused outright: it never reached the vehicle
     mock_client.send_charge_schedules_emea.side_effect = refused_by_the_cloud(400)
     with pytest.raises(HomeAssistantError):
         await hass.services.async_call(
-            "switch", "turn_on", {"entity_id": switch}, blocking=True
+            "select",
+            "select_option",
+            {"entity_id": schedule, "option": "off"},
+            blocking=True,
         )
     assert hass.data[DOMAIN]["_wake_guard"].wakes(VIN) == []
 
@@ -797,6 +870,24 @@ async def test_schedule_write_failures_are_handled_like_commands(
     mock_client.send_charge_schedules_emea.side_effect = AuthenticationError("rejected")
     with pytest.raises(HomeAssistantError):
         await hass.services.async_call(
-            "switch", "turn_on", {"entity_id": switch}, blocking=True
+            "select",
+            "select_option",
+            {"entity_id": schedule, "option": "off"},
+            blocking=True,
         )
     assert config_entry.runtime_data.auth_failed
+
+
+async def test_hvac_on_from_upstream_with_a_temperature(
+    hass, config_entry, mock_client, vehicle
+):
+    # Upstream 1.0.x takes a temperature, an automation made there still
+    # starts the climate
+    vehicle.supported_commands += ["ROHVACON"]
+    await setup(hass, config_entry)
+    await hass.services.async_call(DOMAIN, "hvac_on", {"temperature": 21}, blocking=True)
+    assert sent(mock_client) == ["ROHVACON"]
+
+    # Other actions stay strict
+    with pytest.raises(vol.Invalid):
+        await hass.services.async_call(DOMAIN, "hvac_off", {"temperature": 21}, blocking=True)

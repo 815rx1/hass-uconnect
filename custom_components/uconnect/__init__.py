@@ -1,10 +1,11 @@
 import logging
+import re
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
     Platform,
 )
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, split_entity_id
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
@@ -105,6 +106,7 @@ async def async_setup_entry(
 
     config_entry.runtime_data = coordinator
     await async_setup_frontend_cards(hass)
+    _async_move_schedule_switches(hass, config_entry)
     await hass.config_entries.async_forward_entry_setups(config_entry, PLATFORMS)
     _async_unexpose_switches(hass, config_entry)
 
@@ -130,6 +132,38 @@ async def async_setup_entry(
     config_entry.async_on_unload(config_entry.add_update_listener(_async_options_updated))
 
     return True
+
+
+def _async_move_schedule_switches(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Turn the charge schedule switches into selects, see select.py.
+
+    The select takes over the switch's entity ID, name, icon, area and
+    whether it is disabled or hidden. The history of the switch stays under
+    its old entity ID.
+    """
+
+    registry = er.async_get(hass)
+    for entity in er.async_entries_for_config_entry(registry, entry.entry_id):
+        if entity.domain != Platform.SWITCH or not re.fullmatch(
+            rf"{DOMAIN}_.+_charge_schedule_\d", entity.unique_id
+        ):
+            continue
+        registry.async_remove(entity.entity_id)
+        if registry.async_get_entity_id(Platform.SELECT, DOMAIN, entity.unique_id):
+            continue
+        moved = registry.async_get_or_create(
+            Platform.SELECT,
+            DOMAIN,
+            entity.unique_id,
+            suggested_object_id=split_entity_id(entity.entity_id)[1],
+            config_entry=entry,
+            device_id=entity.device_id,
+            disabled_by=entity.disabled_by,
+            hidden_by=entity.hidden_by,
+        )
+        registry.async_update_entity(
+            moved.entity_id, name=entity.name, icon=entity.icon, area_id=entity.area_id
+        )
 
 
 def _async_unexpose_switches(hass: HomeAssistant, entry: ConfigEntry) -> None:

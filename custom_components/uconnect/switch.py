@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Final, Callable
 
 import logging
@@ -11,6 +12,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EntityCategory
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.util import dt as dt_util
 from homeassistant.components.switch import (
     SwitchDeviceClass,
     SwitchEntityDescription,
@@ -31,17 +33,15 @@ from .pyuconnect.command import (
     Command,
 )
 
-from .charge_schedule import enabled_days
 from .const import DOMAIN, CONF_ADD_COMMAND_ENTITIES
 from .coordinator import UconnectDataUpdateCoordinator
-from .entity import (
-    UconnectCommandEntity,
-    UconnectEntity,
-    schedule_slot_count,
-    was_added,
-)
+from .entity import UconnectCommandEntity, was_added
 
 _LOGGER = logging.getLogger(__name__)
+
+# A state reported on longer ago may be over: the cloud keeps reporting the
+# climate on after it was turned off until the vehicle uploads again
+RECENTLY_REPORTED = timedelta(minutes=10)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -53,6 +53,8 @@ class UconnectSwitchEntityDescription(SwitchEntityDescription):
     on_icon: str | None = None
     off_icon: str | None = None
     is_on: Callable[[Vehicle], bool | None] | None = None
+    # When the vehicle uploaded the state is_on reads
+    reported_at: Callable[[Vehicle], datetime | None] = lambda x: None
     is_available: Callable[[Vehicle], bool] = lambda x: True
 
 
@@ -64,6 +66,10 @@ SWITCH_DESCRIPTIONS: Final[tuple[UconnectSwitchEntityDescription, ...]] = (
         command_on=COMMAND_ENGINE_ON,
         command_off=COMMAND_ENGINE_OFF,
         is_on=lambda x: getattr(x, "ignition_on", None),
+        # An EV's ignition comes with its EV status, else the remote status
+        reported_at=lambda x: max(
+            (t for t in (x.timestamp_ev_info, x.timestamp_status) if t), default=None
+        ),
         device_class=SwitchDeviceClass.SWITCH,
     ),
     UconnectSwitchEntityDescription(
@@ -81,6 +87,7 @@ SWITCH_DESCRIPTIONS: Final[tuple[UconnectSwitchEntityDescription, ...]] = (
         command_on=COMMAND_HVAC_ON,
         command_off=COMMAND_HVAC_OFF,
         is_on=lambda x: getattr(x, "hvac_on", None),
+        reported_at=lambda x: x.timestamp_status,
         device_class=SwitchDeviceClass.SWITCH,
     ),
     UconnectSwitchEntityDescription(
@@ -98,6 +105,7 @@ SWITCH_DESCRIPTIONS: Final[tuple[UconnectSwitchEntityDescription, ...]] = (
         off_icon="mdi:battery-alert",
         command_on=COMMAND_CHARGE,
         is_on=lambda x: getattr(x, "charging", None),
+        reported_at=lambda x: x.timestamp_ev_info,
         device_class=SwitchDeviceClass.SWITCH,
     ),
     # The trunk is a lock now, see lock.py
@@ -132,10 +140,7 @@ async def async_setup_entry(
             ) or was_added(hass, "switch", vehicle.vin, description.key):
                 entities.append(UconnectSwitch(coordinator, description, vehicle))
 
-        for slot in range(schedule_slot_count(hass, vehicle)):
-            entities.append(
-                UconnectChargeScheduleSwitch(coordinator, vehicle, slot)
-            )
+        # The charge schedule slots are selects, see select.py
 
     async_add_entities(entities)
 
@@ -186,8 +191,14 @@ class UconnectSwitch(SwitchEntity, UconnectCommandEntity):
                 f"{self.entity_description.name} cannot be turned on"
             )
 
-        # Already reported on: sending it again would only wake the vehicle
-        if self.is_on is True:
+        # Already reported on: sending it again would only wake the vehicle.
+        # Not once the report is older, it would hold back a restart for good.
+        reported_at = self.entity_description.reported_at(self.vehicle)
+        if (
+            self.is_on is True
+            and reported_at is not None
+            and dt_util.utcnow() - reported_at < RECENTLY_REPORTED
+        ):
             _LOGGER.debug("%s is already on, not sending", self.entity_description.key)
             return
 
@@ -217,77 +228,3 @@ class UconnectSwitch(SwitchEntity, UconnectCommandEntity):
         except Exception as err:
             _LOGGER.error("Failed to %s %s: %s", what, self.entity_description.key, err)
             raise HomeAssistantError(f"Failed to {what}: {err}") from err
-
-
-class UconnectChargeScheduleSwitch(SwitchEntity, UconnectEntity):
-    """Enables or disables one inline charge schedule slot of an EMEA vehicle.
-
-    A configuration entity, so turning off everything in an area does not
-    switch off the charging schedules.
-    """
-
-    _attr_entity_category = EntityCategory.CONFIG
-
-    def __init__(
-        self,
-        coordinator: UconnectDataUpdateCoordinator,
-        vehicle: Vehicle,
-        slot: int,
-    ):
-        UconnectEntity.__init__(self, coordinator, vehicle)
-
-        self._slot = slot
-        self._attr_name = (
-            f"{vehicle.make} {vehicle.nickname or vehicle.model} "
-            f"Charge Schedule {slot + 1}"
-        )
-        self._attr_unique_id = f"{DOMAIN}_{vehicle.vin}_charge_schedule_{slot + 1}"
-        self._attr_icon = "mdi:calendar-clock"
-
-    @property
-    def _schedule(self):
-        schedules = getattr(self.vehicle, "charge_schedules", None) or []
-        return schedules[self._slot] if self._slot < len(schedules) else None
-
-    @property
-    def available(self) -> bool:
-        return super().available and self._schedule is not None
-
-    @property
-    def is_on(self):
-        schedule = self._schedule
-        return schedule.enable if schedule is not None else None
-
-    @property
-    def extra_state_attributes(self):
-        schedule = self._schedule
-        if schedule is None:
-            return None
-
-        return {
-            "start_time": schedule.start_time,
-            "end_time": schedule.end_time,
-            "days": enabled_days(schedule),
-            "charge_to_full": schedule.charge_to_full,
-            "cabin_priority": schedule.cabin_priority,
-            "repeat_schedule": schedule.repeat_schedule,
-        }
-
-    async def _async_set_enable(self, enable: bool):
-        try:
-            await self.coordinator.async_set_emea_charge_schedule(
-                self._vin, self._slot, enable=enable
-            )
-        except HomeAssistantError:
-            raise
-        except Exception as err:
-            _LOGGER.error(
-                "Failed to set charge schedule %d: %s", self._slot + 1, err
-            )
-            raise HomeAssistantError(f"Failed to set charge schedule: {err}") from err
-
-    async def async_turn_on(self, **kwargs):
-        await self._async_set_enable(True)
-
-    async def async_turn_off(self, **kwargs):
-        await self._async_set_enable(False)

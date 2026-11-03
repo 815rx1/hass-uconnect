@@ -16,7 +16,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .pyuconnect.client import Vehicle
+from .pyuconnect.client import Vehicle, _bool
 
 from .const import DOMAIN
 from .coordinator import UconnectDataUpdateCoordinator
@@ -47,6 +47,14 @@ SENSOR_DESCRIPTIONS: Final[tuple[UconnectBinarySensorEntityDescription, ...]] = 
         on_icon="mdi:engine",
         off_icon="mdi:engine-off",
         device_class=BinarySensorDeviceClass.POWER,
+    ),
+    # As in upstream 1.0.x, so its entity carries over in both directions
+    UconnectBinarySensorEntityDescription(
+        key="hvac_on",
+        name="HVAC Active",
+        on_icon="mdi:hvac",
+        off_icon="mdi:hvac-off",
+        device_class=BinarySensorDeviceClass.RUNNING,
     ),
     # The lock sensors are on when unlocked, as the LOCK device class has it,
     # so the open lock is their on icon. Unknown shows neither, see
@@ -254,9 +262,12 @@ class UconnectBinarySensor(BinarySensorEntity, UconnectEntity):
             return None
 
         is_on = self.is_on
-        # Not known: the off icon, a closed lock, would suggest it is locked
-        if is_on is None and self.entity_description.device_class == BinarySensorDeviceClass.LOCK:
-            return "mdi:lock-question"
+        # Not known: the off icon, a closed lock or window, would suggest it
+        # is locked or closed
+        if is_on is None:
+            if self.entity_description.device_class == BinarySensorDeviceClass.LOCK:
+                return "mdi:lock-question"
+            return "mdi:help-circle-outline"
 
         return (
             self.entity_description.on_icon
@@ -287,10 +298,11 @@ class UconnectStolenVehicleSensor(BinarySensorEntity, UconnectEntity):
         """Return true if the vehicle is reported stolen."""
 
         data = self.coordinator.svla_data.get(self._vin)
-        if data is None:
+        if not isinstance(data, dict):
             return None
 
-        return data.get("svlaStatus")
+        # A flag sent as the string "false" must not report the car stolen
+        return _bool(data.get("svlaStatus"))
 
     @property
     def icon(self) -> str:
@@ -303,11 +315,11 @@ class UconnectStolenVehicleSensor(BinarySensorEntity, UconnectEntity):
         """Return the activation timestamp if available."""
 
         data = self.coordinator.svla_data.get(self._vin)
-        if data is None:
+        if not isinstance(data, dict):
             return None
 
         ts = data.get("activationTimestamp")
-        if ts is not None and ts > 0:
+        if isinstance(ts, int | float) and not isinstance(ts, bool) and ts > 0:
             return {
                 "activation_timestamp": datetime.fromtimestamp(ts / 1000).astimezone()
             }

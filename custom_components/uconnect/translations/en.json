@@ -365,7 +365,20 @@
             }
         }
     },
+    "entity": {
+        "select": {
+            "charge_schedule": {
+                "state": {
+                    "on": "On",
+                    "off": "Off"
+                }
+            }
+        }
+    },
     "exceptions": {
+        "unsupported_brand": {
+            "message": "Brand and region {brand} is not supported by this version of the integration. The configuration is kept; it works again with a version that supports it."
+        },
         "refresh_needs_plug": {
             "message": "Deep refresh only works while the vehicle is plugged in. The cloud refused it, the vehicle was not woken."
         },

@@ -35,6 +35,7 @@ from homeassistant.const import (
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import (
     ConfigEntryAuthFailed,
+    ConfigEntryError,
     HomeAssistantError,
     ServiceValidationError,
 )
@@ -238,11 +239,23 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
         self.charge_schedule_data: dict[str, dict] = {}
         self.svla_data: dict[str, dict] = {}
 
+        # Upstream has brands this version does not know yet, such as the
+        # LATAM ones. Said so, instead of an error nobody can make sense of.
+        brand = BRANDS_BY_NAME.get(BRANDS.get(config_entry.data.get(CONF_BRAND_REGION)))
+        if brand is None:
+            raise ConfigEntryError(
+                translation_domain=DOMAIN,
+                translation_key="unsupported_brand",
+                translation_placeholders={
+                    "brand": str(config_entry.data.get(CONF_BRAND_REGION))
+                },
+            )
+
         self.client = Client(
             email=config_entry.data.get(CONF_USERNAME),
             password=config_entry.data.get(CONF_PASSWORD),
             pin=self._read_pin(config_entry),
-            brand=BRANDS_BY_NAME[BRANDS[config_entry.data[CONF_BRAND_REGION]]],
+            brand=brand,
             disable_tls_verification=config_entry.data.get(
                 CONF_DISABLE_TLS_VERIFICATION
             ),
@@ -608,6 +621,9 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
                     self.client.get_stolen_vehicle_status, vin
                 )
             except Exception as err:
+                # Unknown then: an old "not stolen" would go on showing as
+                # current for as long as the reads fail
+                self.svla_data.pop(vin, None)
                 _LOGGER.debug(
                     "Stolen vehicle status not available for %s: %s", vin, err
                 )

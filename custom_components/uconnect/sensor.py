@@ -27,6 +27,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
+from .charge_schedule import supports_emea_schedules
 from .const import DOMAIN, UNIT_DYNAMIC
 from .entity import UconnectEntity, was_added
 from .coordinator import UconnectDataUpdateCoordinator
@@ -327,9 +328,12 @@ async def async_setup_entry(
         ):
             entities.append(UconnectMaintenanceSensor(coordinator, vehicle))
 
-        # Add charge schedule sensor if data is available
-        if vehicle.vin in coordinator.charge_schedule_data or was_added(
-            hass, "sensor", vehicle.vin, "charge_schedule"
+        # Add charge schedule sensor if data is available. Upstream 1.0.x
+        # also has it for the schedules EMEA vehicles report inline.
+        if (
+            vehicle.vin in coordinator.charge_schedule_data
+            or supports_emea_schedules(coordinator.client, vehicle)
+            or was_added(hass, "sensor", vehicle.vin, "charge_schedule")
         ):
             entities.append(UconnectChargeScheduleSensor(coordinator, vehicle))
 
@@ -549,8 +553,24 @@ class UconnectChargeScheduleSensor(SensorEntity, UconnectEntity):
         self._attr_state_class = SensorStateClass.MEASUREMENT
 
     @property
+    def _inline_schedules(self) -> list[dict] | None:
+        """The schedules an EMEA vehicle reports inline, None for the others.
+
+        The v4 endpoint the others are read from answers HTTP 500 for them.
+        """
+
+        if self._vin in self.coordinator.charge_schedule_data or not (
+            supports_emea_schedules(self.coordinator.client, self.vehicle)
+        ):
+            return None
+        return [schedule.to_api() for schedule in self.vehicle.charge_schedules]
+
+    @property
     def native_value(self) -> int | None:
         """Return the number of schedules."""
+
+        if (inline := self._inline_schedules) is not None:
+            return len(inline)
 
         data = self.coordinator.charge_schedule_data.get(self._vin)
         if data is None:
@@ -565,6 +585,9 @@ class UconnectChargeScheduleSensor(SensorEntity, UconnectEntity):
     @property
     def extra_state_attributes(self) -> dict[str, Any] | None:
         """Return the full schedule data."""
+
+        if (inline := self._inline_schedules) is not None:
+            return {"schedules": inline}
 
         data = self.coordinator.charge_schedule_data.get(self._vin)
         if data is None:

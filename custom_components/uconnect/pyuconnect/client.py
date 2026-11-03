@@ -1667,10 +1667,13 @@ class Client:
             raise ValueError(
                 "the current charge schedules could not be read, nothing was changed"
             )
-        # A change confirmed moments ago that the cloud does not show yet
-        written = self._written_value(
-            vin, "schedules", raw, _ms_timestamp(sg(ev, "timestamp"))
-        )
+        # A change confirmed moments ago that the cloud does not show yet, or
+        # one whose outcome is unknown: the vehicle may still apply it, and
+        # planning from the older list would then write its values back
+        uploaded = _ms_timestamp(sg(ev, "timestamp"))
+        written = self._written_value(vin, "schedules", raw, uploaded)
+        if written is None:
+            written = self._written_value(vin, "schedules_unconfirmed", raw, uploaded)
         if written is not None and len(written) == len(raw):
             raw = written
         if not 0 <= slot < len(raw):
@@ -1687,6 +1690,17 @@ class Client:
                 **{f.name: f.name in changes["days"] for f in fields(ScheduledDays)}
             )
         updated = replace(current, **values)
+
+        # Enabled without a weekday it never starts, yet the write wakes the
+        # vehicle. A slot that was never used has none.
+        if (
+            updated.enable
+            and (not current.enable or "days" in changes)
+            and not any(getattr(updated.days, f.name) for f in fields(ScheduledDays))
+        ):
+            raise ValueError(
+                f"charge schedule {slot + 1} needs at least one weekday to be enabled"
+            )
 
         # A slot that was never used has the type NONE, which the vehicle
         # ignores even when enabled
@@ -1710,7 +1724,13 @@ class Client:
         """
 
         id = self.api.set_charge_schedule_emea(vin, schedules)
-        result = self._poll_correlation_id(vin, id) if verify else id
+        try:
+            result = self._poll_correlation_id(vin, id) if verify else id
+        except Exception:
+            # Sent, but whether the vehicle took it is unknown. Not shown, the
+            # next change is only planned on top of it, see above.
+            self._remember(vin, "schedules_unconfirmed", [dict(x) for x in schedules])
+            raise
 
         # Shown right away, the next status the cloud returns may still be
         # the old one for a while

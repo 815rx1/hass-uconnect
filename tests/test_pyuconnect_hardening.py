@@ -441,7 +441,9 @@ def test_plan_reads_the_current_schedules():
     status["evInfo"]["schedules"][1]["futureKey"] = {"kept": True}
     client = schedule_client(status)
 
-    planned = client.plan_charge_schedule_emea(VIN, 1, {"enable": True, "start_time": "02:00"})
+    planned = client.plan_charge_schedule_emea(
+        VIN, 1, {"enable": True, "start_time": "02:00", "days": ["monday"]}
+    )
 
     assert len(planned) == 3
     assert planned[1]["enableScheduleType"] is True
@@ -477,6 +479,25 @@ def test_plan_refuses_without_current_schedules():
         client.plan_charge_schedule_emea(VIN, 5, {"enable": True})
 
 
+def test_slot_without_weekdays_is_not_enabled():
+    # It would never start, yet the write wakes the vehicle
+    client = schedule_client(load_fixture("status_500e.json"))
+    with pytest.raises(ValueError, match="weekday"):
+        client.plan_charge_schedule_emea(VIN, 1, {"enable": True})
+    with pytest.raises(ValueError, match="weekday"):
+        client.plan_charge_schedule_emea(VIN, 0, {"days": []})
+
+    # With one it is, and an enabled slot keeps its other changes
+    planned = client.plan_charge_schedule_emea(
+        VIN, 1, {"enable": True, "days": ["saturday"]}
+    )
+    assert planned[1]["enableScheduleType"] is True
+    assert planned[1]["scheduledDays"]["saturday"] is True
+    assert client.plan_charge_schedule_emea(VIN, 0, {"start_time": "02:00"})
+    # Turned off, the days do not matter
+    assert client.plan_charge_schedule_emea(VIN, 0, {"enable": False, "days": []})
+
+
 def test_disabling_keeps_the_schedule_type():
     client = schedule_client(load_fixture("status_500e.json"))
     planned = client.plan_charge_schedule_emea(VIN, 0, {"enable": False})
@@ -489,7 +510,7 @@ def test_sent_schedules_are_shown_right_away():
     client.refresh()
     client.api.set_charge_schedule_emea.return_value = "corr"
     planned = schedule_client(load_fixture("status_500e.json")).plan_charge_schedule_emea(
-        VIN, 2, {"enable": True}
+        VIN, 2, {"enable": True, "days": ["sunday"]}
     )
 
     with patch.object(client, "_poll_correlation_id", return_value=True):
@@ -1856,6 +1877,26 @@ def test_confirmed_schedule_change_is_kept_while_the_cloud_lags():
 
         # The next change builds on the first, it does not undo it
         plan = client.plan_charge_schedule_emea(VIN, 0, {"end_time": "06:30"})
+    assert (plan[0]["startTime"], plan[0]["endTime"]) == ("02:30", "06:30")
+
+
+def test_schedule_change_with_unknown_outcome_is_planned_on():
+    client, _ = lagging_client()
+    with patch.object(
+        client,
+        "_poll_correlation_id",
+        side_effect=Exception("unable to obtain execution status: timed out"),
+    ):
+        plan = client.plan_charge_schedule_emea(VIN, 0, {"start_time": "02:30"})
+        with pytest.raises(Exception, match="timed out"):
+            client.send_charge_schedules_emea(VIN, plan)
+
+    # Not shown, it may not have reached the vehicle
+    client.refresh()
+    assert client.vehicles[VIN].charge_schedules[0].start_time == "01:00"
+    # But the vehicle may still apply it, so the next change does not write
+    # the old start back
+    plan = client.plan_charge_schedule_emea(VIN, 0, {"end_time": "06:30"})
     assert (plan[0]["startTime"], plan[0]["endTime"]) == ("02:30", "06:30")
 
 

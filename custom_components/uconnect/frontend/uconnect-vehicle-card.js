@@ -579,7 +579,13 @@ class UconnectVehicleCard extends HTMLElement {
   }
 
   _setHtml(el, html) {
-    if (el && el.innerHTML !== html) el.innerHTML = html;
+    // Compared with what was written last: the DOM gives quotes back
+    // unescaped, so a text with one would never match and be rebuilt on
+    // every update. Written over in between, as the map does, it is set again.
+    if (!el || (el._html === html && el.innerHTML === el._htmlRendered)) return;
+    el.innerHTML = html;
+    el._html = html;
+    el._htmlRendered = el.innerHTML;
   }
 
   _render() {
@@ -628,20 +634,31 @@ class UconnectVehicleCard extends HTMLElement {
     //   off = locked/closed (secure), on = unlocked/open (not secure)
     // Sensors without a usable state (e.g. rear doors of a two-door car, which
     // the vehicle reports as not available) are left out. With none left the
-    // state is unknown, which must not show as unlocked or open.
-    const secureStates = (keys) => keys
-      .map((key) => read(key))
-      .filter((s) => hasUsableState(s))
-      .map((s) => !isOnState(s));
+    // state is unknown, which must not show as unlocked or open. A sensor
+    // with no state at all, as when it is disabled, may be the open one, so
+    // then only an open one is certain.
+    const secureStates = (keys) => ({
+      states: keys
+        .map((key) => read(key))
+        .filter((s) => hasUsableState(s))
+        .map((s) => !isOnState(s)),
+      missing: keys.some((key) => entities[key] && !read(key)),
+    });
 
-    const doorStates = secureStates(["door_driver", "door_passenger", "door_rear_left", "door_rear_right"]);
-    const doorsKnown = doorStates.length > 0;
-    const allDoorsLocked = doorsKnown && doorStates.every(Boolean);
+    // The doors lock takes in every door the vehicle reports, also those
+    // without a sensor here
+    const doorsLock = read("doors_lock");
+    const doors = hasUsableState(doorsLock)
+      ? { states: [normalizeState(doorsLock) === "locked"], missing: false }
+      : secureStates(["door_driver", "door_passenger", "door_rear_left", "door_rear_right"]);
+    const doorStates = doors.states;
+    const anyDoorUnlocked = doorStates.some((locked) => !locked);
+    const allDoorsLocked = doorStates.length > 0 && !doors.missing && !anyDoorUnlocked;
     const anyDoorEntity = entities.door_driver || entities.door_passenger || "";
 
-    const windowStates = secureStates(["window_driver", "window_passenger"]);
-    const windowsKnown = windowStates.length > 0;
-    const allWindowsClosed = windowsKnown && windowStates.every(Boolean);
+    const windows = secureStates(["window_driver", "window_passenger"]);
+    const windowStates = windows.states;
+    const allWindowsClosed = windowStates.length > 0 && !windows.missing && windowStates.every(Boolean);
     const openWindows = windowStates.filter((closed) => !closed).length;
     const windowEntity = entities.window_driver || entities.window_passenger || "";
 
@@ -677,16 +694,19 @@ class UconnectVehicleCard extends HTMLElement {
     const rangeState = hasRange ? read("range") : hasRangeTotal ? read("range_total") : null;
     const rangeEntity = hasRange ? (entities.range || "") : hasRangeTotal ? (entities.range_total || "") : "";
     const rangeText = rangeState ? formatState(rangeState, hass) : "\u2014";
-    const rangeIcon = hasSoc ? "mdi:arrow-left-right" : "mdi:gas-station";
+    // Taken from the entities there are, an EV whose state of charge is
+    // unknown for a moment is no combustion car
+    const isEv = Boolean(entities.soc) || !entities.fuel;
+    const rangeIcon = isEv ? "mdi:arrow-left-right" : "mdi:gas-station";
 
     // Indicators
     if (showIndicators) {
       const indicatorItems = [
         {
           icon: "mdi:car-door-lock",
-          stateClass: allDoorsLocked ? "ok" : doorsKnown ? "alert" : "",
+          stateClass: allDoorsLocked ? "ok" : anyDoorUnlocked ? "alert" : "",
           entity: anyDoorEntity,
-          title: allDoorsLocked ? "Doors: Locked" : doorsKnown ? "Doors: Unlocked" : "Doors: Unknown",
+          title: allDoorsLocked ? "Doors: Locked" : anyDoorUnlocked ? "Doors: Unlocked" : "Doors: Unknown",
         },
         {
           icon: allWindowsClosed ? "mdi:car-windshield" : "mdi:car-windshield-outline",
@@ -694,7 +714,7 @@ class UconnectVehicleCard extends HTMLElement {
           entity: windowEntity,
           title: allWindowsClosed
             ? "Windows: Closed"
-            : windowsKnown ? `Windows: ${openWindows} open` : "Windows: Unknown",
+            : openWindows > 0 ? `Windows: ${openWindows} open` : "Windows: Unknown",
         },
         {
           icon: "mdi:lock",
@@ -782,7 +802,8 @@ class UconnectVehicleCard extends HTMLElement {
 
     // Quick info buttons
     if (showButtons) {
-      // Tire status: use pressure values if available, fall back to warning sensors
+      // Tire status: use pressure values if available, fall back to warning
+      // sensors. A warning of the vehicle itself always counts.
       const tireKeys = ["tire_fl", "tire_fr", "tire_rl", "tire_rr"];
       const tireWarnKeys = ["tire_fl_warn", "tire_fr_warn", "tire_rl_warn", "tire_rr_warn"];
       const tireLabels = { tire_fl: "FL", tire_fr: "FR", tire_rl: "RL", tire_rr: "RR",
@@ -796,6 +817,10 @@ class UconnectVehicleCard extends HTMLElement {
         })
         .filter((t) => t.value > 0);
       const hasPressureData = tireEntries.length > 0;
+      const warnEntries = tireWarnKeys
+        .map((key) => ({ key, obj: read(key) }))
+        .filter((t) => hasUsableState(t.obj));
+      const failingTire = warnEntries.find((t) => isOnState(t.obj));
 
       let tireAlert = false;
       let tireValue = "\u2014";
@@ -803,9 +828,16 @@ class UconnectVehicleCard extends HTMLElement {
       let tireEntity = entities.tire_fl || entities.tire_fr
         || entities.tire_fl_warn || entities.tire_fr_warn || "";
 
-      if (hasPressureData) {
+      const formatPressure = (v) => v >= 100 ? v.toFixed(0) : v >= 10 ? v.toFixed(1) : v.toFixed(2);
+      if (failingTire) {
+        const tireKey = failingTire.key.replace("_warn", "");
+        const pressure = tireEntries.find((t) => t.key === tireKey);
+        tireAlert = true;
+        tireLabel = `Tire ${tireLabels[failingTire.key]}`;
+        tireValue = pressure ? `${formatPressure(pressure.value)} ${pressure.unit}`.trim() : "Warning";
+        tireEntity = entities[failingTire.key] || "";
+      } else if (hasPressureData) {
         // Pressure sensors available: show average, alert on low tire
-        const formatPressure = (v) => v >= 100 ? v.toFixed(0) : v >= 10 ? v.toFixed(1) : v.toFixed(2);
         const tireAvg = tireEntries.reduce((a, b) => a + b.value, 0) / tireEntries.length;
         const lowTire = tireEntries.length >= 2
           ? tireEntries.find((t) => t.value < tireAvg * 0.8)
@@ -816,23 +848,10 @@ class UconnectVehicleCard extends HTMLElement {
           : `${formatPressure(tireAvg)} ${tireEntries[0]?.unit || ""}`.trim();
         tireLabel = tireAlert ? `Tire ${tireLabels[lowTire.key]}` : "Tires";
         tireEntity = tireAlert ? (entities[lowTire.key] || "") : tireEntity;
-      } else {
-        // No pressure data: use warning binary sensors (on = problem)
-        const warnEntries = tireWarnKeys
-          .map((key) => ({ key, obj: read(key) }))
-          .filter((t) => hasUsableState(t.obj));
-        if (warnEntries.length > 0) {
-          const failingTire = warnEntries.find((t) => isOnState(t.obj));
-          if (failingTire) {
-            tireAlert = true;
-            tireLabel = `Tire ${tireLabels[failingTire.key]}`;
-            tireValue = "Warning";
-            tireEntity = entities[failingTire.key] || "";
-          } else {
-            tireValue = "OK";
-            tireEntity = entities[warnEntries[0].key] || "";
-          }
-        }
+      } else if (warnEntries.length > 0) {
+        // No pressure data: the warning binary sensors (on = problem) say OK
+        tireValue = "OK";
+        tireEntity = entities[warnEntries[0].key] || "";
       }
 
       const quickItems = [
@@ -844,7 +863,7 @@ class UconnectVehicleCard extends HTMLElement {
         },
         {
           icon: rangeIcon,
-          label: hasSoc ? "Range" : "Fuel Range",
+          label: isEv ? "Range" : "Fuel Range",
           value: rangeText,
           entity: rangeEntity,
         },

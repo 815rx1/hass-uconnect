@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import voluptuous as vol
 
 from homeassistant.config_entries import ConfigEntryState
@@ -120,9 +122,15 @@ SERVICES_COMMANDS: dict[str, Command] = {
 }
 
 
+_LOGGER = logging.getLogger(__name__)
+
 DEVICE_SCHEMA = vol.Schema({vol.Optional(ATTR_DEVICE_ID): cv.string})
 
 COMMAND_SCHEMA = DEVICE_SCHEMA
+
+# Upstream 1.0.x takes a temperature, which this version cannot send. Taken
+# and left out, so an automation made there still starts the climate.
+HVAC_ON_SCHEMA = DEVICE_SCHEMA.extend({vol.Optional("temperature"): vol.Coerce(float)})
 
 # Unlocking takes the Uconnect PIN as its code, see the coordinator
 UNLOCK_SCHEMA = DEVICE_SCHEMA.extend({vol.Optional("code"): cv.string})
@@ -168,6 +176,10 @@ def async_setup_services(hass: HomeAssistant) -> None:
             raise ServiceValidationError(
                 f"Action {call.service} is not supported by vehicle {vin}"
             )
+        if "temperature" in call.data:
+            _LOGGER.warning(
+                "%s cannot set a temperature, it is sent without", call.service
+            )
         await coordinator.async_command(vin, cmd, code=call.data.get("code"))
 
     async def async_set_charge_schedule(call: ServiceCall) -> None:
@@ -203,12 +215,13 @@ def async_setup_services(hass: HomeAssistant) -> None:
         )
 
     for service in SUPPORTED_SERVICES:
-        hass.services.async_register(
-            DOMAIN,
-            service,
-            async_call_command,
-            schema=UNLOCK_SCHEMA if service in UNLOCK_SERVICES else COMMAND_SCHEMA,
-        )
+        if service in UNLOCK_SERVICES:
+            schema = UNLOCK_SCHEMA
+        elif service == SERVICE_HVAC_ON:
+            schema = HVAC_ON_SCHEMA
+        else:
+            schema = COMMAND_SCHEMA
+        hass.services.async_register(DOMAIN, service, async_call_command, schema=schema)
     hass.services.async_register(
         DOMAIN,
         SERVICE_SET_CHARGE_SCHEDULE,

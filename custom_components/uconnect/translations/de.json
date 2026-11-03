@@ -365,7 +365,20 @@
             }
         }
     },
+    "entity": {
+        "select": {
+            "charge_schedule": {
+                "state": {
+                    "on": "An",
+                    "off": "Aus"
+                }
+            }
+        }
+    },
     "exceptions": {
+        "unsupported_brand": {
+            "message": "Marke und Region {brand} werden von dieser Version der Integration nicht unterstützt. Die Konfiguration bleibt erhalten und funktioniert wieder mit einer Version, die sie unterstützt."
+        },
         "refresh_needs_plug": {
             "message": "Deep Refresh geht nur, solange das Auto eingesteckt ist. Die Cloud hat ihn abgelehnt, das Auto wurde nicht geweckt."
         },

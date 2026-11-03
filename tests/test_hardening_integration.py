@@ -970,3 +970,121 @@ async def test_sensors_of_states_unknown_at_setup_are_created(
     )
     assert door is not None
     assert hass.states.get(door).state == "unknown"
+
+
+async def test_unknown_states_show_no_closed_icon(hass, config_entry, mock_client, vehicle):
+    from homeassistant.helpers import entity_registry as er
+
+    # Unknown since the vehicle was switched off without reporting them again
+    vehicle.window_driver_closed = None
+    vehicle.ev_running = None
+    mock_client.reported_parts.return_value = {"window_driver_closed", "ev_running"}
+    config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    registry = er.async_get(hass)
+    for key in ("window_driver_closed", "ev_running"):
+        state = hass.states.get(
+            registry.async_get_entity_id("binary_sensor", DOMAIN, f"{DOMAIN}_{VIN}_{key}")
+        )
+        assert (state.state, state.attributes["icon"]) == (
+            "unknown", "mdi:help-circle-outline"
+        )
+
+
+async def test_hvac_active_sensor_as_in_upstream(hass, config_entry, mock_client, vehicle):
+    from homeassistant.helpers import entity_registry as er
+
+    vehicle.hvac_on = True
+    config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    # The unique ID of upstream 1.0.x, so the entity carries over
+    hvac = er.async_get(hass).async_get_entity_id(
+        "binary_sensor", DOMAIN, f"{DOMAIN}_{VIN}_hvac_on"
+    )
+    state = hass.states.get(hvac)
+    assert (state.state, state.attributes["icon"]) == ("on", "mdi:hvac")
+    assert state.attributes["device_class"] == "running"
+
+
+async def test_stolen_vehicle_status_reads_flags(hass, config_entry, mock_client):
+    from homeassistant.helpers import entity_registry as er
+
+    mock_client.get_stolen_vehicle_status.return_value = {
+        "svlaStatus": "false",
+        "activationTimestamp": "0",
+    }
+    config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    svla = er.async_get(hass).async_get_entity_id(
+        "binary_sensor", DOMAIN, f"{DOMAIN}_{VIN}_svla"
+    )
+    coordinator = config_entry.runtime_data
+
+    async def state():
+        await coordinator.async_refresh()
+        await hass.async_block_till_done()
+        return hass.states.get(svla)
+
+    # A string flag is no theft report, a string time no error
+    assert hass.states.get(svla).state == "off"
+    assert "activation_timestamp" not in hass.states.get(svla).attributes
+
+    mock_client.get_stolen_vehicle_status.return_value = {
+        "svlaStatus": True,
+        "activationTimestamp": 1760000000000,
+    }
+    current = await state()
+    assert current.state == "on" and "activation_timestamp" in current.attributes
+
+    mock_client.get_stolen_vehicle_status.return_value = {"svlaStatus": "maybe"}
+    assert (await state()).state == "unknown"
+
+    # Reads failing: no longer shown as current
+    mock_client.get_stolen_vehicle_status.return_value = {"svlaStatus": False}
+    assert (await state()).state == "off"
+    mock_client.get_stolen_vehicle_status.side_effect = Exception("HTTP 500")
+    assert (await state()).state == "unknown"
+
+
+async def test_charge_schedule_sensor_of_an_emea_vehicle(
+    hass, config_entry, mock_client, vehicle
+):
+    from homeassistant.helpers import entity_registry as er
+
+    # Created by upstream 1.0.x from the schedules reported inline
+    config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    sensor = er.async_get(hass).async_get_entity_id(
+        "sensor", DOMAIN, f"{DOMAIN}_{VIN}_charge_schedule"
+    )
+    state = hass.states.get(sensor)
+    assert state.state == str(len(vehicle.charge_schedules))
+    assert state.attributes["schedules"] == [
+        schedule.to_api() for schedule in vehicle.charge_schedules
+    ]
+
+
+async def test_entry_of_an_unknown_brand_says_why(hass, mock_client):
+    # Upstream's LATAM brands, which this version does not know
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="FIAT_LATAM user@example.com",
+        unique_id="latam",
+        data={"username": "user@example.com", "password": "secret", "brand_region": 19},
+    )
+    entry.add_to_hass(hass)
+    assert not await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert entry.state is ConfigEntryState.SETUP_ERROR
+    assert entry.error_reason_translation_key == "unsupported_brand"
+    # Kept for a version that knows the brand
+    assert entry.data["brand_region"] == 19
