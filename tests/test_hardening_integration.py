@@ -500,7 +500,12 @@ async def test_reload_waits_for_a_command_still_running(
     started = asyncio.Event()
     confirm = asyncio.Event()
 
-    async def slow(func, *args, on_request=False):
+    coordinator = config_entry.runtime_data
+    run = coordinator._async_run_locked
+
+    async def slow(func, *args, **kwargs):
+        if func is not mock_client.command_verify:
+            return await run(func, *args, **kwargs)
         started.set()
         await confirm.wait()
         mock_client.confirmed_states.return_value = confirmed
@@ -510,7 +515,7 @@ async def test_reload_waits_for_a_command_still_running(
     mock_client.restore_confirmed_states.side_effect = lambda states: restored.append(
         json.loads(json.dumps(states))
     )
-    with patch.object(config_entry.runtime_data, "async_run", side_effect=slow):
+    with patch.object(coordinator, "_async_run_locked", side_effect=slow):
         action = hass.async_create_task(
             hass.services.async_call(DOMAIN, "doors_lock", {}, blocking=True)
         )

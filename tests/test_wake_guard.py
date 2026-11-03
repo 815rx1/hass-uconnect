@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from time import monotonic
+from unittest.mock import patch
 
 import pytest
 from homeassistant.util import dt as dt_util
@@ -13,6 +15,7 @@ from custom_components.uconnect.wake_guard import (
     AUTO_REFRESH_MAX_PER_DAY,
     AUTO_REFRESH_MAX_WITHOUT_PROGRESS,
     AUTO_REFRESH_MIN_SPACING,
+    HISTORY_WINDOW,
     MANUAL_MAX_PER_DAY,
     MANUAL_MAX_PER_HOUR,
     MANUAL_REFRESH_COOLDOWN,
@@ -24,6 +27,7 @@ from custom_components.uconnect.wake_guard import (
     Blocked,
     Decision,
     WakeGuard,
+    WakeRecord,
 )
 
 VIN = "ZFAEFAC39MX000001"
@@ -36,12 +40,11 @@ def at(minutes: float) -> datetime:
     return T0 + timedelta(minutes=minutes)
 
 
-async def new_guard(hass, started: datetime | None = None) -> WakeGuard:
+async def new_guard(hass) -> WakeGuard:
     guard = WakeGuard(hass)
     await guard.async_load()
-    # Started well before the moments the tests use, unless a test is about
-    # the start itself
-    guard._started = started or T0 - timedelta(days=1)
+    # Started a day ago, unless a test is about the start itself
+    guard._started = monotonic() - timedelta(days=1).total_seconds()
     return guard
 
 
@@ -71,13 +74,32 @@ async def test_without_interval_only_the_start_refresh(hass):
 
 
 async def test_startup_grace(hass):
-    guard = await new_guard(hass, started=at(0))
-    guard.charging_started(VIN, at(0))
+    clock = [1000.0]
+    with patch("custom_components.uconnect.wake_guard.monotonic", lambda: clock[0]):
+        guard = WakeGuard(hass)
+        await guard.async_load()
+        guard.charging_started(VIN, at(0))
 
-    decision = begin(guard, 3)
-    assert decision.decision is Decision.WAIT
-    assert decision.wait == STARTUP_GRACE - timedelta(minutes=3)
-    assert begin(guard, 15).decision is Decision.ALLOWED
+        clock[0] += 180
+        decision = begin(guard, 3)
+        assert decision.decision is Decision.WAIT
+        assert decision.wait == STARTUP_GRACE - timedelta(minutes=3)
+        clock[0] += 720
+        assert begin(guard, 15).decision is Decision.ALLOWED
+
+
+async def test_startup_grace_survives_a_clock_step(hass):
+    # Booted with a clock two hours behind, which NTP then corrected
+    clock = [1000.0]
+    with patch("custom_components.uconnect.wake_guard.monotonic", lambda: clock[0]):
+        guard = WakeGuard(hass)
+        await guard.async_load()
+        guard.charging_started(VIN, at(0))
+
+        clock[0] += 60
+        decision = begin(guard, 121)
+        assert decision.decision is Decision.WAIT
+        assert decision.wait == STARTUP_GRACE - timedelta(minutes=1)
 
 
 async def test_spacing_after_any_command(hass):
@@ -229,15 +251,25 @@ async def test_repeated_confirmed_command(hass):
     # Not confirmed yet, a retry is fine
     guard.check_manual_command(VIN, "RDU", at(0.5))
 
-    guard.command_confirmed(record)
+    guard.command_confirmed(record, at(0.1))
     with pytest.raises(AlreadyDone):
         guard.check_manual_command(VIN, "RDU", at(0.5))
     # The same one a minute later goes out
-    guard.check_manual_command(VIN, "RDU", at(1.1))
+    guard.check_manual_command(VIN, "RDU", at(1.2))
 
     # So does it after the opposite was sent in between
-    guard.command_confirmed(guard.record_command(VIN, "RDL", at(0.6)))
+    guard.command_confirmed(guard.record_command(VIN, "RDL", at(0.6)), at(0.6))
     guard.check_manual_command(VIN, "RDU", at(0.7))
+
+
+async def test_repeat_counts_from_a_slow_confirmation(hass):
+    guard = await new_guard(hass)
+    record = guard.record_command(VIN, "ROPRECOND", at(0))
+    # The vehicle took more than a minute to confirm it
+    guard.command_confirmed(record, at(1.1))
+    with pytest.raises(AlreadyDone):
+        guard.check_manual_command(VIN, "ROPRECOND", at(1.2))
+    guard.check_manual_command(VIN, "ROPRECOND", at(2.2))
 
 
 async def test_locking_and_switching_off_always_go_out(hass):
@@ -285,6 +317,32 @@ async def test_locking_again_and_again_is_a_loop(hass):
     with pytest.raises(Blocked) as err:
         guard.check_manual_command(VIN, "RDL", at(MANUAL_MAX_PER_HOUR))
     assert err.value.key == "hourly_limit"
+
+
+async def test_lock_retried_all_night_still_goes_out(hass):
+    # An automation retried the lock every 5 minutes without reception
+    guard = await new_guard(hass)
+    for i in range(MANUAL_MAX_PER_DAY):
+        guard.check_manual_command(VIN, "RDL", at(i * 5))
+        guard.record_command(VIN, "RDL", at(i * 5))
+
+    # The next morning the hourly limit is long over, and so is the block
+    guard.check_manual_command(VIN, "RDL", at(12 * 60))
+
+
+async def test_securing_commands_taking_turns_are_a_loop(hass):
+    guard = await new_guard(hass)
+    for i in range(MANUAL_MAX_PER_HOUR):
+        command = ("ROPRECOND_OFF", "ROHVACOFF")[i % 2]
+        guard.check_manual_command(VIN, command, at(i))
+        guard.record_command(VIN, command, at(i))
+
+    with pytest.raises(Blocked) as err:
+        guard.check_manual_command(VIN, "ROPRECOND_OFF", at(MANUAL_MAX_PER_HOUR))
+    assert err.value.key == "hourly_limit"
+    # Switching off after switching on still goes out
+    guard.record_command(VIN, "ROPRECOND", at(MANUAL_MAX_PER_HOUR))
+    guard.check_manual_command(VIN, "ROPRECOND_OFF", at(MANUAL_MAX_PER_HOUR + 0.5))
 
 
 async def test_lock_repeated_today_is_not_held_by_other_commands(hass):
@@ -353,6 +411,39 @@ async def test_clock_jumps(hass):
     assert begin(guard, 80).decision is Decision.ALLOWED
 
 
+async def test_a_long_day_keeps_its_history(hass):
+    guard = await new_guard(hass)
+    guard._vehicle(VIN, at(0)).wakes.extend(
+        WakeRecord(at(i), "DEEPREFRESH", True) for i in range(AUTO_REFRESH_MAX_PER_DAY)
+    )
+    # A loop of locks, as many as the hourly limit lets through in a day
+    for i in range(600):
+        guard.record_command(VIN, "RDL", at(100 + i))
+
+    assert guard.auto_refreshes_last_day(VIN, at(800)) == AUTO_REFRESH_MAX_PER_DAY
+
+
+async def test_clock_behind_keeps_the_history(hass, hass_storage):
+    clock = [1000.0]
+    with patch("custom_components.uconnect.wake_guard.monotonic", lambda: clock[0]):
+        guard = await new_guard(hass)
+        guard.record_command(VIN, "RDL", at(0))
+
+        # Booted with a clock days behind: ignored, but neither lost
+        early = at(-3 * 24 * 60)
+        assert guard.last_wake(VIN, early) is None
+        await guard.async_flush()
+        assert hass_storage[STORAGE_KEY]["data"]["vehicles"][VIN]["wakes"]
+        # and back once the clock is corrected
+        assert guard.last_wake(VIN, at(1)) == at(0)
+
+        # A clock behind them for a whole day means they were dated wrong
+        assert guard.last_wake(VIN, early) is None
+        clock[0] += HISTORY_WINDOW.total_seconds()
+        assert guard.last_wake(VIN, early) is None
+        assert guard.last_wake(VIN, at(1)) is None
+
+
 async def test_damaged_storage_is_ignored(hass, hass_storage):
     hass_storage[STORAGE_KEY] = {
         "version": 1,
@@ -366,6 +457,7 @@ async def test_damaged_storage_is_ignored(hass, hass_storage):
                     "session": {"auto_refreshes": -3, "without_progress": "x"},
                 },
                 "junk": "x",
+                "ZFAEFAC39MX000002": {"wakes": 5},
             },
         },
     }

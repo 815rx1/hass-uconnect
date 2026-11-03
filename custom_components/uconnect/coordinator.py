@@ -809,12 +809,17 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
         self._check_can_send(vin)
         async with self._action_running():
             record = None
-            if not automatic:
-                if (record := await self._async_record_manual(vin, command)) is None:
-                    return
-
             try:
-                result = await self.async_run(func, *args, on_request=not automatic)
+                # Checked once the client is free: the same command sent just
+                # before is confirmed by then, and this one is not sent again
+                async with self._client_lock:
+                    if not automatic:
+                        record = await self._async_record_manual(vin, command)
+                        if record is None:
+                            return
+                    result = await self._async_run_locked(
+                        func, *args, on_request=not automatic
+                    )
             except HomeAssistantError:
                 raise
             except PinRejectedError as err:

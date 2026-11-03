@@ -13,7 +13,9 @@ around it:
   Home Assistant instance, so they share one schedule
 - the clock jumping, e.g. a Raspberry Pi without real-time clock booting with
   an old time: a wake-up dated in the future counts as just now, and one dated
-  more than a day ahead is discarded so it cannot block refreshes for good
+  more than a day ahead is set aside so it cannot block refreshes for good. It
+  is only discarded once the clock stayed behind it for a day: the clock of a
+  boot is corrected long before, and the history must not be lost to it
 
 Commands sent on request are recorded too. They are never held back for
 timing, only repeated and runaway ones are: a refresh right after another, or
@@ -29,6 +31,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 import logging
+from time import monotonic
 from typing import Any
 
 from homeassistant.core import HomeAssistant, callback
@@ -104,7 +107,9 @@ STATE_COMMANDS = frozenset(COMMAND_GROUPS)
 # Commands that leave the vehicle locked or switched off. They are never held
 # back as a repeat, since the state shown may be out of date and a vehicle left
 # unlocked or running is worse than one more wake-up, and the hourly limit only
-# holds them back when they repeat themselves, as a loop would.
+# holds them back when they repeat themselves, as a loop would. The daily limit
+# never does: a loop retrying a lock all night, e.g. without reception, must
+# not hold back the lock the next morning.
 SECURING_COMMANDS = frozenset(
     {
         "RDL",
@@ -125,8 +130,10 @@ MANUAL_MAX_PER_DAY = 100
 HISTORY_WINDOW = timedelta(hours=24)
 # Timestamps further ahead than this can only come from a wrong clock
 FUTURE_TOLERANCE = timedelta(days=1)
-# Only bounds the file: the daily limits keep a day's history well below it
-MAX_HISTORY = 500
+# Only bounds the file, above what the limits let through within a day: 30 an
+# hour of the securing commands of each group, 100 others and the automatic
+# refreshes. Cutting a day's history short would reset those limits.
+MAX_HISTORY = 5000
 
 
 class Decision(Enum):
@@ -166,6 +173,7 @@ class WakeRecord:
     automatic: bool
     # Set once the vehicle confirmed the command
     confirmed: bool = False
+    confirmed_at: datetime | None = None
 
 
 @dataclass
@@ -193,6 +201,10 @@ class ChargeSession:
 class VehicleWakes:
     wakes: list[WakeRecord] = field(default_factory=list)
     session: ChargeSession = field(default_factory=ChargeSession)
+    # Wake-ups dated more than a day ahead, and since when on the monotonic
+    # clock they are, see _vehicle
+    ahead: list[WakeRecord] = field(default_factory=list)
+    ahead_since: float | None = None
 
 
 def _utcnow() -> datetime:
@@ -245,7 +257,9 @@ class WakeGuard:
         # One-time changes already applied, kept with the history because
         # they also serve keeping the vehicle from being commanded by accident
         self._migrations: set[str] = set()
-        self._started = _utcnow()
+        # Monotonic, so a clock stepped forward after the boot does not end
+        # the startup grace at once
+        self._started = monotonic()
 
     async def async_load(self) -> None:
         """Load the history saved by earlier runs."""
@@ -267,7 +281,8 @@ class WakeGuard:
             if not isinstance(vin, str) or not isinstance(raw, dict):
                 continue
             entry = VehicleWakes()
-            for item in raw.get("wakes") or []:
+            wakes = raw.get("wakes")
+            for item in wakes if isinstance(wakes, list) else []:
                 if not isinstance(item, dict) or (at := _parse(item.get("at"))) is None:
                     continue
                 entry.wakes.append(
@@ -276,6 +291,7 @@ class WakeGuard:
                         command=str(item.get("command") or ""),
                         automatic=bool(item.get("automatic")),
                         confirmed=bool(item.get("confirmed")),
+                        confirmed_at=_parse(item.get("confirmed_at")),
                     )
                 )
             session = raw.get("session")
@@ -305,8 +321,9 @@ class WakeGuard:
                             "command": w.command,
                             "automatic": w.automatic,
                             "confirmed": w.confirmed,
+                            "confirmed_at": _iso(w.confirmed_at),
                         }
-                        for w in entry.wakes
+                        for w in sorted(entry.wakes + entry.ahead, key=lambda w: w.at)
                     ],
                     "session": {
                         "started": _iso(entry.session.started),
@@ -340,15 +357,32 @@ class WakeGuard:
     def _vehicle(self, vin: str, now: datetime) -> VehicleWakes:
         entry = self._vehicles.setdefault(vin, VehicleWakes())
         limit = now + FUTURE_TOLERANCE
-        future = [w for w in entry.wakes if w.at > limit]
-        if future:
+        records = entry.wakes + entry.ahead
+        # Set aside rather than dropped: the clock may be the one that is
+        # wrong, and once it is corrected they count again
+        ahead = [w for w in records if w.at > limit]
+        if not ahead:
+            entry.ahead_since = None
+        elif entry.ahead_since is None:
+            entry.ahead_since = monotonic()
             _LOGGER.warning(
                 "Ignoring %d wake-ups of %s dated more than a day ahead, "
                 "the clock was probably wrong",
-                len(future),
+                len(ahead),
                 vin,
             )
-        valid = [w for w in entry.wakes if w.at <= limit]
+        elif monotonic() - entry.ahead_since >= HISTORY_WINDOW.total_seconds():
+            # The clock stayed behind them for a day, they were dated wrong
+            _LOGGER.warning(
+                "Dropping %d wake-ups of %s dated more than a day ahead",
+                len(ahead),
+                vin,
+            )
+            ahead = []
+            entry.ahead_since = None
+            self._save()
+        entry.ahead = sorted(ahead, key=lambda w: w.at)
+        valid = [w for w in records if w.at <= limit]
         kept = [w for w in valid if _age(now, w.at) < HISTORY_WINDOW]
         # The latest one is kept beyond the window, it still dates the last
         # wake-up
@@ -447,25 +481,35 @@ class WakeGuard:
             None,
         )
 
+        # Measured from the confirmation, which itself can take a minute
         if (
             command not in SECURING_COMMANDS
             and last_of_group is not None
             and last_of_group.command == command
             and last_of_group.confirmed
-            and now - last_of_group.at < REPEAT_WINDOW
+            and timedelta(0)
+            <= (since := now - (last_of_group.confirmed_at or last_of_group.at))
+            < REPEAT_WINDOW
         ):
             raise AlreadyDone(
                 f"{command} was confirmed by the vehicle "
-                f"{int((now - last_of_group.at).total_seconds())} s ago"
+                f"{int(since.total_seconds())} s ago"
             )
 
         # Locking after unlocking, or switching off what was switched on,
         # always goes out. Repeated, only its own repeats count towards the
-        # loop limits: other commands must never use up the budget of a lock
+        # loop limits: other commands must never use up the budget of a lock.
+        # Those of one group count together, or two climate offs taking turns
+        # would never be limited.
         if command in SECURING_COMMANDS:
-            if last_of_group is None or last_of_group.command != command:
+            if last_of_group is None or last_of_group.command not in SECURING_COMMANDS:
                 return
-            counted = [w for w in wakes if w.command == command]
+            counted = [
+                w
+                for w in wakes
+                if w.command in SECURING_COMMANDS
+                and COMMAND_GROUPS.get(w.command) == group
+            ]
         else:
             counted = wakes
 
@@ -484,6 +528,8 @@ class WakeGuard:
                 wait,
             )
 
+        if command in SECURING_COMMANDS:
+            return
         last_day = [
             w for w in counted if not w.automatic and _age(now, w.at) < HISTORY_WINDOW
         ]
@@ -509,8 +555,11 @@ class WakeGuard:
         return record
 
     @callback
-    def command_confirmed(self, record: WakeRecord) -> None:
+    def command_confirmed(
+        self, record: WakeRecord, now: datetime | None = None
+    ) -> None:
         record.confirmed = True
+        record.confirmed_at = now or _utcnow()
         self._save()
 
     @callback
@@ -591,7 +640,8 @@ class WakeGuard:
                 ),
             )
 
-        if (since_start := now - self._started) < STARTUP_GRACE:
+        since_start = timedelta(seconds=monotonic() - self._started)
+        if since_start < STARTUP_GRACE:
             return AutoRefreshDecision(
                 Decision.WAIT,
                 wait=STARTUP_GRACE - max(since_start, timedelta(0)),

@@ -79,8 +79,9 @@ BUTTON_DESCRIPTIONS: Final[tuple[UconnectButtonEntityDescription, ...]] = (
 )
 
 
-# Commands go to one vehicle at a time
-PARALLEL_UPDATES = 1
+# The coordinator sends one command at a time. Holding the platform for the
+# whole call, refresh included, would keep a lock or switch-off waiting.
+PARALLEL_UPDATES = 0
 
 
 async def async_setup_entry(

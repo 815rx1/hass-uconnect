@@ -1478,8 +1478,10 @@ class Client:
                 status_failed = True
 
             # The notifications are only needed when the status endpoint does
-            # not work, but are checked now and then in case it never reports
-            if status_failed or attempt % 3 == 0:
+            # not work, but are checked now and then in case it never reports.
+            # Not once a slow status call used up the time: each request can
+            # take 40 s, while a lock waiting to go out waits for the client.
+            if (status_failed or attempt % 3 == 0) and monotonic() < deadline:
                 try:
                     r = self._get_commands_statuses(vin)
                 except LoginError as err:

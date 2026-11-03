@@ -391,6 +391,28 @@ def test_poll_ends_on_the_monotonic_clock():
     assert client.api.get_remote_operation_status.call_count == 1
 
 
+def test_poll_sends_no_request_after_its_time():
+    """A status call that used up the minute is not followed by another one
+    of up to 40 s, while a lock may be waiting for the client."""
+    client = Client("user@example.com", "pw", "1234", FIAT_EU)
+    client.api = MagicMock()
+    clock = [0.0]
+
+    def slow(*args):
+        clock[0] += 70
+        raise requests.exceptions.ReadTimeout("slow")
+
+    client.api.get_remote_operation_status.side_effect = slow
+    client.api.get_vehicle_notifications.side_effect = slow
+
+    with patch.object(client_module, "sleep"), patch.object(
+        client_module, "monotonic", lambda: clock[0]
+    ):
+        with pytest.raises(Exception, match="timed out"):
+            client._poll_correlation_id(VIN, "c")
+    client.api.get_vehicle_notifications.assert_not_called()
+
+
 def test_login_failing_during_the_poll_is_no_refusal():
     client = Client("user@example.com", "pw", "1234", FIAT_EU)
     client.api = MagicMock()
@@ -2146,7 +2168,7 @@ def test_notification_spelled_fail_is_a_failure(spelling):
             "items": [{"correlationId": "c", "notification": {"data": {"status": spelling}}}]
         }
     }
-    ticks = iter([0.0, 0.0])
+    ticks = iter([0.0, 0.0, 0.0])
     with patch.object(client_module, "sleep"), patch.object(
         client_module, "monotonic", lambda: next(ticks, 61.0)
     ):

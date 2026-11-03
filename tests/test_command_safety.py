@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 from datetime import timedelta
 import time
@@ -433,6 +434,70 @@ async def test_repeated_unlock_is_skipped_quietly(hass, config_entry, mock_clien
     # the automation calling it
     await hass.services.async_call(DOMAIN, "doors_unlock", {"code": PIN}, blocking=True)
     assert sent(mock_client) == ["RDU"]
+
+
+def held_commands(config_entry, mock_client, calls: list[str]) -> asyncio.Event:
+    """Hold the unlock in the client until the returned event is set, and
+    note the commands and polls in the order they reach the client."""
+    coordinator = config_entry.runtime_data
+    run = coordinator._async_run_locked
+    release = asyncio.Event()
+
+    async def held(func, *args, **kwargs):
+        if func is mock_client.command_verify:
+            calls.append(args[1].name)
+            if args[1].name == "RDU":
+                await release.wait()
+        elif func is mock_client.refresh:
+            calls.append("refresh")
+        return await run(func, *args, **kwargs)
+
+    coordinator._async_run_locked = held
+    return release
+
+
+async def test_overlapping_repeat_is_skipped_quietly(hass, config_entry, mock_client):
+    # A second automation asks while the first unlock is still running
+    await setup(hass, config_entry)
+    calls = []
+    release = held_commands(config_entry, mock_client, calls)
+    unlock = {"code": PIN}
+    first = hass.async_create_task(
+        hass.services.async_call(DOMAIN, "doors_unlock", unlock, blocking=True)
+    )
+    await asyncio.sleep(0.05)
+    second = hass.async_create_task(
+        hass.services.async_call(DOMAIN, "doors_unlock", unlock, blocking=True)
+    )
+    await asyncio.sleep(0.05)
+    release.set()
+    await first
+    await second
+    assert sent(mock_client) == ["RDU"]
+
+
+async def test_lock_does_not_wait_for_the_refresh_after_an_unlock(
+    hass, config_entry, mock_client
+):
+    await setup(hass, config_entry)
+    lock = entity_id(hass, "lock", "lock_doors")
+    calls = []
+    release = held_commands(config_entry, mock_client, calls)
+    unlock = hass.async_create_task(
+        hass.services.async_call(
+            "lock", "unlock", {"entity_id": lock, "code": PIN}, blocking=True
+        )
+    )
+    await asyncio.sleep(0.05)
+    locking = hass.async_create_task(
+        hass.services.async_call("lock", "lock", {"entity_id": lock}, blocking=True)
+    )
+    await asyncio.sleep(0.05)
+    release.set()
+    await unlock
+    await locking
+    # Next once the vehicle confirmed the unlock, before its refresh
+    assert calls[:3] == ["RDU", "RDL", "refresh"]
 
 
 async def test_engine_off_after_on(hass, config_entry, mock_client, vehicle):
