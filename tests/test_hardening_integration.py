@@ -126,6 +126,30 @@ async def test_rejected_login_later_stops_commands(hass, setup_integration, mock
     mock_client.command_verify.assert_not_called()
 
 
+async def test_login_backoff_is_shortened_only_while_setting_up(
+    hass, config_entry, mock_client
+):
+    seen = []
+    mock_client.refresh.side_effect = lambda: seen.append(mock_client.api.setting_up)
+    config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    await config_entry.runtime_data.async_refresh()
+    assert seen == [True, False]
+    assert mock_client.api.setting_up is False
+
+
+async def test_pin_is_read_without_surrounding_spaces(hass, config_entry, mock_client):
+    from custom_components.uconnect.coordinator import UconnectDataUpdateCoordinator
+
+    config_entry.add_to_hass(hass)
+    hass.config_entries.async_update_entry(
+        config_entry, options={**config_entry.options, "pin": " 1234 "}
+    )
+    assert UconnectDataUpdateCoordinator._read_pin(config_entry) == "1234"
+
+
 async def test_failing_health_report_is_not_asked_every_poll(
     hass, setup_integration, mock_client
 ):

@@ -6,6 +6,8 @@ import copy
 from datetime import datetime, timedelta, timezone
 import json
 import logging
+import time
+import traceback
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -15,9 +17,13 @@ from custom_components.uconnect.pyuconnect import client as client_module
 from custom_components.uconnect.pyuconnect.api import (
     _PIN_REJECTIONS,
     API,
+    LOGIN_BACKOFF_SETUP_MAX,
     LOGIN_BACKOFF_START,
+    PIN_TOKEN_MARGIN,
+    PIN_TOKEN_MAX_LIFETIME,
     AuthenticationError,
     LoginBackoffError,
+    LoginError,
     PinAuthError,
     PinRejectedError,
     _is_token_rejected,
@@ -219,7 +225,8 @@ def test_failed_login_backs_off():
     api = logged_out_api()
     api.login = MagicMock(side_effect=Exception("Gigya rate limit 403048"))
 
-    with pytest.raises(Exception, match="unable to login"):
+    # Its own kind, telling it from a failure after something was sent
+    with pytest.raises(LoginError, match="unable to login"):
         api._refresh_token_if_needed()
     # Within the backoff no request is made at all
     with pytest.raises(LoginBackoffError):
@@ -382,6 +389,19 @@ def test_poll_ends_on_the_monotonic_clock():
         with pytest.raises(Exception, match="timed out"):
             client._poll_correlation_id(VIN, "c")
     assert client.api.get_remote_operation_status.call_count == 1
+
+
+def test_login_failing_during_the_poll_is_no_refusal():
+    client = Client("user@example.com", "pw", "1234", FIAT_EU)
+    client.api = MagicMock()
+    client.api.command.return_value = "c"
+    client.api.get_remote_operation_status.side_effect = LoginBackoffError("paused")
+
+    with patch.object(client_module, "sleep"):
+        with pytest.raises(Exception, match="execution status") as raised:
+            client.command_verify(VIN, COMMAND_DOORS_LOCK)
+    # The command went out, so nothing may take it for one that never did
+    assert not isinstance(raised.value, LoginError)
 
 
 # --- Charge schedules ---------------------------------------------------
@@ -551,10 +571,19 @@ def test_signing_library_does_not_log_secrets():
 
 
 @pytest.mark.parametrize(
-    ("status", "body"),
-    [(403, {"name": "INVALID_PIN"}), (423, {"name": "PIN_LOCKED"}), (401, {"message": "no"})],
+    ("status", "body", "locked"),
+    [
+        (403, {"name": "INVALID_PIN"}, False),
+        (423, {"name": "PIN_LOCKED"}, True),
+        (401, {"message": "no"}, False),
+        # Named in an answer of another status, as that differs by account
+        (200, {"name": "INVALID_PIN"}, False),
+        (400, {"name": "INVALID_PIN"}, False),
+        (422, {"name": "invalid_pin"}, False),
+        (200, {"name": "PIN_LOCKED"}, True),
+    ],
 )
-def test_rejected_pin_is_not_sent_again(status, body):
+def test_rejected_pin_is_not_sent_again(status, body, locked):
     api = logged_in_api()
 
     def answer(method, url, **kwargs):
@@ -567,7 +596,7 @@ def test_rejected_pin_is_not_sent_again(status, body):
         with pytest.raises(PinRejectedError):
             api.command(VIN, COMMAND_DOORS_LOCK)
         assert len(pin_requests(req)) == 1
-        assert api.pin_locked is (status == 423)
+        assert api.pin_locked is locked
         sent = req.call_count
         # Nothing goes out any more, neither a command nor the PIN
         with pytest.raises(PinRejectedError):
@@ -770,9 +799,11 @@ def test_failures_at_the_pin_step_say_nothing_was_sent(outcome):
     assert "uid1" not in str(err.value)
 
 
-def test_pin_that_cannot_be_right_is_not_sent():
+# Full-width and Arabic-Indic digits pass str.isdigit()
+@pytest.mark.parametrize("pin", ["12 34", "１２３４", "١٢٣٤"])
+def test_pin_that_cannot_be_right_is_not_sent(pin):
     api = logged_in_api()
-    api.set_pin("12 34")
+    api.set_pin(pin)
     with patch.object(api.sess, "request") as req:
         with pytest.raises(PinRejectedError):
             api.command(VIN, COMMAND_DOORS_LOCK)
@@ -787,6 +818,205 @@ def test_command_queued_is_never_sent_twice():
     assert not _is_token_rejected(queued)
     assert not _is_token_rejected(response(200, {"note": "expired_token"}))
     assert _is_token_rejected(response(200, {"name": "EXPIRED_TOKEN"}))
+
+
+UNAUTHORIZED = {"message": "Unauthorized"}
+PENDING = {"responseStatus": "pending", "correlationId": "a"}
+
+
+def remote_requests(req) -> list:
+    return [c.kwargs["json"]["pinAuth"] for c in req.call_args_list if "/remote" in c.kwargs["url"]]
+
+
+@pytest.mark.parametrize(
+    "refused", [response(401, UNAUTHORIZED), response(403, {"debugMsg": "FORBIDDEN"})]
+)
+def test_cached_pin_token_refused_is_renewed_once(refused):
+    api = logged_in_api()
+    logins = counting_login(api)
+    api._pin_token = ("pin-1", float("inf"))
+    answers = [
+        refused,
+        response(200, {"token": "pin-2", "expiry": 300000}),
+        response(200, PENDING),
+    ]
+    with patch.object(api.sess, "request", side_effect=answers) as req:
+        assert api.command(VIN, COMMAND_DOORS_LOCK) == "a"
+    # Sent once more with a fresh token, without a login that would have
+    # sent the old token again and held back the next one
+    assert remote_requests(req) == ["pin-1", "pin-2"]
+    assert len(pin_requests(req)) == 1
+    assert logins == []
+    assert api._last_rejected_relogin is None
+
+
+def test_pin_token_lifetime_is_capped():
+    api = logged_in_api()
+    answers = [
+        # Not a lifetime in milliseconds, an epoch time say
+        response(200, {"token": "pin-1", "expiry": 1760000000000}),
+        response(200, PENDING),
+    ]
+    with patch(
+        "custom_components.uconnect.pyuconnect.api.time.monotonic", return_value=1000.0
+    ), patch.object(api.sess, "request", side_effect=answers):
+        api.command(VIN, COMMAND_DOORS_LOCK)
+    assert api._pin_token == ("pin-1", 1000.0 + PIN_TOKEN_MAX_LIFETIME - PIN_TOKEN_MARGIN)
+
+
+def test_pin_is_not_sent_again_while_a_bare_401_is_unproven():
+    api = logged_in_api()
+    api.login = MagicMock()
+    listed = {"ok": False}
+
+    def answer(method, url, **kwargs):
+        if url.endswith("/vehicles"):
+            if listed["ok"]:
+                return response(200, {"vehicles": []})
+            return response(503, {"message": "Service Unavailable"})
+        if url.endswith("/pin/authenticate"):
+            return response(401, UNAUTHORIZED)
+        return response(200, PENDING)
+
+    with patch.object(api.sess, "request", side_effect=answer) as req:
+        for _ in range(3):
+            with pytest.raises(PinAuthError):
+                api.command(VIN, COMMAND_DOORS_LOCK)
+        # Also not from the API object of a reload
+        again = logged_in_api()
+        with patch.object(again.sess, "request", side_effect=answer) as reloaded:
+            with pytest.raises(PinAuthError):
+                again.command(VIN, COMMAND_DOORS_LOCK)
+        assert pin_requests(reloaded) == []
+        # Sent once while the service fails, not on every attempt
+        assert len(pin_requests(req)) == 1
+        assert not api.pin_rejected
+
+        # Once the credentials read the list, a bare 401 proves a wrong PIN
+        listed["ok"] = True
+        with pytest.raises(PinRejectedError):
+            api.command(VIN, COMMAND_DOORS_LOCK)
+        assert len(pin_requests(req)) == 2
+        assert api.pin_rejected
+
+
+def test_bare_401_checked_with_renewed_credentials_is_not_taken_as_wrong():
+    api = logged_in_api()
+
+    def login():
+        api.aws_auth = object()
+        api.expire_time = datetime.now(timezone.utc) + timedelta(hours=1)
+
+    api.login = MagicMock(side_effect=login)
+    pin_answers = [response(401, UNAUTHORIZED), response(200, {"token": "pin-1"})]
+
+    def answer(method, url, **kwargs):
+        if url.endswith("/pin/authenticate"):
+            return pin_answers.pop(0)
+        if url.endswith("/vehicles"):
+            return response(200, {"vehicles": []})
+        return response(200, PENDING)
+
+    # The credentials come due between the PIN and the read of the list
+    expired = iter([False, False, True])
+    with patch.object(
+        api, "_token_expired", side_effect=lambda: next(expired, False)
+    ), patch.object(api.sess, "request", side_effect=answer) as req:
+        assert api.command(VIN, COMMAND_DOORS_LOCK) == "a"
+    # The list read with the new credentials proves nothing about the old
+    # ones: the PIN went out once more instead of being taken as wrong
+    api.login.assert_called_once()
+    assert len(pin_requests(req)) == 2
+    assert not api.pin_rejected
+
+
+def test_relogin_interval_does_not_hold_back_a_command_on_request():
+    api = logged_in_api()
+    logins = counting_login(api)
+    api._last_rejected_relogin = time.monotonic()
+    api.bypass_login_backoff = True
+    answers = [
+        response(200, {"token": "pin-1"}),
+        response(403, {"message": "The security token included in the request is invalid"}),
+        response(200, PENDING),
+    ]
+    with patch.object(api.sess, "request", side_effect=answers):
+        assert api.command(VIN, COMMAND_DOORS_LOCK) == "a"
+    assert logins == [1]
+
+
+def test_bare_401_shortly_after_a_fresh_login_is_checked_on_request():
+    api = logged_in_api()
+    logins = counting_login(api)
+    api._last_rejected_relogin = 100.0
+    api.bypass_login_backoff = True
+    pin_answers = [response(401, UNAUTHORIZED), response(200, {"token": "pin-1"})]
+
+    def answer(method, url, **kwargs):
+        if url.endswith("/pin/authenticate"):
+            return pin_answers.pop(0)
+        if url.endswith("/vehicles"):
+            # Refused before the fresh login, taken after it
+            return response(200, {"vehicles": []}) if logins else response(401, UNAUTHORIZED)
+        return response(200, PENDING)
+
+    with patch(
+        "custom_components.uconnect.pyuconnect.api.time.monotonic", return_value=160.0
+    ), patch.object(api.sess, "request", side_effect=answer) as req:
+        assert api.command(VIN, COMMAND_DOORS_LOCK) == "a"
+    assert logins == [1]
+    assert len(pin_requests(req)) == 2
+    assert not api.pin_rejected
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        requests.exceptions.ConnectionError(
+            f"Max retries exceeded with url: /v1/accounts/uid1/vehicles/{VIN}/remote"
+        ),
+        requests.exceptions.ReadTimeout(f"Read timed out. (url: /v1/accounts/uid1/vehicles/{VIN})"),
+    ],
+)
+@pytest.mark.parametrize("call", ["status", "command"])
+def test_connection_errors_leave_out_account_and_vehicle(error, call):
+    api = logged_in_api()
+    with patch.object(api.sess, "request", side_effect=error):
+        # Of the same kind, the callers tell a timeout from a refusal by it
+        with pytest.raises(requests.exceptions.RequestException) as raised:
+            if call == "status":
+                api.get_vehicle_status(VIN)
+            else:
+                api.command(VIN, COMMAND_DOORS_LOCK)
+    assert isinstance(raised.value, PinAuthError if call == "command" else type(error))
+    # Neither in the message nor in a logged traceback
+    text = "".join(traceback.format_exception(raised.value))
+    assert "uid1" not in text
+    assert VIN not in text
+
+
+def test_failure_answers_leave_out_account_vin_and_position():
+    api = logged_in_api()
+    api._pin_token = ("pin-1", float("inf"))
+    failure = response(
+        200,
+        {
+            "responseStatus": "failure",
+            "debugMsg": f"vehicle {VIN} of uid1 not reachable",
+            "accountId": "uid1",
+            "lastKnownPosition": {"latitude": 48.12345, "longitude": 11.5432},
+        },
+    )
+    with patch.object(api.sess, "request", return_value=failure) as req:
+        with pytest.raises(Exception, match="command queuing failed") as raised:
+            api.command(VIN, COMMAND_DOORS_LOCK)
+    # Answered, so not sent once more
+    assert req.call_count == 1
+    text = str(raised.value)
+    assert "not reachable" in text
+    assert "uid1" not in text
+    assert VIN not in text
+    assert "48.12" not in text and "11.54" not in text
 
 
 # --- The login backoff outlives the client -------------------------------
@@ -811,6 +1041,73 @@ def test_backoff_is_kept_for_a_new_client():
     with pytest.raises(Exception, match="unable to login"):
         fixed._refresh_token_if_needed()
     fixed.login.assert_called_once()
+
+
+def test_new_client_takes_over_credentials_that_did_not_expire():
+    api = logged_out_api()
+
+    def login():
+        api.uid = "uid1"
+        api.aws_auth = object()
+        api.expire_time = datetime.now(timezone.utc) + timedelta(hours=1)
+
+    api.login = MagicMock(side_effect=login)
+    api._refresh_token_if_needed()
+
+    # A setup retry does not log in with the password again
+    retry = logged_out_api()
+    retry.login = MagicMock()
+    retry._refresh_token_if_needed()
+    retry.login.assert_not_called()
+    assert retry.uid == "uid1"
+    assert retry.aws_auth is api.aws_auth
+
+    # Neither another password nor rejected credentials are taken over
+    assert API("user@example.com", "new-pw", "1234", FIAT_EU).aws_auth is None
+    retry._invalidate_token()
+    assert logged_out_api().aws_auth is None
+
+
+def test_backoff_is_shortened_while_setting_up():
+    api = logged_out_api()
+    api.login = MagicMock(side_effect=Exception("down"))
+    clock = [1000.0]
+
+    with patch("custom_components.uconnect.pyuconnect.api.time.monotonic", lambda: clock[0]):
+        for _ in range(6):
+            clock[0] = max(clock[0], api._next_login_attempt) + 1
+            with pytest.raises(LoginError):
+                api._refresh_token_if_needed()
+        failed = clock[0]
+        assert api._next_login_attempt - failed == 30 * 60
+
+        retry = logged_out_api()
+        retry.login = MagicMock()
+        clock[0] = failed + LOGIN_BACKOFF_SETUP_MAX + 1
+        with pytest.raises(LoginBackoffError):
+            retry._refresh_token_if_needed()
+        # The setup of the entry, which nothing can bypass, tries again sooner
+        retry.setting_up = True
+        retry._refresh_token_if_needed()
+        retry.login.assert_called_once()
+
+
+def test_failing_login_goes_on_with_credentials_still_valid():
+    api = logged_in_api()
+    # Within the five minutes they are renewed early, still valid
+    api.expire_time = datetime.now(timezone.utc) + timedelta(minutes=2)
+    api.login = MagicMock(side_effect=Exception("down"))
+    api.bypass_login_backoff = True
+
+    api._refresh_token_if_needed()
+    api._refresh_token_if_needed()
+    # Tried once, then held back by the backoff, also on request
+    api.login.assert_called_once()
+
+    api.expire_time = datetime.now(timezone.utc) - timedelta(seconds=1)
+    with pytest.raises(LoginError):
+        api._refresh_token_if_needed()
+    assert api.login.call_count == 2
 
 
 # --- Data robustness ----------------------------------------------------

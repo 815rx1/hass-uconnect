@@ -19,6 +19,7 @@ from .pyuconnect.brands import BRANDS as BRANDS_BY_NAME
 
 from .pyuconnect.api import (
     AuthenticationError,
+    LoginError,
     PinAuthError,
     PinRejectedError,
     forget_pin_rejection,
@@ -166,11 +167,11 @@ def is_auth_error(err: BaseException) -> bool:
 def _refused_before_queued(err: BaseException) -> bool:
     """Whether a command failed before anything reached the vehicle.
 
-    The cloud refused it outright with a 4xx answer, or the PIN
+    The cloud refused it outright with a 4xx answer, or the login or the PIN
     authentication before it failed, whatever the answer.
     """
 
-    if isinstance(err, PinAuthError):
+    if isinstance(err, (PinAuthError, LoginError)):
         return True
     response = getattr(err, "response", None)
     status = getattr(response, "status_code", None)
@@ -302,7 +303,10 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
         without checking it, so an absent one is returned as an empty string.
         """
 
-        return config_entry.options.get(CONF_PIN) or config_entry.data.get(CONF_PIN, "")
+        # A space pasted along would make the PIN fail every command
+        return str(
+            config_entry.options.get(CONF_PIN) or config_entry.data.get(CONF_PIN) or ""
+        ).strip()
 
     @staticmethod
     def _read_charging_refresh_interval(config_entry: ConfigEntry) -> int:
@@ -388,34 +392,51 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
         self._wrong_codes = 0
 
     async def async_run(
-        self, func: Callable[..., _T], *args: Any, on_request: bool = False
+        self,
+        func: Callable[..., _T],
+        *args: Any,
+        on_request: bool = False,
+        setting_up: bool = False,
     ) -> _T:
         """Run a blocking client call in the executor, one call at a time."""
 
         async with self._client_lock:
-            return await self._async_run_locked(func, *args, on_request=on_request)
+            return await self._async_run_locked(
+                func, *args, on_request=on_request, setting_up=setting_up
+            )
 
     async def _async_run_locked(
-        self, func: Callable[..., _T], *args: Any, on_request: bool = False
+        self,
+        func: Callable[..., _T],
+        *args: Any,
+        on_request: bool = False,
+        setting_up: bool = False,
     ) -> _T:
         """Run a client call while the client lock is already held.
 
         Calls made on request may log in although the login is backing off
-        after failures: somebody locking the car must not wait for that.
+        after failures: somebody locking the car must not wait for that. While
+        the entry is set up nothing can bypass it, so it is shortened then,
+        or the lock would stay unavailable long after the login works again.
         """
 
         api = self.client.api
         api.bypass_login_backoff = on_request
+        api.setting_up = setting_up
         try:
             return await self.hass.async_add_executor_job(func, *args)
         finally:
             api.bypass_login_backoff = False
+            api.setting_up = False
 
     async def _async_update_data(self):
         """Update data via library. Called by update_coordinator periodically."""
 
         try:
-            await self.async_run(self.client.refresh)
+            await self.async_run(
+                self.client.refresh,
+                setting_up=self.config_entry.state is ConfigEntryState.SETUP_IN_PROGRESS,
+            )
         except Exception as err:
             if is_auth_error(err):
                 self.auth_failed = True
@@ -805,7 +826,7 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
                 # limit, service down) has nothing to do with the plug
                 if (
                     refused
-                    and not isinstance(err, PinAuthError)
+                    and not isinstance(err, (PinAuthError, LoginError))
                     and command in DEEP_REFRESH_COMMANDS
                     and getattr(vehicle, "plugged_in", None) is False
                 ):
@@ -948,6 +969,7 @@ async def async_retry_pin(hass: HomeAssistant, entry: ConfigEntry, pin: str) -> 
     the place of the rejected one once the options apply; releasing the old
     one before that would let it go out once more.
     """
+    pin = str(pin or "").strip()
     coordinator = getattr(entry, "runtime_data", None)
     if isinstance(coordinator, UconnectDataUpdateCoordinator):
         if pin == coordinator.client.api.pin:

@@ -35,18 +35,24 @@ AUTH_ERROR_CODES = {401030, 403042}
 
 
 # A cached PIN authentication token is renewed this many seconds before the
-# lifetime the backend gives it runs out
+# lifetime the backend gives it runs out, and kept no longer than the maximum
+# whatever lifetime it gives
 PIN_TOKEN_MARGIN = 15
+PIN_TOKEN_MAX_LIFETIME = 10 * 60
 
 # After a failed login the next one waits this long, doubling with every
 # further failure up to the maximum. Logging in again on every poll while the
 # login service is failing or rate limiting can get the account locked.
 LOGIN_BACKOFF_START = 60
 LOGIN_BACKOFF_MAX = 30 * 60
+# While the entry is set up a failed login is tried again after this at the
+# latest: no command can bypass the backoff then, as the lock entity is not
+# loaded until the setup works
+LOGIN_BACKOFF_SETUP_MAX = 5 * 60
 
 # Credentials the backend rejects before they expire are renewed at most this
 # often. An endpoint answering 401 for good would otherwise cost a full login
-# on every request.
+# on every request. Calls made on request, a lock say, are not held back.
 TOKEN_REJECTED_RELOGIN_INTERVAL = 10 * 60
 
 
@@ -54,7 +60,11 @@ class AuthenticationError(Exception):
     """The login was rejected because of invalid credentials"""
 
 
-class LoginBackoffError(Exception):
+class LoginError(Exception):
+    """The login failed, so nothing was sent with it"""
+
+
+class LoginBackoffError(LoginError):
     """No login was attempted because the last ones failed shortly before"""
 
 
@@ -142,12 +152,17 @@ def _redact(text: str, *secrets: str | None) -> str:
 class _LoginBackoff:
     failures: int = 0
     next_attempt: float = 0.0
+    failed_at: float = 0.0
+    # uid, signer and expiry of the last login that worked
+    credentials: tuple | None = None
 
 
 # The login backoff is kept per account and password beyond one API object:
 # Home Assistant creates a new client on every setup retry, which would
 # otherwise start the backoff from scratch and log in every few minutes. A new
-# password starts without backoff.
+# password starts without backoff. The credentials of the last login are kept
+# with it for the same reason: a setup retry every minute or so would
+# otherwise log in with the password each time.
 _LOGIN_BACKOFFS: dict[str, _LoginBackoff] = {}
 
 
@@ -164,6 +179,12 @@ def _login_backoff(login_url: str, email: str | None, password: str | None) -> _
 # rejected PIN and whether the backend reported the PIN locked.
 _PIN_REJECTIONS: dict[str, tuple[str, bool]] = {}
 
+# Accounts whose PIN got a bare 401 that proved nothing while the service
+# failed. The PIN goes out again only once the vehicle list shows the
+# credentials are taken, so that a bare 401 then proves a wrong PIN: sent on
+# every attempt during an outage, a wrong one would lock the account.
+_PIN_UNPROVEN: set[str] = set()
+
 
 def _account_key(login_url: str, email: str | None) -> str:
     return hashlib.sha256(f"{login_url}\n{(email or '').casefold()}".encode()).hexdigest()
@@ -173,6 +194,7 @@ def forget_pin_rejection(login_url: str, email: str | None) -> None:
     """Lets the PIN of an account be sent again when no API object is at hand"""
 
     _PIN_REJECTIONS.pop(_account_key(login_url, email), None)
+    _PIN_UNPROVEN.discard(_account_key(login_url, email))
 
 
 def _login_error(r: dict) -> str:
@@ -249,16 +271,37 @@ def _lists_vehicles(r: requests.Response) -> bool:
     return isinstance(body, dict) and "vehicles" in body
 
 
+def _pin_error(r: requests.Response) -> str:
+    """The error name an answer of the PIN authentication gives instead of a
+    token, e.g. INVALID_PIN"""
+
+    if len(r.content) > 4096:
+        return ""
+    try:
+        body = r.json()
+    except ValueError:
+        return ""
+    if not isinstance(body, dict) or "token" in body:
+        return ""
+    return str(body.get("name", "")).upper()
+
+
+def _pin_locked(r: requests.Response) -> bool:
+    return r.status_code == 423 or _pin_error(r) == "PIN_LOCKED"
+
+
 def _pin_rejected(r: requests.Response) -> bool:
     """Tells whether the answer of the PIN authentication rejects the PIN.
 
     The backend answers a wrong PIN with 403 INVALID_PIN, some accounts with
     401, and a locked PIN with 423. A 401 that names the credentials is about
     those, and was already retried with a fresh login; a bare 401 was checked
-    against the credentials before it gets here, see API._pin_auth.
+    against the credentials before it gets here, see API._pin_auth. An answer
+    naming a wrong or locked PIN counts whatever its status, as the status
+    differs between accounts.
     """
 
-    if r.status_code == 423:
+    if _pin_locked(r) or _pin_error(r) == "INVALID_PIN":
         return True
     text = r.text.lower() if len(r.content) <= 4096 else ""
     if r.status_code == 403:
@@ -349,7 +392,8 @@ class API:
         self._credentials_rejected: str | None = None
         self._last_rejected_relogin: float | None = None
         # Set for calls made on request: a person locking the car waits for
-        # nothing, only background polling is held back by the backoff
+        # nothing, only background polling is held back by the backoff and
+        # by the relogin interval
         self.bypass_login_backoff = False
 
         self.sess = _TimeoutSession(timeout)
@@ -360,6 +404,13 @@ class API:
         )})
 
         self.expire_time: datetime | None = None
+        # Set while the entry is set up, see LOGIN_BACKOFF_SETUP_MAX
+        self.setting_up = False
+
+        # Credentials an earlier API object of the account got, see
+        # _LOGIN_BACKOFFS: once expired they are renewed as usual
+        if self._backoff.credentials is not None:
+            self.uid, self.aws_auth, self.expire_time = self._backoff.credentials
 
         if disable_tls_verification:
             self.sess.verify = False
@@ -425,6 +476,7 @@ class API:
         """Lets the PIN be sent again, e.g. once it was unlocked in the app"""
         self._pin_token = None
         _PIN_REJECTIONS.pop(self._account, None)
+        _PIN_UNPROVEN.discard(self._account)
 
     def pin_rejection_fingerprint(self, salt: str) -> str:
         """Identifies the PIN set now without revealing it, to keep a
@@ -464,6 +516,16 @@ class API:
                 r.status_code,
                 _redact(r.text[:4000], self.uid, self.email),
             )
+
+    def _failure(self, r: Any) -> str:
+        """Describes a failure answer for an error message, which reaches the
+        frontend and the log: its message and keys only. The full answer is
+        in the debug log, see _log_response."""
+
+        if not isinstance(r, dict):
+            return f"unexpected answer: {type(r).__name__}"
+        error = _redact(str(r.get("debugMsg", "unknown error")), self.uid, self.email)
+        return f"{error} (keys {sorted(r)})"
 
     def _gigya(self, method: str, call: str, params: dict) -> dict:
         """Calls the login service, keeping secrets out of any error raised.
@@ -623,9 +685,22 @@ class API:
                     f"the credentials were rejected: {self._credentials_rejected}"
                 )
 
+            # Renewed five minutes before they expire, the credentials still
+            # work until then: a failing login need not stop a request, e.g.
+            # the status poll of a command that already went out
+            still_valid = (
+                self.expire_time is not None
+                and datetime.now().astimezone() < self.expire_time
+            )
+
             backoff = self._backoff
-            wait = backoff.next_attempt - time.monotonic()
-            if wait > 0 and not self.bypass_login_backoff:
+            deadline = backoff.next_attempt
+            if self.setting_up:
+                deadline = min(deadline, backoff.failed_at + LOGIN_BACKOFF_SETUP_MAX)
+            wait = deadline - time.monotonic()
+            if wait > 0 and (still_valid or not self.bypass_login_backoff):
+                if still_valid:
+                    return
                 raise LoginBackoffError(
                     f"login paused for another {int(wait) + 1} s after "
                     f"{backoff.failures} failed attempts"
@@ -642,17 +717,26 @@ class API:
                     LOGIN_BACKOFF_START * 2 ** (backoff.failures - 1),
                     LOGIN_BACKOFF_MAX,
                 )
-                backoff.next_attempt = time.monotonic() + delay
-                raise Exception(f"unable to login: {e}") from e
+                backoff.failed_at = time.monotonic()
+                backoff.next_attempt = backoff.failed_at + delay
+                if still_valid:
+                    _LOGGER.debug("Login failed, going on with the current credentials: %s", e)
+                    return
+                raise LoginError(f"unable to login: {e}") from e
 
             backoff.failures = 0
             backoff.next_attempt = 0.0
+            backoff.credentials = (self.uid, self.aws_auth, self.expire_time)
 
     def _invalidate_token(self):
         """Forces a fresh login on the next request"""
 
         with self._login_lock:
             self.expire_time = None
+            # Not taken over by the next API object either
+            credentials = self._backoff.credentials
+            if credentials is not None and credentials[1] is self.aws_auth:
+                self._backoff.credentials = None
 
     def _aws_request(
         self,
@@ -677,18 +761,27 @@ class API:
         for attempt in range(2):
             self._refresh_token_if_needed()
 
-            r = self.sess.request(
-                method=method,
-                url=url,
-                headers=self._default_aws_headers(key or self.brand.api.key)
-                | {"content-type": "application/json"},
-                auth=self.aws_auth,
-                **kwargs,
-            )
+            try:
+                r = self.sess.request(
+                    method=method,
+                    url=url,
+                    headers=self._default_aws_headers(key or self.brand.api.key)
+                    | {"content-type": "application/json"},
+                    auth=self.aws_auth,
+                    **kwargs,
+                )
+            except requests.exceptions.RequestException as err:
+                # Of the same kind, for the callers telling a timeout from a
+                # refusal, but without the URL the text of one quotes
+                raise type(err)(
+                    f"{type(err).__name__} on {method} {_redacted_path(url)}"
+                ) from None
 
             # A request carrying the PIN token that fails may have failed over
             # the token, so the next one asks for a fresh token
-            if r.status_code >= 400 and "pinAuth" in (kwargs.get("json") or {}):
+            if (r.status_code >= 400 or _is_token_rejected(r)) and "pinAuth" in (
+                kwargs.get("json") or {}
+            ):
                 self._pin_token = None
 
             if (
@@ -700,7 +793,11 @@ class API:
             ):
                 now = time.monotonic()
                 last = self._last_rejected_relogin
-                if last is not None and now - last < TOKEN_REJECTED_RELOGIN_INTERVAL:
+                if (
+                    last is not None
+                    and now - last < TOKEN_REJECTED_RELOGIN_INTERVAL
+                    and not self.bypass_login_backoff
+                ):
                     _LOGGER.debug(
                         "Credentials rejected (HTTP %s) again shortly after a "
                         "fresh login, not logging in again yet",
@@ -742,8 +839,8 @@ class API:
         self._log_response("list_vehicles", r)
         r = r.json()
 
-        if "vehicles" not in r:
-            raise Exception(f"incorrect response: {r}")
+        if not isinstance(r, dict) or "vehicles" not in r:
+            raise Exception(f"incorrect response: {self._failure(r)}")
 
         return r["vehicles"]
 
@@ -1057,9 +1154,8 @@ class API:
         self._log_response("update_location", r)
         r = r.json()
 
-        if "responseStatus" not in r or r["responseStatus"] != "pending":
-            error = r.get("debugMsg", "unknown error")
-            raise Exception(f"update location failed: {error} ({r})")
+        if not isinstance(r, dict) or r.get("responseStatus") != "pending":
+            raise Exception(f"update location failed: {self._failure(r)}")
 
         return r["correlationId"]
 
@@ -1098,7 +1194,10 @@ class API:
                 if self.pin_locked
                 else "the PIN was rejected and is not sent again until it is changed"
             )
-        if not self.pin or not str(self.pin).isdigit():
+        # ASCII digits only: full-width or Arabic-Indic ones count as digits
+        # too, but cannot be the PIN
+        pin = str(self.pin or "")
+        if not (pin.isascii() and pin.isdigit()):
             raise PinRejectedError("the PIN must consist of digits only")
 
         data = {
@@ -1107,6 +1206,12 @@ class API:
 
         try:
             self._refresh_token_if_needed()
+            if self._account in _PIN_UNPROVEN:
+                if not _lists_vehicles(self._read_vehicle_list()):
+                    raise PinAuthError(
+                        "PIN authentication failed: not sent while the service fails"
+                    )
+                _PIN_UNPROVEN.discard(self._account)
             r = self._post_pin(data)
             if r.status_code == 401 and not _names_credentials(r):
                 r = self._recheck_bare_401(data, r)
@@ -1119,10 +1224,10 @@ class API:
             raise PinAuthError(f"PIN authentication failed: {reason}") from err
 
         if _pin_rejected(r):
-            self._reject_pin(r.status_code == 423)
+            self._reject_pin(_pin_locked(r))
             raise PinRejectedError(
                 "the PIN is locked, unlock it in the official app"
-                if r.status_code == 423
+                if _pin_locked(r)
                 else f"the PIN was rejected (HTTP {r.status_code})"
             )
 
@@ -1153,7 +1258,9 @@ class API:
         ):
             self._pin_token = (
                 answer["token"],
-                time.monotonic() + expiry / 1000 - PIN_TOKEN_MARGIN,
+                time.monotonic()
+                + min(expiry / 1000, PIN_TOKEN_MAX_LIFETIME)
+                - PIN_TOKEN_MARGIN,
             )
 
         return answer["token"]
@@ -1178,25 +1285,32 @@ class API:
         list, they are taken, the PIN was wrong and the answer stands.
         Refused, they are renewed and the PIN is sent once more; a bare 401 to
         that is the PIN once the fresh credentials read the list. Any other
-        answer to a read proves neither.
+        answer to a read proves neither. Credentials renewed on their expiry
+        between the PIN and the read prove nothing about the ones the PIN went
+        out with, so the PIN is sent once more with the new ones.
         """
 
+        auth = self.aws_auth
         probe = self._read_vehicle_list()
-        if _lists_vehicles(probe):
-            return r
+        if self.aws_auth is auth:
+            if _lists_vehicles(probe):
+                return r
 
-        now = time.monotonic()
-        last = self._last_rejected_relogin
-        if not _is_token_rejected(probe) or (
-            last is not None and now - last < TOKEN_REJECTED_RELOGIN_INTERVAL
-        ):
-            # Not proven either way, e.g. the service failing: neither marked
-            # as a wrong PIN nor sent again
-            _raise_for_status(r, PinAuthError)
+            now = time.monotonic()
+            last = self._last_rejected_relogin
+            if not _is_token_rejected(probe) or (
+                last is not None
+                and now - last < TOKEN_REJECTED_RELOGIN_INTERVAL
+                and not self.bypass_login_backoff
+            ):
+                # Not proven either way, e.g. the service failing: neither
+                # marked as a wrong PIN nor sent again
+                _PIN_UNPROVEN.add(self._account)
+                _raise_for_status(r, PinAuthError)
 
-        _LOGGER.info("Credentials rejected at the PIN authentication, logging in again")
-        self._last_rejected_relogin = now
-        self._invalidate_token()
+            _LOGGER.info("Credentials rejected at the PIN authentication, logging in again")
+            self._last_rejected_relogin = now
+            self._invalidate_token()
         r = self._post_pin(data)
         if (
             r.status_code == 401
@@ -1205,6 +1319,7 @@ class API:
         ):
             # Everything refused, also with fresh credentials: an outage, not
             # proof of a wrong PIN
+            _PIN_UNPROVEN.add(self._account)
             _raise_for_status(r, PinAuthError)
         return r
 
@@ -1219,7 +1334,9 @@ class API:
             relogin="never",
         )
 
-    def _command_with_pin_auth(self, vin: str, cmd: Command, pin_auth: str):
+    def _command_with_pin_auth(
+        self, vin: str, cmd: Command, pin_auth: str, relogin: str = "any"
+    ):
         data = {
             "command": cmd.name,
             "pinAuth": pin_auth,
@@ -1229,6 +1346,7 @@ class API:
             method="POST",
             url=self.brand.api.url
             + f"/{cmd.api_version}/accounts/{self.uid}/vehicles/{vin}/{cmd.url}",
+            relogin=relogin,
             json=data,
         )
 
@@ -1236,9 +1354,8 @@ class API:
         self._log_response("command execute", r)
         r = r.json()
 
-        if "responseStatus" not in r or r["responseStatus"] != "pending":
-            error = r.get("debugMsg", "unknown error")
-            raise Exception(f"command queuing failed: {error} ({r})")
+        if not isinstance(r, dict) or r.get("responseStatus") != "pending":
+            raise Exception(f"command queuing failed: {self._failure(r)}")
 
         return r["correlationId"]
 
@@ -1248,7 +1365,28 @@ class API:
         if self.dev_mode:
             return
 
-        pin_auth = self._pin_auth()
+        # The backend can stop taking a cached PIN token before its expiry,
+        # e.g. once the official app asked for one in between. Refused with
+        # 401 or 403 the command was not queued, so it goes out once more with
+        # a fresh token; the PIN was taken when the cached one was issued. A
+        # bare 401 to the cached token logs in again only with the fresh one:
+        # resent after a login with the same token it would fail again, and
+        # hold back the next login.
+        cached = self._pin_token
+        if cached is not None and time.monotonic() < cached[1]:
+            try:
+                return self._send_command(vin, cmd, cached[0], "marked")
+            except requests.exceptions.HTTPError as err:
+                if err.response is None or err.response.status_code not in (401, 403):
+                    raise
+                _LOGGER.info(
+                    "PIN token refused (HTTP %s), authenticating again",
+                    err.response.status_code,
+                )
+
+        return self._send_command(vin, cmd, self._pin_auth(), "any")
+
+    def _send_command(self, vin: str, cmd: Command, pin_auth: str, relogin: str):
         fallback = getattr(cmd, "fallback", None)
 
         # A fallback the backend took after a 403 goes out first from then on,
@@ -1258,13 +1396,13 @@ class API:
         # takes it while charging, but never DEEPREFRESH2.
         if fallback is not None and (vin, cmd.name) in self._use_fallback:
             try:
-                return self._command_with_pin_auth(vin, fallback, pin_auth)
+                return self._command_with_pin_auth(vin, fallback, pin_auth, relogin)
             except requests.exceptions.HTTPError:
                 self._use_fallback.discard((vin, cmd.name))
                 raise
 
         try:
-            return self._command_with_pin_auth(vin, cmd, pin_auth)
+            return self._command_with_pin_auth(vin, cmd, pin_auth, relogin)
         except requests.exceptions.HTTPError as err:
             if (
                 err.response is not None
@@ -1278,7 +1416,7 @@ class API:
                 )
                 # Remembered only once the fallback went out: refused as well,
                 # it says nothing about which variant the vehicle takes
-                result = self._command_with_pin_auth(vin, fallback, pin_auth)
+                result = self._command_with_pin_auth(vin, fallback, pin_auth, relogin)
                 self._use_fallback.add((vin, cmd.name))
                 return result
 
@@ -1326,9 +1464,8 @@ class API:
         self._log_response("set_charge_schedule", r)
         r = r.json()
 
-        if "correlationId" not in r:
-            error = r.get("debugMsg", "unknown error")
-            raise Exception(f"set charge schedule failed: {error} ({r})")
+        if not isinstance(r, dict) or "correlationId" not in r:
+            raise Exception(f"set charge schedule failed: {self._failure(r)}")
 
         return r["correlationId"]
 
@@ -1364,9 +1501,8 @@ class API:
         self._log_response("set_charge_schedule_emea", r)
         r = r.json()
 
-        if "correlationId" not in r:
-            error = r.get("debugMsg", "unknown error")
-            raise Exception(f"set charge schedule (emea) failed: {error} ({r})")
+        if not isinstance(r, dict) or "correlationId" not in r:
+            raise Exception(f"set charge schedule (emea) failed: {self._failure(r)}")
 
         return r["correlationId"]
 
@@ -1399,8 +1535,7 @@ class API:
         self._log_response("set charging level", r)
         r = r.json()
 
-        if "correlationId" not in r:
-            error = r.get("debugMsg", "unknown error")
-            raise Exception(f"set charging level failed: {error} ({r})")
+        if not isinstance(r, dict) or "correlationId" not in r:
+            raise Exception(f"set charging level failed: {self._failure(r)}")
 
         return r["correlationId"]

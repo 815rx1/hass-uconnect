@@ -625,6 +625,28 @@ async def test_failed_pin_authentication_holds_nothing_back(
     assert hass.data[DOMAIN]["_wake_guard"].wakes(VIN) == []
 
 
+async def test_failed_login_holds_nothing_back(hass, config_entry, mock_client, vehicle):
+    from custom_components.uconnect.coordinator import (
+        RefreshNeedsPlug,
+        UconnectRequestError,
+    )
+    from custom_components.uconnect.pyuconnect.api import LoginError
+
+    await setup(hass, config_entry)
+    vehicle.plugged_in = False
+    mock_client.command_verify.side_effect = LoginError(
+        "unable to login: accounts.webSdkBootstrap: ConnectionError"
+    )
+
+    with pytest.raises(UconnectRequestError) as raised:
+        await hass.services.async_call(DOMAIN, "deep_refresh", {}, blocking=True)
+
+    # Nothing was sent without the login: no wake-up kept that would refuse
+    # the next refresh, and nothing about the plug
+    assert not isinstance(raised.value, RefreshNeedsPlug)
+    assert hass.data[DOMAIN]["_wake_guard"].wakes(VIN) == []
+
+
 async def test_locked_pin_says_so_and_is_kept(
     hass, hass_storage, config_entry, mock_client
 ):

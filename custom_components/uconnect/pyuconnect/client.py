@@ -12,7 +12,7 @@ from .api import (
     AuthenticationError,
     ChargingLevel,
     DEFAULT_TIMEOUT,
-    LoginBackoffError,
+    LoginError,
     PinRejectedError,
     _masked_vin,
 )
@@ -748,7 +748,7 @@ def _refused_before_sent(err: BaseException) -> bool:
     """Whether a command failed before anything reached the vehicle: the login
     or the PIN failed, or the cloud refused it outright with a 4xx answer."""
 
-    if isinstance(err, (AuthenticationError, LoginBackoffError, PinRejectedError)):
+    if isinstance(err, (AuthenticationError, LoginError, PinRejectedError)):
         return True
     status = getattr(getattr(err, "response", None), "status_code", None)
     return isinstance(status, int) and 400 <= status < 500
@@ -1464,6 +1464,10 @@ class Client:
                     if result in TERMINAL_SUCCESS + TERMINAL_FAILURE:
                         return result
 
+            except LoginError as err:
+                # The command went out: unlike before it, a failed login now
+                # does not mean it never reached the vehicle
+                raise Exception(f"unable to obtain execution status: {err}") from err
             except (ConnectionError, TimeoutError, ValueError, RequestException) as err:
                 # Some brands/regions return 404 for the remote-operation status
                 # endpoint even though the command itself succeeds (see issue #105).
@@ -1478,6 +1482,8 @@ class Client:
             if status_failed or attempt % 3 == 0:
                 try:
                     r = self._get_commands_statuses(vin)
+                except LoginError as err:
+                    raise Exception(f"unable to obtain execution status: {err}") from err
                 except (ConnectionError, TimeoutError, ValueError, RequestException) as err:
                     last_error = err
                     continue

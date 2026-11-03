@@ -209,7 +209,7 @@ def command_api(answer):
     api._pin_auth = MagicMock(return_value="pin-token")
     sent = []
 
-    def send(vin, cmd, pin_auth):
+    def send(vin, cmd, pin_auth, relogin="any"):
         sent.append((vin, cmd.name))
         return answer(cmd.name)
 
