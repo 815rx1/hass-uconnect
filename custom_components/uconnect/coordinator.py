@@ -298,6 +298,8 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
         )
         # The ignition and EV running state of each vehicle at the last poll
         self._running: dict[str, tuple[bool | None, bool | None]] = {}
+        # And when the client last saw each of them switched off
+        self._switched_off_at: dict[str, datetime | None] = {}
         # The polls after a switch-off still to come, and when the location
         # of each vehicle switched off is to be checked
         self._switch_off_polls: list[CALLBACK_TYPE] = []
@@ -583,8 +585,22 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
             state = (vehicle.ignition_on, vehicle.ev_running)
             before = self._running.get(vin)
             self._running[vin] = state
-            if before is not None and any(
-                was is True and is_now is False for was, is_now in zip(before, state)
+            # A drive between two polls shows only in the time of the
+            # switch-off: the states read while on are left out with it
+            off_at = self.client.switched_off_at(vin)
+            if not isinstance(off_at, datetime):
+                off_at = None
+            off_before = self._switched_off_at.get(vin)
+            self._switched_off_at[vin] = off_at
+            if before is not None and (
+                any(
+                    was is True and is_now is False
+                    for was, is_now in zip(before, state)
+                )
+                or (
+                    off_at is not None
+                    and (off_before is None or off_at > off_before)
+                )
             ):
                 switched_off = True
                 self._location_checks[vin] = now + max(SWITCH_OFF_POLL_DELAYS)

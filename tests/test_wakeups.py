@@ -852,6 +852,29 @@ async def test_location_is_requested_once_if_it_did_not_come(
     assert location_requests(mock_client) == 1
 
 
+async def test_drive_between_two_polls_is_followed_as_a_switch_off(
+    hass, freezer, config_entry, mock_client, vehicle
+):
+    # Parked, then driven between two polls: the poll after it reads the
+    # switch-off, and the states read while on are left out with it
+    vehicle.charging = False
+    vehicle.ignition_on = False
+    vehicle.ev_running = False
+    vehicle.location = Location(latitude=48.1, longitude=11.5, updated=dt_util.utcnow())
+    await setup(hass, config_entry, 0)
+    await run_for(hass, freezer, 16, every=0.5)
+    times = []
+    mock_client.refresh.side_effect = lambda: times.append(dt_util.utcnow())
+
+    vehicle.ev_running = None
+    mock_client.switched_off_at.return_value = dt_util.utcnow()
+    await run_for(hass, freezer, 9, every=0.25)
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert [round((t - times[0]).total_seconds() / 60) for t in times][:3] == [0, 1, 3]
+    assert location_requests(mock_client) == 1
+
+
 async def test_location_not_read_is_checked_again_with_the_next_poll(
     hass, freezer, config_entry, mock_client, vehicle
 ):
