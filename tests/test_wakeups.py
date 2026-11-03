@@ -897,3 +897,22 @@ async def test_location_is_not_requested_with_a_rejected_pin(
     await run_for(hass, freezer, 30, every=0.5)
     await hass.async_block_till_done(wait_background_tasks=True)
     assert location_requests(mock_client) == 0
+
+
+async def test_first_refresh_waiting_for_the_client_needs_fresh_data(
+    hass, freezer, config_entry, mock_client, vehicle
+):
+    # Decided with the charge data 55 minutes old, then held up by a slow
+    # poll until it is 80 minutes old: no longer enough for a first refresh
+    charging_car(mock_client, vehicle)
+    vehicle.timestamp_ev_info = dt_util.utcnow() - timedelta(minutes=40)
+    await setup(hass, config_entry, 30)
+    coordinator = config_entry.runtime_data
+
+    await run_for(hass, freezer, 10)
+    await coordinator._client_lock.acquire()
+    await run_for(hass, freezer, 30)
+    coordinator._client_lock.release()
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert deep_refreshes(mock_client) == 0

@@ -39,6 +39,7 @@ from .coordinator import (
 from .wake_guard import (
     AUTO_REFRESH_FIRST_STEP,
     AUTO_REFRESH_MAX_FAILURES,
+    AUTO_REFRESH_MAX_WITHOUT_PROGRESS,
     Decision,
     WakeRecord,
     async_get_wake_guard,
@@ -480,7 +481,7 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
                 self._vin,
                 COMMAND_DEEP_REFRESH,
                 automatic=True,
-                blocker=self._refresh_blocker,
+                blocker=lambda: self._refresh_blocker(record),
             )
         except ServiceValidationError as err:
             # Refused before anything reached the vehicle, so it does not
@@ -546,12 +547,13 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
 
         return COMMAND_DEEP_REFRESH.name in vehicle.supported_commands
 
-    def _refresh_blocker(self) -> str | None:
+    def _refresh_blocker(self, record: WakeRecord | None = None) -> str | None:
         """Return why the vehicle must not be woken now, None if it may.
 
         Judged on what the cloud reports right now, never on the state this
         sensor carried over: a charge that ended while Home Assistant was down,
-        or a poll that failed, must not lead to a wake-up.
+        or a poll that failed, must not lead to a wake-up. record is the
+        refresh being checked, when it has been recorded already.
         """
         coordinator = self.coordinator
         if coordinator.auth_failed:
@@ -585,13 +587,16 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
 
         # Refreshes renew the data only while they keep coming. After a gap,
         # Home Assistant or the cloud having been down, the next one is a
-        # first refresh again
+        # first refresh again. Checked again once the client is free, the
+        # refresh in question is recorded already and is not one before it
         guard = async_get_wake_guard(self.hass)
         session = guard.session(self._vin)
-        last = guard.last_auto_refresh(self._vin)
+        earlier = [w for w in guard.wakes(self._vin) if w.automatic and w is not record]
+        last = earlier[-1].at if earlier else None
+        refreshes = session.auto_refreshes - (1 if record is not None else 0)
         interval = timedelta(minutes=coordinator.charging_refresh_interval)
         following = (
-            session.auto_refreshes > 0
+            refreshes > 0
             and session.started is not None
             and last is not None
             and last >= session.started
@@ -745,14 +750,13 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
             # A vehicle driven since the baseline reading is on a charge of
             # its own: the one that reading was taken in ended unseen, while
             # Home Assistant or the cloud was down, and the odometer does not
-            # move during a charge
+            # move during a charge. That holds whether it was plugged in again
+            # below the old reading or above it, and the reading is taken as
+            # the baseline of the new charge either way
             odometer = getattr(self.vehicle, "odometer", None)
             if (
-                soc_changed
-                and self._state.is_charging  # Was already charging
+                self._state.is_charging  # Was already charging
                 and is_charging  # And still is
-                and self._state.last_actual_soc is not None
-                and current_soc < self._state.last_actual_soc
                 and odometer is not None
                 and self._state.last_odometer is not None
                 and odometer != self._state.last_odometer
@@ -764,6 +768,7 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
                 )
                 self._state.is_charging = False
                 self._state.measured_this_session = False
+                soc_changed = True
                 new_charge = True
             elif (
                 soc_changed
@@ -929,6 +934,11 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
             self._state.rate_baseline_stale = not soc_changed
             self._state.last_actual_soc_time = now
             self._state.soc_confirmed_time = None
+            # The odometer is uploaded apart from the charge data and can
+            # arrive only with the charge, so a reading kept from the drive
+            # would make the charge look like a new one at its next reading
+            if (odometer := getattr(self.vehicle, "odometer", None)) is not None:
+                self._state.last_odometer = odometer
 
         # Calculate charging rate if charging with valid data
         # Don't recalculate if we detected stale charging data
@@ -1221,10 +1231,18 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
 
         extrapolated = base_soc + (rate * correction * elapsed_hours)
 
-        # A later upload of the same reading puts the vehicle back there
+        # A later upload of the same reading puts the vehicle back there.
+        # Once the refreshes gave up because none brought a new percent, the
+        # charge has stalled and it stays there until the vehicle uploads more
         confirmed = self._state.soc_confirmed_time
         if confirmed is not None and self._state.last_vehicle_soc is not None:
             since = max((now - confirmed).total_seconds() / 3600.0, 0.0)
+            if (
+                self.hass is not None
+                and async_get_wake_guard(self.hass).session(self._vin).without_progress
+                >= AUTO_REFRESH_MAX_WITHOUT_PROGRESS
+            ):
+                since = 0.0
             extrapolated = min(
                 extrapolated,
                 self._state.last_vehicle_soc + rate * correction * since,

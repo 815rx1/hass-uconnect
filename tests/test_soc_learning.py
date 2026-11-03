@@ -26,7 +26,10 @@ from custom_components.uconnect.extrapolated_soc import (
     MAX_IDLE_DRAIN_RATE,
     SocEstimationState,
 )
-from custom_components.uconnect.wake_guard import async_get_wake_guard
+from custom_components.uconnect.wake_guard import (
+    AUTO_REFRESH_MAX_WITHOUT_PROGRESS,
+    async_get_wake_guard,
+)
 
 from .conftest import VIN
 
@@ -317,6 +320,98 @@ async def test_same_reading_uploaded_again_holds_the_charge_estimate(
     await report(hass, freezer, setup_integration, vehicle, 0.1)
     assert parked.native_value == pytest.approx(69, abs=0.1)
     assert parked._state.charging_rate_pct_per_hour == pytest.approx(20)
+
+
+async def test_stalled_charge_is_held_once_the_refreshes_gave_up(
+    hass, freezer, setup_integration, vehicle, parked
+):
+    def uploaded(hours: float):
+        return dt_util.utcnow() + timedelta(hours=hours)
+
+    await report(
+        hass, freezer, setup_integration, vehicle, 1,
+        charging=True, timestamp_ev_info=uploaded(1),
+    )
+    await report(
+        hass, freezer, setup_integration, vehicle, 0.5,
+        state_of_charge=65, timestamp_ev_info=uploaded(0.5),
+    )
+    await report(
+        hass, freezer, setup_integration, vehicle, 0.1,
+        state_of_charge=67, timestamp_ev_info=uploaded(0.1),
+    )
+    await report(
+        hass, freezer, setup_integration, vehicle, 0.5, timestamp_ev_info=uploaded(0.5)
+    )
+    # The last refreshes brought the same 67 too, and no more are sent
+    async_get_wake_guard(hass).session(VIN).without_progress = (
+        AUTO_REFRESH_MAX_WITHOUT_PROGRESS
+    )
+
+    await report(hass, freezer, setup_integration, vehicle, 3)
+    assert parked.native_value == pytest.approx(67, abs=0.1)
+
+    # A new percent from the vehicle is extrapolated on as before
+    await report(
+        hass, freezer, setup_integration, vehicle, 0.1,
+        state_of_charge=68, timestamp_ev_info=uploaded(0),
+    )
+    assert parked._state.soc_confirmed_time is None
+
+
+async def test_higher_charging_reading_after_a_drive_is_a_new_charge(
+    hass, freezer, setup_integration, vehicle, sensor
+):
+    vehicle.time_to_fully_charge_l1 = None
+    vehicle.time_to_fully_charge_l2 = 120
+    vehicle.time_to_fully_charge_l3 = None
+    await report(
+        hass, freezer, setup_integration, vehicle, 0,
+        charging=True, ignition_on=False, state_of_charge=80, odometer=1000,
+        charging_level=2,
+    )
+    guard = async_get_wake_guard(hass)
+    session = guard.session(VIN)
+    session.without_progress = AUTO_REFRESH_MAX_WITHOUT_PROGRESS
+
+    # Charged on to 95 unseen, driven down to 85 and plugged in again
+    await report(
+        hass, freezer, setup_integration, vehicle, 8,
+        state_of_charge=85, odometer=1050,
+    )
+
+    assert guard.session(VIN).without_progress == 0
+    assert not sensor._state.measured_this_session
+    # Rated from the time-to-full, not from 80 to 85 over the eight hours
+    assert sensor._state.charging_rate_pct_per_hour == pytest.approx(7.5)
+
+    # Its next reading belongs to the same charge
+    started = guard.session(VIN).started
+    await report(hass, freezer, setup_integration, vehicle, 0.5, state_of_charge=88)
+    assert guard.session(VIN).started == started
+    assert sensor._state.charging_rate_pct_per_hour == pytest.approx(6)
+
+
+async def test_odometer_arriving_with_the_charge_is_no_new_charge(
+    hass, freezer, setup_integration, vehicle, sensor
+):
+    # As on 30.10.: parked at 52 with the odometer from before the drive,
+    # which only came up to date with the upload that started the charge
+    await report(
+        hass, freezer, setup_integration, vehicle, 0,
+        charging=False, ignition_on=False, state_of_charge=52, odometer=32642,
+    )
+    await report(
+        hass, freezer, setup_integration, vehicle, 7,
+        charging=True, odometer=32653,
+    )
+    guard = async_get_wake_guard(hass)
+    started = guard.session(VIN).started
+
+    await report(hass, freezer, setup_integration, vehicle, 0.25, state_of_charge=61)
+
+    assert guard.session(VIN).started == started
+    assert sensor._state.last_vehicle_soc == 61
 
 
 async def test_state_is_restored_although_stored_unavailable(
