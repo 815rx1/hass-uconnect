@@ -852,6 +852,39 @@ async def test_location_is_requested_once_if_it_did_not_come(
     assert location_requests(mock_client) == 1
 
 
+async def test_location_not_read_is_checked_again_with_the_next_poll(
+    hass, freezer, config_entry, mock_client, vehicle
+):
+    await drive(hass, freezer, config_entry, mock_client, vehicle, 16)
+    vehicle.ignition_on = False
+    # Uploaded with the next poll, which sees it
+    mock_client.switched_off_at.return_value = dt_util.utcnow() + timedelta(minutes=2)
+    # The cloud failed to answer the location in the polls after it
+    mock_client.location_read.return_value = False
+    await run_for(hass, freezer, 6, every=0.5)
+    await hass.async_block_till_done(wait_background_tasks=True)
+    assert location_requests(mock_client) == 0
+
+    # Read at the next poll, still in the window: the old one did not come
+    mock_client.location_read.return_value = True
+    await run_for(hass, freezer, 6, every=0.5)
+    await hass.async_block_till_done(wait_background_tasks=True)
+    assert location_requests(mock_client) == 1
+
+
+async def test_location_never_read_is_not_requested(
+    hass, freezer, config_entry, mock_client, vehicle
+):
+    await drive(hass, freezer, config_entry, mock_client, vehicle, 16)
+    vehicle.ignition_on = False
+    mock_client.switched_off_at.return_value = dt_util.utcnow()
+    mock_client.location_read.return_value = False
+
+    await run_for(hass, freezer, 30, every=0.5)
+    await hass.async_block_till_done(wait_background_tasks=True)
+    assert location_requests(mock_client) == 0
+
+
 async def test_location_that_came_along_is_not_requested(
     hass, freezer, config_entry, mock_client, vehicle
 ):

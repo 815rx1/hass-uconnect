@@ -14,9 +14,9 @@ around it:
 - the clock jumping, e.g. a Raspberry Pi without real-time clock booting with
   an old time: a wake-up dated in the future counts as just now, and one dated
   more than a day ahead is set aside so it cannot block refreshes for good. It
-  is only discarded once the clock stayed behind it for a day, or came within
-  a day of it without passing it: the clock of a boot is corrected long
-  before, and at once, and the history must not be lost to it
+  is only discarded once the clock stayed behind it for a day, or jumped to
+  within a day of it without passing it: the clock of a boot is corrected
+  long before, and at once, and the history must not be lost to it
 
 Commands sent on request are recorded too. They are never held back for
 timing, only repeated and runaway ones are: a refresh right after another, or
@@ -131,6 +131,9 @@ MANUAL_MAX_PER_DAY = 100
 HISTORY_WINDOW = timedelta(hours=24)
 # Timestamps further ahead than this can only come from a wrong clock
 FUTURE_TOLERANCE = timedelta(days=1)
+# The clock moving this much more or less than the monotonic one jumped, as a
+# corrected clock does
+CLOCK_JUMP = timedelta(minutes=5)
 # Only bounds the file, above what the limits let through within a day: 30 an
 # hour of the securing commands of each group, 100 others and the automatic
 # refreshes. Cutting a day's history short would reset those limits.
@@ -206,6 +209,8 @@ class VehicleWakes:
     # clock they are, see _vehicle
     ahead: list[WakeRecord] = field(default_factory=list)
     ahead_since: float | None = None
+    # The clock less the monotonic one when they were set aside
+    ahead_offset: float | None = None
 
 
 def _utcnow() -> datetime:
@@ -358,10 +363,18 @@ class WakeGuard:
     def _vehicle(self, vin: str, now: datetime) -> VehicleWakes:
         entry = self._vehicles.setdefault(vin, VehicleWakes())
         limit = now + FUTURE_TOLERANCE
-        # One set aside that comes within a day while still ahead was dated
-        # wrong: a corrected clock jumps past them, this one moved towards it.
-        # Counted as just now, it would hold back refreshes for a day.
-        returning = [w for w in entry.ahead if now < w.at <= limit]
+        offset = now.timestamp() - monotonic()
+        # One set aside that a jump of the clock brought within a day, but
+        # not past it, was dated wrong: a corrected clock jumps past them.
+        # Counted as just now, it would hold back refreshes for a day. A clock
+        # that only ran on towards it may still be the wrong one: it stays
+        # aside, neither counted nor dropped.
+        jumped = (
+            entry.ahead_offset is not None
+            and abs(offset - entry.ahead_offset) > CLOCK_JUMP.total_seconds()
+        )
+        nearing = [w for w in entry.ahead if now < w.at <= limit]
+        returning = nearing if jumped else []
         if returning:
             _LOGGER.warning(
                 "Dropping %d wake-ups of %s dated ahead, the clock was wrong",
@@ -372,11 +385,13 @@ class WakeGuard:
         records = entry.wakes + [w for w in entry.ahead if w not in returning]
         # Set aside rather than dropped: the clock may be the one that is
         # wrong, and once it is corrected they count again
-        ahead = [w for w in records if w.at > limit]
+        ahead = [w for w in records if w.at > limit or w in nearing]
+        valid = [w for w in records if w not in ahead]
         if not ahead:
-            entry.ahead_since = None
+            entry.ahead_since = entry.ahead_offset = None
         elif entry.ahead_since is None:
             entry.ahead_since = monotonic()
+            entry.ahead_offset = offset
             _LOGGER.warning(
                 "Ignoring %d wake-ups of %s dated more than a day ahead, "
                 "the clock was probably wrong",
@@ -391,10 +406,9 @@ class WakeGuard:
                 vin,
             )
             ahead = []
-            entry.ahead_since = None
+            entry.ahead_since = entry.ahead_offset = None
             self._save()
         entry.ahead = sorted(ahead, key=lambda w: w.at)
-        valid = [w for w in records if w.at <= limit]
         kept = [w for w in valid if _age(now, w.at) < HISTORY_WINDOW]
         # The latest one is kept beyond the window, it still dates the last
         # wake-up

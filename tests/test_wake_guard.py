@@ -487,6 +487,40 @@ async def test_clock_ahead_does_not_hold_refreshes_back_once_corrected(hass):
         assert begin(guard, 13 * 60).decision is Decision.ALLOWED
 
 
+async def test_clock_running_wrong_keeps_the_wakes_set_aside(hass):
+    clock = [1000.0]
+    with patch("custom_components.uconnect.wake_guard.monotonic", lambda: clock[0]):
+        guard = await new_guard(hass)
+        guard._vehicle(VIN, at(0)).wakes.extend(
+            WakeRecord(at(-i * 60), "DEEPREFRESH", True) for i in (0, 4)
+        )
+
+        # Started with the clock a day and a half behind, and running on wrong
+        # for hours, which brings it within a day of them
+        for hour in range(13):
+            assert guard.auto_refreshes_last_day(VIN, at((hour - 36) * 60)) == 0
+            clock[0] += 3600
+
+        # Corrected at last: they are from today and count
+        assert guard.auto_refreshes_last_day(VIN, at(0)) == 2
+
+
+async def test_clock_jumping_to_within_a_day_drops_the_wakes_set_aside(hass):
+    clock = [1000.0]
+    with patch("custom_components.uconnect.wake_guard.monotonic", lambda: clock[0]):
+        guard = await new_guard(hass)
+        guard._vehicle(VIN, at(36 * 60)).wakes.append(
+            WakeRecord(at(36 * 60), "DEEPREFRESH", True)
+        )
+        assert guard.auto_refreshes_last_day(VIN, at(0)) == 0
+
+        # The clock jumps half a day, not past it: it was dated wrong
+        clock[0] += 60
+        assert guard.auto_refreshes_last_day(VIN, at(13 * 60)) == 0
+        assert not guard._vehicle(VIN, at(13 * 60)).ahead
+        assert guard.auto_refreshes_last_day(VIN, at(37 * 60)) == 0
+
+
 async def test_damaged_storage_is_ignored(hass, hass_storage):
     hass_storage[STORAGE_KEY] = {
         "version": 1,

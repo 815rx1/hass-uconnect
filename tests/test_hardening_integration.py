@@ -725,6 +725,54 @@ async def test_rejection_of_a_replaced_pin_stays_for_that_pin(
     mock_client.command_verify.assert_not_called()
 
 
+async def test_second_rejected_pin_keeps_the_setup_pin_rejected(
+    hass, hass_storage, config_entry, mock_client
+):
+    from custom_components.uconnect.coordinator import PIN_REJECTION_STORAGE_KEY
+
+    stored = {"pin": "fp-1234", "locked": False}
+    pin_rejections(mock_client, hass_storage, config_entry, stored)
+    mock_client.api.pin = "5678"
+    config_entry.add_to_hass(hass)
+    hass.config_entries.async_update_entry(
+        config_entry, options={**config_entry.options, "pin": "5678"}
+    )
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    # The PIN in the options is rejected too: both are kept
+    mock_client.api.pin_rejected = mock_client.api.pin_locked = True
+    await config_entry.runtime_data._async_save_pin_rejection()
+    assert hass_storage[PIN_REJECTION_STORAGE_KEY]["data"] == {
+        config_entry.entry_id: {"pin": "fp-5678", "locked": True, "earlier": [stored]}
+    }
+
+    # Clearing the option brings the setup PIN back, which is not sent again
+    result = await hass.config_entries.options.async_init(config_entry.entry_id)
+    await hass.config_entries.options.async_configure(
+        result["flow_id"], {**config_entry.options, "pin": ""}
+    )
+    await hass.async_block_till_done()
+    mock_client.set_pin.assert_called_with("1234")
+    assert mock_client.api.pin_rejected and not mock_client.api.pin_locked
+    with pytest.raises(HomeAssistantError):
+        await hass.services.async_call(DOMAIN, "doors_lock", {}, blocking=True)
+    mock_client.command_verify.assert_not_called()
+
+    # Saving it unchanged releases the setup PIN only
+    mock_client.api.clear_pin_rejection.side_effect = lambda: setattr(
+        mock_client.api, "pin_rejected", False
+    )
+    result = await hass.config_entries.options.async_init(config_entry.entry_id)
+    await hass.config_entries.options.async_configure(
+        result["flow_id"], {**config_entry.options, "pin": ""}
+    )
+    await hass.async_block_till_done()
+    assert hass_storage[PIN_REJECTION_STORAGE_KEY]["data"] == {
+        config_entry.entry_id: {"pin": "fp-5678", "locked": True}
+    }
+
+
 @pytest.mark.parametrize("pin", ["", "1234"])
 async def test_changing_another_option_does_not_send_a_rejected_pin_again(
     hass, hass_storage, config_entry, mock_client, pin

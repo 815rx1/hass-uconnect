@@ -815,6 +815,32 @@ def test_pin_rejection_is_restored_only_for_the_same_pin():
     assert api.pin_rejected and not api.pin_locked
 
 
+def test_second_rejected_pin_keeps_the_first_one_rejected():
+    api = logged_in_api()
+    rejected = response(403, {"name": "INVALID_PIN"})
+    for pin in ("1234", "5678"):
+        api.set_pin(pin)
+        with patch.object(api.sess, "request", return_value=rejected):
+            with pytest.raises(PinRejectedError):
+                api.command(VIN, COMMAND_DOORS_LOCK)
+
+    # The setup PIN coming back when the option is cleared is not sent again
+    api.set_pin("1234")
+    assert api.pin_rejected
+    with patch.object(api.sess, "request") as req:
+        with pytest.raises(PinRejectedError):
+            api.command(VIN, COMMAND_DOORS_LOCK)
+    req.assert_not_called()
+
+    # Releasing one lets only that one go out
+    api.clear_pin_rejection()
+    assert not api.pin_rejected
+    api.set_pin("5678")
+    assert api.pin_rejected
+    forget_pin_rejection(FIAT_EU.login_url, "user@example.com", "5678")
+    assert not api.pin_rejected and not _PIN_REJECTIONS
+
+
 def no_json() -> requests.Response:
     r = response(200)
     r._content = b"OK"
@@ -1366,6 +1392,33 @@ def test_locked_states_reported_at_the_switch_off_are_unknown():
     assert remote_states(v) == [True] * 7 + [False]
 
 
+def test_locked_states_reported_at_the_switch_off_are_unknown_after_a_restart():
+    """29.10. 16:26: restarted after the switch-off, before a poll saw it.
+    The last poll before saw the vehicle on."""
+    start = datetime.now(timezone.utc) - timedelta(hours=2)
+    parked = start + timedelta(minutes=18)
+    client = make_client(
+        [ev_upload("ON", start)], remote=remote_report(start + timedelta(seconds=22))
+    )
+    client.refresh()
+    saved = json.loads(json.dumps(client.confirmed_states()))
+
+    restarted = make_client(
+        [ev_upload("OFF", parked + timedelta(seconds=4))] * 2,
+        remote=remote_report(parked, running="OFF"),
+    )
+    restarted.restore_confirmed_states(saved)
+    restarted.refresh()
+    assert remote_states(restarted.vehicles[VIN]) == [None] * 7 + [False]
+    assert abs(restarted.switched_off_at(VIN) - parked).total_seconds() < 5
+
+    # Seen on in the future, with the clock ahead: not taken back
+    saved[VIN]["switched_on_at"]["at"] = (start + timedelta(days=2)).isoformat()
+    restarted = make_client([ev_upload("OFF", parked + timedelta(seconds=4))])
+    restarted.restore_confirmed_states(saved)
+    assert restarted._switched_on_at == {}
+
+
 def test_locked_states_reported_at_the_switch_off_stay_unknown_after_a_parked_upload():
     """The switch-off upload was not polled, only a later one of the parked
     car: the report at the switch-off is still left out."""
@@ -1547,7 +1600,11 @@ def test_lock_confirmed_while_on_is_unknown_once_switched_off():
     client.refresh()
     assert v.ignition_on is False
     assert remote_states(v) == [None] * 8
-    assert client.confirmed_states()[VIN].keys() == {"reported_before_switch_off"}
+    assert client.confirmed_states()[VIN].keys() == {
+        "reported_before_switch_off",
+        "switched_on_at",
+        "switched_off_at",
+    }
     client.refresh()
     assert remote_states(v) == [None] * 8
 
@@ -1604,6 +1661,57 @@ def test_lock_confirmed_while_the_status_fails_is_kept_a_day_at_most():
     with patch.object(client_module, "monotonic", lambda: later):
         client.refresh()
     assert v.door_driver_locked is None
+
+
+@pytest.mark.parametrize("status", ["TIMEOUT", "SUCCESS"])
+def test_unlock_is_not_shown_locked_once_a_day_old(status):
+    """The vehicle unlocked and uploaded nothing since: the report from
+    before the unlock must not come back as the state a day on."""
+    from custom_components.uconnect.pyuconnect.client import LOCK_OVERRIDE_MAX_AGE
+    from custom_components.uconnect.pyuconnect.command import COMMAND_DOORS_UNLOCK
+
+    client = locked_by_home_assistant()
+    upload = ev_upload("OFF", datetime.now(timezone.utc) - timedelta(minutes=30))
+    client.api.get_vehicle.side_effect = lambda vin: copy.deepcopy(upload)
+    client.api.get_remote_operation_status.return_value = {"status": status}
+    client.api.get_vehicle_notifications.return_value = {}
+    start = client_module.monotonic()
+    late = iter([start, start])
+    with (
+        patch("custom_components.uconnect.pyuconnect.client.sleep"),
+        patch.object(client_module, "monotonic", side_effect=lambda: next(late, start + 61)),
+    ):
+        client.command_verify(VIN, COMMAND_DOORS_UNLOCK)
+    v = client.vehicles[VIN]
+    client.refresh()
+    assert remote_states(v)[:4] == ([None] * 4 if status == "TIMEOUT" else [False] * 4)
+
+    later = client_module.monotonic() + LOCK_OVERRIDE_MAX_AGE + 600
+    with patch.object(client_module, "monotonic", lambda: later):
+        client.refresh()
+        assert remote_states(v)[:4] == [None] * 4
+        client.refresh()
+        assert remote_states(v)[:4] == [None] * 4
+
+    # Also over a restart, with the report and the unlock days old
+    saved = json.loads(json.dumps(client.confirmed_states()))
+    days_ago = datetime.now(timezone.utc) - timedelta(days=3)
+    for entry in saved[VIN].values():
+        entry["at"] = (days_ago + timedelta(hours=1)).isoformat()
+    restarted = make_client(
+        [ev_upload("OFF", days_ago)], remote=remote_report(days_ago, running="OFF")
+    )
+    restarted.restore_confirmed_states(saved)
+    restarted.refresh()
+    assert remote_states(restarted.vehicles[VIN])[:4] == [None] * 4
+
+    # Until the vehicle reports again
+    client.api.get_vehicle_status.return_value = remote_report(
+        datetime.now(timezone.utc) + timedelta(seconds=5), running="OFF"
+    )
+    with patch.object(client_module, "monotonic", lambda: later):
+        client.refresh()
+    assert remote_states(v)[:4] == [True] * 4
 
 
 def test_lock_saved_with_the_clock_ahead_is_not_restored():
@@ -1899,6 +2007,24 @@ def test_position_at_zero_is_ignored():
     client.api.get_vehicle_location.return_value = {"latitude": 0, "longitude": 0}
     client.refresh()
     assert client.vehicles[VIN].location == good
+    assert not client.location_read(VIN)
+
+
+def test_failed_location_read_is_told_apart():
+    client = make_client([load_fixture("status_500e.json")] * 3)
+    assert not client.location_read(VIN)
+    client.refresh()
+    assert client.location_read(VIN)
+
+    # The position shown is kept, but may be older than the cloud's
+    client.api.get_vehicle_location.side_effect = requests.HTTPError("503")
+    client.refresh()
+    assert client.vehicles[VIN].location is not None
+    assert not client.location_read(VIN)
+
+    client.api.get_vehicle_location.side_effect = None
+    client.refresh()
+    assert client.location_read(VIN)
 
 
 def test_command_status_timeout_is_final():

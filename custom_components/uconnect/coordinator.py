@@ -22,6 +22,7 @@ from .pyuconnect.api import (
     LoginError,
     PinAuthError,
     PinRejectedError,
+    PIN_REJECTIONS_KEPT,
     forget_pin_rejection,
     pin_rejection_fingerprint,
 )
@@ -701,6 +702,11 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
             return "the location came along"
         if dt_util.utcnow() - off_at > SWITCH_OFF_LOCATION_WINDOW:
             return "the switch-off was too long ago"
+        if not self.client.location_read(vin):
+            # The cloud may have the position already: the next poll in the
+            # window decides
+            self._location_checks[vin] = dt_util.utcnow()
+            return "the location could not be read, checked again with the next poll"
         if COMMAND_REFRESH_LOCATION.name not in vehicle.supported_commands:
             return "the vehicle does not offer it"
         if self.auth_failed:
@@ -1131,9 +1137,9 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
         the restart or of a PIN set again."""
         entry_id = self.config_entry.entry_id
         stored = (await self._pin_rejection.async_load()).get(entry_id)
-        if isinstance(stored, dict):
+        for rejection in _stored_pin_rejections(stored):
             self.client.api.restore_pin_rejection(
-                stored.get("pin"), stored.get("locked"), entry_id
+                rejection["pin"], rejection["locked"], entry_id
             )
         # Also one known only in memory, e.g. from a refresh still running
         # while the entry reloaded, or from an entry removed and added again
@@ -1145,15 +1151,18 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
         fingerprint = api.pin_rejection_fingerprint(entry_id)
         try:
             stored = (await self._pin_rejection.async_load()).get(entry_id)
+            # The rejections of PINs since replaced stay: a blank PIN field
+            # brings the one given at setup back
+            rejections = [
+                rejection
+                for rejection in _stored_pin_rejections(stored)
+                if rejection["pin"] != fingerprint
+            ]
             if api.pin_rejected:
-                entries = {entry_id: {"pin": fingerprint, "locked": api.pin_locked}}
-            elif isinstance(stored, dict) and stored.get("pin") != fingerprint:
-                # The rejection of a PIN since replaced stays: a blank PIN
-                # field brings the one given at setup back
-                entries = {entry_id: stored}
-            else:
-                entries = {}
-            self._pin_rejection.update([entry_id], entries)
+                rejections.append({"pin": fingerprint, "locked": api.pin_locked})
+            self._pin_rejection.update(
+                [entry_id], _pin_rejection_entries(entry_id, rejections)
+            )
             # Written even when nothing changed: Home Assistant only logs a
             # failed write, and the data in memory would pass for saved
             await self._pin_rejection.async_save()
@@ -1254,8 +1263,40 @@ async def async_retry_pin(hass: HomeAssistant, entry: ConfigEntry, pin: str) -> 
     # in _async_save_pin_rejection, for a blank PIN field brings it back
     store = VehicleStore.shared(hass, PIN_REJECTION_STORAGE_KEY)
     stored = (await store.async_load()).get(entry.entry_id)
-    if isinstance(stored, dict) and stored.get("pin") == pin_rejection_fingerprint(
-        entry.entry_id, pin
-    ):
-        store.update([entry.entry_id], {})
+    rejections = _stored_pin_rejections(stored)
+    fingerprint = pin_rejection_fingerprint(entry.entry_id, pin)
+    if any(rejection["pin"] == fingerprint for rejection in rejections):
+        rejections = [r for r in rejections if r["pin"] != fingerprint]
+        store.update([entry.entry_id], _pin_rejection_entries(entry.entry_id, rejections))
         await store.async_save()
+
+
+def _stored_pin_rejections(stored: Any) -> list[dict[str, Any]]:
+    """The PIN rejections stored for an entry, oldest first.
+
+    The latest one is kept as "pin" and "locked", as before more than one
+    was kept, so that an older version still finds it; the others are in
+    "earlier".
+    """
+    if not isinstance(stored, dict):
+        return []
+    earlier = stored.get("earlier")
+    rejections = [*(earlier if isinstance(earlier, list) else []), stored]
+    return [
+        {"pin": rejection["pin"], "locked": rejection.get("locked") is True}
+        for rejection in rejections
+        if isinstance(rejection, dict) and isinstance(rejection.get("pin"), str)
+    ]
+
+
+def _pin_rejection_entries(
+    entry_id: str, rejections: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """The store entries for the PIN rejections of an entry, oldest first"""
+    if not rejections:
+        return {}
+    *earlier, latest = rejections[-PIN_REJECTIONS_KEPT:]
+    stored = dict(latest)
+    if earlier:
+        stored["earlier"] = earlier
+    return {entry_id: stored}

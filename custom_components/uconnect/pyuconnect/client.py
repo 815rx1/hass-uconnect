@@ -735,11 +735,18 @@ WRITE_OVERRIDE_MAX_AGE = 3600
 # Lock commands and the states they set. The vehicle often uploads no new
 # status after a remote lock, so the cloud keeps reporting the state from
 # before for hours. The state confirmed is shown until the vehicle uploads a
-# newer one, which it does when it is unlocked by key, for a day at most.
+# newer one, which it does when it is unlocked by key, for a day at most. The
+# report from before is no truer after that day: the states are unknown until
+# a newer one.
 LOCK_OVERRIDE_MAX_AGE = 24 * 3600
 # Kept with the confirmed states, see Client._drop_states_reported_while_on
 REPORTED_BEFORE_OFF = "reported_before_switch_off"
 REPORTED_AT_OFF = "reported_at_switch_off"
+# Kept with them too: a restart between the last poll that saw the vehicle on
+# and the first that sees it off would take the report made at the switch-off
+# for the parked car's
+SWITCHED_ON_AT = "switched_on_at"
+SWITCHED_OFF_AT = "switched_off_at"
 # A report this close to the switch-off was made with the driver still in
 # the seat
 SWITCH_OFF_REPORT_WINDOW = 60
@@ -814,6 +821,8 @@ class Client:
         # When each vehicle was last seen on, and first seen off after that
         self._switched_on_at: Dict[str, datetime] = {}
         self._switched_off_at: Dict[str, datetime] = {}
+        # Whether the last location read of each vehicle gave a position
+        self._location_read: Dict[str, bool] = {}
         # Confirmed changes the cloud may not show yet, see
         # WRITE_OVERRIDE_MAX_AGE: value, when it was written and monotonic
         self._written: Dict[str, Dict[str, tuple[Any, datetime, float]]] = {}
@@ -856,6 +865,7 @@ class Client:
                 self._reported_at_off.pop(vin, None)
                 self._switched_on_at.pop(vin, None)
                 self._switched_off_at.pop(vin, None)
+                self._location_read.pop(vin, None)
                 self._written.pop(vin, None)
 
         for x in vehicles:
@@ -971,6 +981,7 @@ class Client:
                     continue
                 raise
 
+            self._location_read[vin] = False
             try:
                 loc = self.api.get_vehicle_location(vin)
 
@@ -993,6 +1004,7 @@ class Client:
                         is_approximate=sg_bool(loc, "isLocationApprox"),
                         updated=updated,
                     )
+                    self._location_read[vin] = True
             except Exception as err:
                 _LOGGER.debug("Location not available for %s: %s", vin, err)
 
@@ -1134,7 +1146,9 @@ class Client:
         """The changes confirmed and not reported yet, to keep over a restart:
         lock states, charge schedules and the charging level. Also the remote
         status each vehicle was switched off after: a restart while the status
-        upload fails would otherwise show the states of the drive again."""
+        upload fails would otherwise show the states of the drive again. And
+        when each vehicle was last seen on and switched off, see
+        _note_switch_off."""
 
         states = {
             vin: {
@@ -1147,6 +1161,8 @@ class Client:
         for key, markers in (
             (REPORTED_BEFORE_OFF, self._reported_before_off),
             (REPORTED_AT_OFF, self._reported_at_off),
+            (SWITCHED_ON_AT, self._switched_on_at),
+            (SWITCHED_OFF_AT, self._switched_off_at),
         ):
             for vin, reported in markers.items():
                 states.setdefault(vin, {})[key] = {
@@ -1181,6 +1197,17 @@ class Client:
                         )
                         markers[vin] = at
                     continue
+                if what in (SWITCHED_ON_AT, SWITCHED_OFF_AT):
+                    # Not one from a clock that was ahead: seen on in the
+                    # future, no switch-off would be noticed until then
+                    if at.tzinfo is not None and at <= now + timedelta(minutes=5):
+                        times = (
+                            self._switched_on_at
+                            if what == SWITCHED_ON_AT
+                            else self._switched_off_at
+                        )
+                        times.setdefault(vin, at)
+                    continue
                 if what.startswith("lock:"):
                     valid = isinstance(value, dict)
                 elif what == "schedules":
@@ -1198,7 +1225,13 @@ class Client:
                 if at > now + timedelta(minutes=5):
                     continue
                 age = max((now - at).total_seconds(), 0.0)
-                if age > self._override_max_age(what):
+                # Locks left unknown stay so until a newer report, see
+                # _apply_written_locks
+                if age > self._override_max_age(what) and not (
+                    what.startswith("lock:")
+                    and value
+                    and all(v is None for v in value.values())
+                ):
                     continue
                 self._written.setdefault(vin, {})[what] = (value, at, monotonic() - age)
 
@@ -1405,6 +1438,12 @@ class Client:
 
         return self._switched_off_at.get(vin)
 
+    def location_read(self, vin: str) -> bool:
+        """Whether the last poll read a position of the vehicle. If not, the
+        one shown may be older than what the cloud has."""
+
+        return self._location_read.get(vin, False)
+
     def _apply_written_locks(
         self, vin: str, vehicle: "Vehicle", fetched: set[str]
     ) -> None:
@@ -1430,6 +1469,19 @@ class Client:
                 if uploaded is None and group in fetched
                 else None
             )
+            _, at, since = self._written[vin][what]
+            if (
+                monotonic() - since > LOCK_OVERRIDE_MAX_AGE
+                and (uploaded is None or uploaded <= at)
+                and reported != states
+            ):
+                # A day on, the report from before the lock still is not the
+                # state: an unlock shown locked again may leave the car open
+                states = {a: None for a in states}
+                self._written[vin][what] = (states, at, since)
+                for attr in states:
+                    setattr(vehicle, attr, None)
+                continue
             written = self._written_value(
                 vin, what, reported, uploaded, LOCK_OVERRIDE_MAX_AGE
             )

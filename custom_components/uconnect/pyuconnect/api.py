@@ -176,8 +176,13 @@ def _login_backoff(login_url: str, email: str | None, password: str | None) -> _
 # A rejected PIN is kept per account beyond one API object too, for the same
 # reason: a reload creates a new client, and sending the same wrong PIN again
 # brings the PIN lock closer, which also blocks the official app. Holds the
-# rejected PIN and whether the backend reported the PIN locked.
-_PIN_REJECTIONS: dict[str, tuple[str, bool]] = {}
+# rejected PINs, oldest first, each with whether the backend reported it
+# locked: more than one, for a PIN rejected before may be set again, e.g. the
+# one given at setup when the option is cleared.
+_PIN_REJECTIONS: dict[str, dict[str, bool]] = {}
+
+# The most PINs kept as rejected per account, the oldest is dropped first
+PIN_REJECTIONS_KEPT = 5
 
 # Accounts whose PIN got a bare 401 that proved nothing while the service
 # failed. The PIN goes out again only once the vehicle list shows the
@@ -195,10 +200,19 @@ def forget_pin_rejection(login_url: str, email: str | None, pin: str | None = No
     only the given one if any"""
 
     key = _account_key(login_url, email)
-    rejection = _PIN_REJECTIONS.get(key)
-    if rejection is not None and (pin is None or rejection[0] == pin):
-        del _PIN_REJECTIONS[key]
+    if pin is None:
+        _PIN_REJECTIONS.pop(key, None)
+    else:
+        _forget_rejected_pin(key, pin)
     _PIN_UNPROVEN.discard(key)
+
+
+def _forget_rejected_pin(key: str, pin: str | None) -> None:
+    rejections = _PIN_REJECTIONS.get(key)
+    if rejections is not None:
+        rejections.pop(pin, None)
+        if not rejections:
+            del _PIN_REJECTIONS[key]
 
 
 def pin_rejection_fingerprint(salt: str, pin: str) -> str:
@@ -473,10 +487,9 @@ class API:
     def set_tls_verification(self, verify: bool):
         self.sess.verify = verify
 
-    def _rejection(self) -> tuple[str, bool] | None:
-        """The rejection of the PIN set now, with whether it is locked"""
-        rejection = _PIN_REJECTIONS.get(self._account)
-        return rejection if rejection is not None and rejection[0] == self.pin else None
+    def _rejection(self) -> bool | None:
+        """Whether the PIN set now is locked if it was rejected, else None"""
+        return _PIN_REJECTIONS.get(self._account, {}).get(self.pin)
 
     @property
     def pin_rejected(self) -> bool:
@@ -486,16 +499,22 @@ class API:
     @property
     def pin_locked(self) -> bool:
         """Whether the backend reported the PIN set now as locked"""
-        rejection = self._rejection()
-        return rejection is not None and rejection[1]
+        return self._rejection() is True
 
     def _reject_pin(self, locked: bool) -> None:
-        _PIN_REJECTIONS[self._account] = (self.pin, locked)
+        # Added to the others: rejecting a second PIN must not let the first
+        # one go out again once it is set again
+        rejections = _PIN_REJECTIONS.setdefault(self._account, {})
+        rejections.pop(self.pin, None)
+        rejections[self.pin] = locked
+        while len(rejections) > PIN_REJECTIONS_KEPT:
+            del rejections[next(iter(rejections))]
 
     def clear_pin_rejection(self) -> None:
-        """Lets the PIN be sent again, e.g. once it was unlocked in the app"""
+        """Lets the PIN set now be sent again, e.g. once it was unlocked in
+        the app. Other PINs rejected before stay so."""
         self._pin_token = None
-        _PIN_REJECTIONS.pop(self._account, None)
+        _forget_rejected_pin(self._account, self.pin)
         _PIN_UNPROVEN.discard(self._account)
 
     def pin_rejection_fingerprint(self, salt: str) -> str:
