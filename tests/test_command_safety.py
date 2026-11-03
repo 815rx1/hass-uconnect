@@ -279,7 +279,7 @@ async def test_known_state_is_not_sent_again(hass, config_entry, mock_client, ve
     vehicle.supported_commands += ["REON", "REOFF", "CNOW"]
     vehicle.ignition_on = True
     vehicle.charging = True
-    vehicle.timestamp_ev_info = dt_util.now() - timedelta(minutes=2)
+    vehicle.timestamp_status = dt_util.now() - timedelta(minutes=2)
     await setup(hass, config_entry)
 
     for key in ("switch_engine", "switch_charging"):
@@ -316,6 +316,31 @@ async def test_state_reported_on_long_ago_does_not_hold_back_turning_on(
     vehicle.timestamp_status = dt_util.now() - timedelta(hours=10)
     await hass.services.async_call("switch", "turn_on", {"entity_id": hvac}, blocking=True)
     assert sent(mock_client) == ["ROHVACON"]
+
+    # Reported on before a confirmed switch-off: the cloud has not caught up
+    vehicle.timestamp_status = dt_util.now() - timedelta(minutes=2)
+    await hass.services.async_call("switch", "turn_off", {"entity_id": hvac}, blocking=True)
+    await hass.services.async_call("switch", "turn_on", {"entity_id": hvac}, blocking=True)
+    assert sent(mock_client) == ["ROHVACON", "ROHVACOFF", "ROHVACON"]
+
+
+async def test_charging_reported_long_ago_still_holds_back_turning_on(
+    hass, config_entry, mock_client, vehicle
+):
+    # While charging the EV status is only uploaded every deep refresh, and
+    # again when the charge ends
+    vehicle.supported_commands += ["CNOW"]
+    vehicle.charging = True
+    vehicle.timestamp_ev_info = dt_util.now() - timedelta(minutes=25)
+    await setup(hass, config_entry)
+
+    await hass.services.async_call(
+        "switch",
+        "turn_on",
+        {"entity_id": entity_id(hass, "switch", "switch_charging")},
+        blocking=True,
+    )
+    assert sent(mock_client) == []
 
 
 async def test_charging_level_already_set_is_not_sent(hass, config_entry, mock_client):
@@ -633,7 +658,14 @@ async def test_charge_schedule_switches_become_selects(hass, config_entry, mock_
             disabled_by=RegistryEntryDisabler.USER if slot == 2 else None,
         )
     registry.async_update_entity(
-        "switch.fiat_500e_charge_schedule_1", name="Night charging", icon="mdi:moon"
+        "switch.fiat_500e_charge_schedule_1",
+        name="Night charging",
+        icon="mdi:moon",
+        labels={"ev"},
+        aliases=["night"],
+    )
+    registry.async_update_entity_options(
+        "switch.fiat_500e_charge_schedule_1", "conversation", {"should_expose": True}
     )
     await setup(hass, config_entry)
 
@@ -642,6 +674,8 @@ async def test_charge_schedule_switches_become_selects(hass, config_entry, mock_
     select = registry.async_get(entity_id(hass, "select", "charge_schedule_1"))
     assert select.entity_id == "select.fiat_500e_charge_schedule_1"
     assert (select.name, select.icon) == ("Night charging", "mdi:moon")
+    assert (select.labels, list(select.aliases)) == ({"ev"}, ["night"])
+    assert select.options["conversation"] == {"should_expose": True}
     assert hass.states.get(select.entity_id).state == "on"
     assert registry.async_get(entity_id(hass, "select", "charge_schedule_2")).disabled_by
     await hass.services.async_call(

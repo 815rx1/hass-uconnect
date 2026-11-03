@@ -1710,11 +1710,15 @@ class Client:
         # one whose outcome is unknown: the vehicle may still apply it, and
         # planning from the older list would then write its values back
         uploaded = _ms_timestamp(sg(ev, "timestamp"))
+        reported = raw
         written = self._written_value(vin, "schedules", raw, uploaded)
-        if written is None:
+        confirmed = written is not None
+        if not confirmed:
             written = self._written_value(vin, "schedules_unconfirmed", raw, uploaded)
         if written is not None and len(written) == len(raw):
             raw = written
+            if confirmed:
+                reported = written
         if not 0 <= slot < len(raw):
             raise ValueError(f"charge schedule {slot + 1} does not exist")
 
@@ -1746,7 +1750,9 @@ class Client:
         if updated.enable and str(updated.schedule_type or "").upper() in ("", "NONE"):
             updated = replace(updated, schedule_type="CHARGE")
 
-        if updated == current:
+        # The same change as a write with an unknown outcome goes out again:
+        # that one may never have reached the vehicle
+        if updated == current and updated == ChargeSchedule.from_api(reported[slot]):
             _LOGGER.debug("Charge schedule %d of %s unchanged, not sent", slot + 1, vin)
             return None
 

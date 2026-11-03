@@ -426,6 +426,17 @@ class WakeGuard:
         return wakes[-1].at if wakes else None
 
     @callback
+    def last_confirmed(
+        self, vin: str, command: str, now: datetime | None = None
+    ) -> datetime | None:
+        """When the last command of this name the vehicle confirmed was sent."""
+        wakes = self._vehicle(vin, now or _utcnow()).wakes
+        return next(
+            (w.at for w in reversed(wakes) if w.command == command and w.confirmed),
+            None,
+        )
+
+    @callback
     def last_auto_refresh(
         self, vin: str, now: datetime | None = None
     ) -> datetime | None:

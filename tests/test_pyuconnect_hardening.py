@@ -1994,6 +1994,26 @@ def test_schedule_change_with_unknown_outcome_is_planned_on():
     assert (plan[0]["startTime"], plan[0]["endTime"]) == ("02:30", "06:30")
 
 
+def test_schedule_change_with_unknown_outcome_goes_out_again_on_retry():
+    client, _ = lagging_client()
+    with patch.object(
+        client,
+        "_poll_correlation_id",
+        side_effect=Exception("unable to obtain execution status: timed out"),
+    ):
+        plan = client.plan_charge_schedule_emea(VIN, 0, {"enable": False})
+        with pytest.raises(Exception, match="timed out"):
+            client.send_charge_schedules_emea(VIN, plan)
+    client.refresh()
+    assert client.vehicles[VIN].charge_schedules[0].enable is True
+
+    # The write may never have reached the vehicle, the same change is sent
+    client.api.set_charge_schedule_emea.reset_mock()
+    with patch("custom_components.uconnect.pyuconnect.client.sleep"):
+        assert client.update_charge_schedule_emea(VIN, 0, {"enable": False}) is True
+    client.api.set_charge_schedule_emea.assert_called_once()
+
+
 def test_newer_upload_replaces_the_change():
     client, status = lagging_client()
     with patch("custom_components.uconnect.pyuconnect.client.sleep"):

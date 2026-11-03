@@ -37,11 +37,12 @@ from .pyuconnect.command import (
 from .const import DOMAIN, CONF_ADD_COMMAND_ENTITIES
 from .coordinator import UconnectDataUpdateCoordinator
 from .entity import UconnectCommandEntity, was_added
+from .wake_guard import async_get_wake_guard
 
 _LOGGER = logging.getLogger(__name__)
 
 # A state reported on longer ago may be over: the cloud keeps reporting the
-# climate on after it was turned off until the vehicle uploads again
+# climate on after it ended until the vehicle uploads again
 RECENTLY_REPORTED = timedelta(minutes=10)
 
 
@@ -54,8 +55,11 @@ class UconnectSwitchEntityDescription(SwitchEntityDescription):
     on_icon: str | None = None
     off_icon: str | None = None
     is_on: Callable[[Vehicle], bool | None] | None = None
-    # When the vehicle uploaded the state is_on reads
+    # When the vehicle uploaded the state is_on reads, and how long a state
+    # reported on holds back turning on. None for a state the vehicle uploads
+    # again once it is over, such as charging.
     reported_at: Callable[[Vehicle], datetime | None] = lambda x: None
+    on_reported_for: timedelta | None = RECENTLY_REPORTED
     is_available: Callable[[Vehicle], bool] = lambda x: True
 
 
@@ -106,7 +110,9 @@ SWITCH_DESCRIPTIONS: Final[tuple[UconnectSwitchEntityDescription, ...]] = (
         off_icon="mdi:battery-alert",
         command_on=COMMAND_CHARGE,
         is_on=lambda x: getattr(x, "charging", None),
-        reported_at=lambda x: x.timestamp_ev_info,
+        # The EV status is uploaded when a charge ends, while it runs only
+        # every deep refresh
+        on_reported_for=None,
         device_class=SwitchDeviceClass.SWITCH,
     ),
     # The trunk is a lock now, see lock.py
@@ -199,20 +205,38 @@ class UconnectSwitch(SwitchEntity, UconnectCommandEntity):
         # as a repeat, is seen here in the state its refresh brought in
         async with self._turn_on_lock:
             # Already reported on: sending it again would only wake the
-            # vehicle. Not once the report is older, it would hold back a
-            # restart for good.
-            reported_at = self.entity_description.reported_at(self.vehicle)
-            if (
-                self.is_on is True
-                and reported_at is not None
-                and dt_util.utcnow() - reported_at < RECENTLY_REPORTED
-            ):
+            # vehicle
+            if self._reported_on():
                 _LOGGER.debug(
                     "%s is already on, not sending", self.entity_description.key
                 )
                 return
 
             await self._async_send(self.entity_description.command_on, "turn on")
+
+    def _reported_on(self) -> bool:
+        """Whether the vehicle is still on as reported.
+
+        Not once the report is older, it would hold back a restart for good,
+        nor when it is from before a confirmed switch-off.
+        """
+        description = self.entity_description
+        if self.is_on is not True:
+            return False
+        if description.on_reported_for is None:
+            return True
+        reported_at = description.reported_at(self.vehicle)
+        if (
+            reported_at is None
+            or dt_util.utcnow() - reported_at >= description.on_reported_for
+        ):
+            return False
+        if description.command_off is None:
+            return True
+        off_at = async_get_wake_guard(self.hass).last_confirmed(
+            self.vehicle.vin, description.command_off.name
+        )
+        return off_at is None or reported_at > off_at
 
     async def async_turn_off(self, **kwargs):
         # Charging cannot be stopped remotely. Raising here would stop a

@@ -139,9 +139,9 @@ async def async_setup_entry(
 def _async_move_schedule_switches(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Turn the charge schedule switches into selects, see select.py.
 
-    The select takes over the switch's entity ID, name, icon, area and
-    whether it is disabled or hidden. The history of the switch stays under
-    its old entity ID.
+    The select takes over the switch's entity ID, name, icon, area, labels,
+    aliases, entity options and whether it is disabled or hidden. The history
+    of the switch stays under its old entity ID.
     """
 
     registry = er.async_get(hass)
@@ -164,8 +164,15 @@ def _async_move_schedule_switches(hass: HomeAssistant, entry: ConfigEntry) -> No
             hidden_by=entity.hidden_by,
         )
         registry.async_update_entity(
-            moved.entity_id, name=entity.name, icon=entity.icon, area_id=entity.area_id
+            moved.entity_id,
+            name=entity.name,
+            icon=entity.icon,
+            area_id=entity.area_id,
+            labels=entity.labels,
+            aliases=entity.aliases,
         )
+        for domain, options in entity.options.items():
+            registry.async_update_entity_options(moved.entity_id, domain, options)
 
 
 def _async_unexpose_switches(hass: HomeAssistant, entry: ConfigEntry) -> None:
