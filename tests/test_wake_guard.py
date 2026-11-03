@@ -210,6 +210,32 @@ async def test_flapping_charge_stays_one_session(hass):
     assert guard.session(VIN).auto_refreshes == 0
 
 
+async def test_automatic_command_keeps_all_limits(hass):
+    clock = [1000.0]
+    with patch("custom_components.uconnect.wake_guard.monotonic", lambda: clock[0]):
+        guard = WakeGuard(hass)
+        await guard.async_load()
+
+        clock[0] += 180
+        with pytest.raises(Blocked) as err:
+            guard.check_automatic_command(VIN, "VF", at(3))
+        assert err.value.wait == STARTUP_GRACE - timedelta(minutes=3)
+        clock[0] += 720
+
+        # Locked a minute ago, which a person sending it would not wait for
+        guard.record_command(VIN, "RDL", at(14))
+        guard.check_manual_command(VIN, "VF", at(15))
+        with pytest.raises(Blocked):
+            guard.check_automatic_command(VIN, "VF", at(15))
+        guard.check_automatic_command(VIN, "VF", at(20))
+
+        # and the limits of commands sent on request
+        guard.record_command(VIN, "VF", at(20))
+        with pytest.raises(Blocked) as err:
+            guard.check_automatic_command(VIN, "VF", at(26))
+        assert err.value.key == "refresh_cooldown"
+
+
 async def test_manual_refresh_cooldown_and_daily_limit(hass):
     guard = await new_guard(hass)
     guard.check_manual_command(VIN, "DEEPREFRESH", at(0))

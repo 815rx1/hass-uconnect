@@ -1366,6 +1366,12 @@ class Client:
 
         return set(self._remote_parts.get(vin, ()))
 
+    def switched_off_at(self, vin: str) -> datetime | None:
+        """When the vehicle uploaded that it was switched off, if it was seen
+        on before that, see _note_switch_off."""
+
+        return self._switched_off_at.get(vin)
+
     def _apply_written_locks(
         self, vin: str, vehicle: "Vehicle", fetched: set[str]
     ) -> None:

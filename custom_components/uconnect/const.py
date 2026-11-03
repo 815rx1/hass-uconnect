@@ -72,4 +72,17 @@ MAX_CONSECUTIVE_FAILURES: int = 3
 # How often the health report and maintenance history are fetched
 SLOW_EXTRA_DATA_INTERVAL: timedelta = timedelta(hours=6)
 
+# While the vehicle is on it is polled this often, unless the interval set is
+# shorter. Once it is switched off it is polled again after each of these
+# delays: the upload with the switch-off and the position mostly comes minutes
+# after the one saying it is off.
+DRIVING_SCAN_INTERVAL: timedelta = timedelta(minutes=2)
+SWITCH_OFF_POLL_DELAYS: tuple[timedelta, ...] = (
+    timedelta(minutes=1),
+    timedelta(minutes=3),
+)
+# A position still older than the switch-off after the last of those polls is
+# asked for once, which wakes the vehicle, but only this soon after it
+SWITCH_OFF_LOCATION_WINDOW: timedelta = timedelta(minutes=10)
+
 UNIT_DYNAMIC: str = "dynamic"

@@ -544,10 +544,38 @@ class WakeGuard:
             )
 
     @callback
+    def check_automatic_command(
+        self, vin: str, command: str, now: datetime | None = None
+    ) -> None:
+        """Check whether a command nobody asked for should go out now.
+
+        Raises Blocked if it is held back: by the limits of commands sent on
+        request, as it counts towards them, and like the automatic refresh
+        while charging, right after Home Assistant started or another command.
+        """
+        now = now or _utcnow()
+        since_start = timedelta(seconds=monotonic() - self._started)
+        if since_start < STARTUP_GRACE:
+            raise Blocked(
+                "Home Assistant started less than 15 minutes ago",
+                "startup_grace",
+                STARTUP_GRACE - max(since_start, timedelta(0)),
+            )
+        wakes = [w for w in self._vehicle(vin, now).wakes if w.at <= now]
+        if wakes and (since := _age(now, wakes[-1].at)) < AUTO_REFRESH_MIN_SPACING:
+            raise Blocked(
+                "the vehicle was woken moments ago",
+                "woken_moments_ago",
+                AUTO_REFRESH_MIN_SPACING - since,
+            )
+        self.check_manual_command(vin, command, now)
+
+    @callback
     def record_command(
         self, vin: str, command: str, now: datetime | None = None
     ) -> WakeRecord:
-        """Record a command sent on request, right before it is sent."""
+        """Record a command sent on request, or allowed by
+        check_automatic_command, right before it is sent."""
         now = now or _utcnow()
         record = WakeRecord(now, command, False)
         self._vehicle(vin, now).wakes.append(record)

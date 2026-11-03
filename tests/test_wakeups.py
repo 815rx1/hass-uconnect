@@ -21,7 +21,9 @@ from pytest_homeassistant_custom_component.common import (
 )
 
 from custom_components.uconnect.const import DOMAIN
+from custom_components.uconnect.coordinator import LOCATION_REQUEST_STORAGE_KEY
 from custom_components.uconnect.extrapolated_soc import SocEstimationState
+from custom_components.uconnect.pyuconnect.client import Location
 from custom_components.uconnect.wake_guard import (
     AUTO_REFRESH_MAX_PER_DAY,
     AUTO_REFRESH_MAX_WITHOUT_PROGRESS,
@@ -761,3 +763,137 @@ async def test_refresh_decided_during_a_poll_is_checked_again(
     await hass.async_block_till_done(wait_background_tasks=True)
 
     assert deep_refreshes(mock_client) == 0
+
+
+def location_requests(mock_client) -> int:
+    return sum(
+        1
+        for call in mock_client.command_verify.call_args_list
+        if call.args[1].name == "VF"
+    )
+
+
+async def drive(hass, freezer, config_entry, mock_client, vehicle, minutes: int):
+    """Set up with the vehicle on and drive for a while, polling as it goes."""
+    vehicle.charging = False
+    vehicle.ignition_on = True
+    vehicle.location = Location(latitude=48.1, longitude=11.5, updated=dt_util.utcnow())
+    await setup(hass, config_entry, 0)
+    await run_for(hass, freezer, minutes, every=0.5)
+
+
+async def test_vehicle_on_is_polled_every_two_minutes(
+    hass, freezer, config_entry, mock_client, vehicle
+):
+    await drive(hass, freezer, config_entry, mock_client, vehicle, 0)
+    polls = mock_client.refresh.call_count
+    reads = mock_client.get_stolen_vehicle_status.call_count
+
+    await run_for(hass, freezer, 20, every=0.5)
+
+    # Polled more than twice as often as the five minutes set, but the extra
+    # data only at the interval set
+    assert mock_client.refresh.call_count - polls >= 8
+    assert mock_client.get_stolen_vehicle_status.call_count - reads <= 4
+    mock_client.command_verify.assert_not_called()
+
+    vehicle.ignition_on = False
+    await run_for(hass, freezer, 4, every=0.5)
+    assert config_entry.runtime_data.update_interval == timedelta(minutes=5)
+
+
+async def test_switch_off_is_polled_again_after_one_and_three_minutes(
+    hass, freezer, config_entry, mock_client, vehicle
+):
+    await drive(hass, freezer, config_entry, mock_client, vehicle, 3)
+    times = []
+    mock_client.refresh.side_effect = lambda: times.append(dt_util.utcnow())
+
+    # The next poll sees the vehicle off, then the interval set applies
+    vehicle.ignition_on = False
+    await run_for(hass, freezer, 7, every=0.25)
+    assert [round((t - times[0]).total_seconds() / 60) for t in times] == [0, 1, 3]
+    assert config_entry.runtime_data.update_interval == timedelta(minutes=5)
+    mock_client.command_verify.assert_not_called()
+
+
+async def test_switch_off_polls_stop_on_unload(
+    hass, freezer, config_entry, mock_client, vehicle
+):
+    await drive(hass, freezer, config_entry, mock_client, vehicle, 3)
+    vehicle.ignition_on = False
+    await run_for(hass, freezer, 2, every=0.5)
+
+    assert await hass.config_entries.async_unload(config_entry.entry_id)
+    polls = mock_client.refresh.call_count
+    await run_for(hass, freezer, 5, every=0.5)
+    assert mock_client.refresh.call_count == polls
+
+
+async def test_location_is_requested_once_if_it_did_not_come(
+    hass, freezer, hass_storage, config_entry, mock_client, vehicle
+):
+    # Past the startup grace of the wake guard
+    await drive(hass, freezer, config_entry, mock_client, vehicle, 16)
+    vehicle.ignition_on = False
+    mock_client.switched_off_at.return_value = dt_util.utcnow()
+    await run_for(hass, freezer, 2.5, every=0.5)
+    assert location_requests(mock_client) == 0
+
+    await run_for(hass, freezer, 3, every=0.5)
+    await hass.async_block_till_done(wait_background_tasks=True)
+    assert location_requests(mock_client) == 1
+    assert hass_storage[LOCATION_REQUEST_STORAGE_KEY]["data"] == {
+        VIN: mock_client.switched_off_at.return_value.isoformat()
+    }
+
+    await run_for(hass, freezer, 60, every=1)
+    await hass.async_block_till_done(wait_background_tasks=True)
+    assert location_requests(mock_client) == 1
+
+
+async def test_location_that_came_along_is_not_requested(
+    hass, freezer, config_entry, mock_client, vehicle
+):
+    await drive(hass, freezer, config_entry, mock_client, vehicle, 16)
+    vehicle.ignition_on = False
+    off_at = dt_util.utcnow()
+    mock_client.switched_off_at.return_value = off_at
+    await run_for(hass, freezer, 1.5, every=0.5)
+    vehicle.location = Location(latitude=48.2, longitude=11.6, updated=off_at)
+
+    await run_for(hass, freezer, 30, every=0.5)
+    await hass.async_block_till_done(wait_background_tasks=True)
+    assert location_requests(mock_client) == 0
+
+
+async def test_location_request_is_not_sent_again_after_a_restart(
+    hass, freezer, hass_storage, config_entry, mock_client, vehicle
+):
+    # Asked for before the restart
+    off_at = dt_util.utcnow() + timedelta(minutes=16)
+    hass_storage[LOCATION_REQUEST_STORAGE_KEY] = {
+        "version": 1,
+        "key": LOCATION_REQUEST_STORAGE_KEY,
+        "data": {VIN: off_at.isoformat()},
+    }
+    await drive(hass, freezer, config_entry, mock_client, vehicle, 16)
+    vehicle.ignition_on = False
+    mock_client.switched_off_at.return_value = off_at
+
+    await run_for(hass, freezer, 30, every=0.5)
+    await hass.async_block_till_done(wait_background_tasks=True)
+    assert location_requests(mock_client) == 0
+
+
+async def test_location_is_not_requested_with_a_rejected_pin(
+    hass, freezer, config_entry, mock_client, vehicle
+):
+    await drive(hass, freezer, config_entry, mock_client, vehicle, 16)
+    mock_client.api.pin_rejected = True
+    vehicle.ignition_on = False
+    mock_client.switched_off_at.return_value = dt_util.utcnow()
+
+    await run_for(hass, freezer, 30, every=0.5)
+    await hass.async_block_till_done(wait_background_tasks=True)
+    assert location_requests(mock_client) == 0

@@ -13,7 +13,7 @@ import time
 from typing import Any, NoReturn, TypeVar
 
 from .pyuconnect import Client
-from .pyuconnect.command import Command
+from .pyuconnect.command import COMMAND_REFRESH_LOCATION, Command
 from .pyuconnect.api import CHARGING_LEVELS_BY_NAME
 from .pyuconnect.brands import BRANDS as BRANDS_BY_NAME
 
@@ -32,7 +32,7 @@ from homeassistant.const import (
     CONF_SCAN_INTERVAL,
     CONF_USERNAME,
 )
-from homeassistant.core import HomeAssistant
+from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.exceptions import (
     ConfigEntryAuthFailed,
     ConfigEntryError,
@@ -40,6 +40,7 @@ from homeassistant.exceptions import (
     ServiceValidationError,
 )
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers.update_coordinator import (
     DataUpdateCoordinator,
     UpdateFailed,
@@ -57,10 +58,13 @@ from .const import (
     DEFAULT_CHARGING_REFRESH_INTERVAL,
     DEFAULT_SCAN_INTERVAL,
     DEFAULT_UNLOCK_REQUIRES_PIN,
+    DRIVING_SCAN_INTERVAL,
     EVENT_PLACEHOLDER_DISCARDED,
     MAX_CONSECUTIVE_FAILURES,
     MIN_CHARGING_REFRESH_INTERVAL,
     SLOW_EXTRA_DATA_INTERVAL,
+    SWITCH_OFF_LOCATION_WINDOW,
+    SWITCH_OFF_POLL_DELAYS,
     UNLOCK_COMMANDS,
     UNLOCK_LOCKOUT,
     UNLOCK_MAX_WRONG_CODES,
@@ -99,6 +103,10 @@ CONFIRMED_STATES_SAVE_DELAY = 10
 # A PIN the backend rejected, per entry, so a restart does not send it again:
 # every wrong attempt brings the PIN lock closer, also for the official app
 PIN_REJECTION_STORAGE_KEY = f"{DOMAIN}.pin_rejection"
+
+# The switch-off of each vehicle its location was last asked for after, so a
+# restart does not ask again, see _async_request_location
+LOCATION_REQUEST_STORAGE_KEY = f"{DOMAIN}.location_request"
 
 # The placeholder statuses automations were told about, kept per VIN for the
 # Home Assistant run so a reload of the entry does not tell them again
@@ -279,6 +287,20 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
         # When the health report and maintenance history were last asked
         # for, per vehicle, whether that worked or not
         self._last_slow_attempt: dict[str, datetime] = {}
+        # When the extra data was last fetched, see _async_poll
+        self._last_extra_data: datetime | None = None
+        # The interval set in the options, polls are closer while driving
+        self._scan_interval = timedelta(
+            minutes=config_entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
+        )
+        # The ignition and EV running state of each vehicle at the last poll
+        self._running: dict[str, tuple[bool | None, bool | None]] = {}
+        # The polls after a switch-off still to come, and when the location
+        # of each vehicle switched off is to be checked
+        self._switch_off_polls: list[CALLBACK_TYPE] = []
+        self._location_checks: dict[str, datetime] = {}
+        self._polling = False
+        self._switch_off_poll = False
         # Set once the login was rejected. Until the entry is set up again
         # with new credentials nothing is sent, every further attempt with
         # the old ones only brings the account closer to a lockout.
@@ -293,17 +315,16 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
         self._confirmed_states = VehicleStore.shared(hass, CONFIRMED_STATES_STORAGE_KEY)
         self._last_charge = VehicleStore.shared(hass, LAST_CHARGE_STORAGE_KEY)
         self._pin_rejection = VehicleStore.shared(hass, PIN_REJECTION_STORAGE_KEY)
+        self._location_requests = VehicleStore.shared(
+            hass, LOCATION_REQUEST_STORAGE_KEY
+        )
 
         super().__init__(
             hass,
             _LOGGER,
             name=DOMAIN,
             config_entry=config_entry,
-            update_interval=timedelta(
-                minutes=config_entry.options.get(
-                    CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL
-                )
-            ),
+            update_interval=self._scan_interval,
             always_update=True,
         )
 
@@ -466,6 +487,26 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
     async def _async_update_data(self):
         """Update data via library. Called by update_coordinator periodically."""
 
+        # The polls closer than the interval set only read the status: the
+        # extra data is fetched as often as without them
+        light = self._switch_off_poll or self.update_interval < self._scan_interval
+        self._polling = True
+        try:
+            return await self._async_poll(light)
+        finally:
+            self._polling = False
+            self.update_interval = self._interval_now()
+
+    def _interval_now(self) -> timedelta:
+        """The poll interval, shorter while a vehicle is on."""
+        if any(
+            v.ignition_on is True or v.ev_running is True
+            for v in list(self.client.vehicles.values())
+        ):
+            return min(self._scan_interval, DRIVING_SCAN_INTERVAL)
+        return self._scan_interval
+
+    async def _async_poll(self, light: bool):
         try:
             await self.async_run(
                 self.client.refresh,
@@ -511,13 +552,178 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
             self.last_successful_update = dt_util.utcnow()
             self._fire_placeholder_events()
             self._save_vehicle_stores()
+            self._follow_switch_offs()
 
             # Only after a successful poll: each of these calls can take until
             # the request timeout while the cloud is down, and they hold the
-            # client lock, so commands would queue behind them for minutes
-            await self._async_update_extra_data()
+            # client lock, so commands would queue behind them for minutes.
+            # The closer polls can end a moment before the interval is up.
+            now = dt_util.utcnow()
+            if (
+                not light
+                or self._last_extra_data is None
+                or now - self._last_extra_data
+                >= self._scan_interval - timedelta(seconds=30)
+            ):
+                self._last_extra_data = now
+                await self._async_update_extra_data()
 
         return True
+
+    def _follow_switch_offs(self) -> None:
+        """Poll again shortly after a vehicle was switched off, and check
+        after the last of those polls whether its location came along."""
+
+        now = dt_util.utcnow()
+        switched_off = False
+        for vin, vehicle in list(self.client.vehicles.items()):
+            state = (vehicle.ignition_on, vehicle.ev_running)
+            before = self._running.get(vin)
+            self._running[vin] = state
+            if before is not None and any(
+                was is True and is_now is False for was, is_now in zip(before, state)
+            ):
+                switched_off = True
+                self._location_checks[vin] = now + max(SWITCH_OFF_POLL_DELAYS)
+
+        for vin, due in list(self._location_checks.items()):
+            if now >= due:
+                del self._location_checks[vin]
+                # Not awaited, the request waits for the client lock
+                self.config_entry.async_create_background_task(
+                    self.hass,
+                    self._async_request_location(vin),
+                    f"{DOMAIN} location after switch-off",
+                )
+
+        if switched_off:
+            # A new switch-off replaces the polls of the last one
+            self._cancel_switch_off_polls()
+            self._switch_off_polls = [
+                async_call_later(self.hass, delay, self._handle_switch_off_poll)
+                for delay in SWITCH_OFF_POLL_DELAYS
+            ]
+
+    def _cancel_switch_off_polls(self) -> None:
+        for cancel in self._switch_off_polls:
+            cancel()
+        self._switch_off_polls = []
+
+    @callback
+    def _handle_switch_off_poll(self, _now: datetime) -> None:
+        # A poll running already reads what this one would
+        if self._polling or self.auth_failed or self._shutdown_requested:
+            return
+        self.config_entry.async_create_background_task(
+            self.hass, self._async_switch_off_poll(), f"{DOMAIN} switch-off poll"
+        )
+
+    async def _async_switch_off_poll(self) -> None:
+        self._switch_off_poll = True
+        try:
+            await self.async_refresh()
+        finally:
+            self._switch_off_poll = False
+
+    async def async_shutdown(self) -> None:
+        self._cancel_switch_off_polls()
+        await super().async_shutdown()
+
+    async def _async_request_location(self, vin: str) -> None:
+        """Ask for the location once after a switch-off, if it did not come.
+
+        The vehicle mostly uploads its position with the switch-off, but now
+        and then not until it is driven again. The request wakes the vehicle,
+        so it goes out at most once per switch-off, also over a restart, and
+        is not tried again if it fails.
+        """
+
+        async with self._action_running():
+            async with self._client_lock:
+                if (reason := await self._location_request_refused(vin)) is not None:
+                    _LOGGER.info(
+                        "Location of %s not requested after the switch-off: %s",
+                        vin,
+                        reason,
+                    )
+                    return
+
+                guard = async_get_wake_guard(self.hass)
+                record = guard.record_command(vin, COMMAND_REFRESH_LOCATION.name)
+                await guard.async_flush()
+                _LOGGER.info(
+                    "Requesting the location of %s, the last one is older than "
+                    "the switch-off",
+                    vin,
+                )
+                try:
+                    result = await self._async_run_locked(
+                        self.client.command_verify, vin, COMMAND_REFRESH_LOCATION
+                    )
+                except PinRejectedError:
+                    guard.forget(vin, record)
+                    await self._async_save_pin_rejection()
+                    _LOGGER.info("Location request of %s: the PIN was rejected", vin)
+                    return
+                except Exception as err:
+                    if is_auth_error(err):
+                        self.auth_failed = True
+                    if _refused_before_queued(err):
+                        guard.forget(vin, record)
+                    _LOGGER.info("Location request of %s failed: %s", vin, err)
+                    return
+
+        if result:
+            guard.command_confirmed(record)
+        else:
+            _LOGGER.info("Location request of %s was not confirmed", vin)
+        await self.async_refresh()
+
+    async def _location_request_refused(self, vin: str) -> str | None:
+        """Why the location is not asked for after this switch-off, if so.
+
+        Otherwise the wake guard allowed the request, and the switch-off is
+        marked on disk as asked for.
+        """
+
+        vehicle = self.client.vehicles.get(vin)
+        if vehicle is None:
+            return "the vehicle is not available"
+        off_at = self.client.switched_off_at(vin)
+        if not isinstance(off_at, datetime):
+            return "the time of the switch-off is not known"
+        location = vehicle.location
+        if location is not None and location.updated is not None and (
+            location.updated >= off_at
+        ):
+            return "the location came along"
+        if dt_util.utcnow() - off_at > SWITCH_OFF_LOCATION_WINDOW:
+            return "the switch-off was too long ago"
+        if COMMAND_REFRESH_LOCATION.name not in vehicle.supported_commands:
+            return "the vehicle does not offer it"
+        if self.auth_failed:
+            return "the login was rejected"
+        if not self.client.api.pin:
+            return "no PIN is set"
+        if self.client.api.pin_rejected:
+            return "the PIN was rejected"
+
+        marker = off_at.isoformat()
+        if (await self._location_requests.async_load()).get(vin) == marker:
+            return "it was requested for this switch-off already"
+        try:
+            async_get_wake_guard(self.hass).check_automatic_command(
+                vin, COMMAND_REFRESH_LOCATION.name
+            )
+        except (Blocked, AlreadyDone) as err:
+            return str(err)
+        try:
+            self._location_requests.update([vin], {vin: marker})
+            await self._location_requests.async_save()
+        except Exception as err:
+            # Unsaved, a restart could ask once more
+            return f"unable to save that it was requested: {err}"
+        return None
 
     def _may_start_without_status(self, err: Exception) -> bool:
         """Whether setup goes on although its first status poll failed.
@@ -993,9 +1199,10 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
             raise HomeAssistantError(f"{what} was not confirmed by the vehicle")
 
     async def update_options(self, hass: HomeAssistant, config_entry: ConfigEntry):
-        self.update_interval = timedelta(
+        self._scan_interval = timedelta(
             minutes=config_entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
         )
+        self.update_interval = self._interval_now()
         self.charging_refresh_interval = self._read_charging_refresh_interval(
             config_entry
         )

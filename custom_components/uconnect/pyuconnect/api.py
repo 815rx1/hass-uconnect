@@ -257,6 +257,16 @@ def _names_credentials(r: requests.Response) -> bool:
     return any(marker in text for marker in _CREDENTIAL_MARKERS)
 
 
+def _needs_plug(r: requests.Response) -> bool:
+    """Tells whether a refused command names the vehicle not being plugged in,
+    which no other variant of the command changes"""
+
+    if len(r.content) > 4096:
+        return False
+    text = r.text.lower()
+    return "not plugged-in" in text or "not plugged in" in text
+
+
 def _lists_vehicles(r: requests.Response) -> bool:
     """Tells whether an answer is the vehicle list, which proves the backend
     took the credentials. Its error envelope, or a maintenance page, can come
@@ -1409,6 +1419,8 @@ class API:
                 err.response is not None
                 and err.response.status_code == 403
                 and fallback is not None
+                # A 500e not plugged in refuses the fallback too
+                and not _needs_plug(err.response)
             ):
                 _LOGGER.warning(
                     "%s command returned 403; retrying with %s",

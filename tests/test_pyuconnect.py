@@ -271,6 +271,23 @@ def test_refresh_refused_unplugged_still_goes_out_while_charging():
     assert [name for _, name in sent] == ["DEEPREFRESH", "DEEPREFRESH2", "DEEPREFRESH"]
 
 
+def test_refresh_refused_as_not_plugged_in_does_not_try_the_fallback():
+    # 2026-10-30: the 500e refuses DEEPREFRESH2 as well while not plugged in
+    def answer(name):
+        raise requests.HTTPError(
+            response=response(
+                403,
+                {"message": "Deep refresh not allowed if the vehicle is not plugged-in"},
+            )
+        )
+
+    api, sent = command_api(answer)
+    with pytest.raises(requests.HTTPError):
+        api.command(VIN, COMMAND_DEEP_REFRESH)
+
+    assert [name for _, name in sent] == ["DEEPREFRESH"]
+
+
 def test_variant_refused_with_403_is_not_taken_again():
     api, sent = command_api(refuse("DEEPREFRESH", "DEEPREFRESH2"))
 
