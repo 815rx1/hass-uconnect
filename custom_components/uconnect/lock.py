@@ -167,7 +167,8 @@ class UconnectLock(LockEntity, UconnectCommandEntity):
 
     @property
     def extra_state_attributes(self) -> dict[str, Any] | None:
-        if self.entity_description.key != "lock_doors":
+        # Out of date, the doors are unknown like the lock itself
+        if self.entity_description.key != "lock_doors" or not self.data_current:
             return None
 
         def state(value: bool | None) -> str | None:

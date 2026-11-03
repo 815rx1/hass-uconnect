@@ -666,6 +666,12 @@ WRITE_OVERRIDE_MAX_AGE = 3600
 LOCK_OVERRIDE_MAX_AGE = 24 * 3600
 # Kept with the confirmed states, see Client._drop_states_reported_while_on
 REPORTED_BEFORE_OFF = "reported_before_switch_off"
+REPORTED_AT_OFF = "reported_at_switch_off"
+# A report this close to the switch-off was made with the driver still in
+# the seat
+SWITCH_OFF_REPORT_WINDOW = 60
+# The groups whose locked or closed states such a report leaves out
+SECURED_GROUPS = ("doors", "windows", "trunk", "liftGate")
 LOCK_COMMAND_STATES: dict[str, tuple[tuple[str, ...], bool]] = {
     "RDL": (REMOTE_STATE_GROUPS["doors"], True),
     "RDU": (REMOTE_STATE_GROUPS["doors"], False),
@@ -724,6 +730,11 @@ class Client:
         # The time of each remote status the vehicle was switched off after,
         # see _drop_states_reported_while_on
         self._reported_before_off: Dict[str, datetime] = {}
+        # The time of each remote status made at the switch-off
+        self._reported_at_off: Dict[str, datetime] = {}
+        # When each vehicle was last seen on, and first seen off after that
+        self._switched_on_at: Dict[str, datetime] = {}
+        self._switched_off_at: Dict[str, datetime] = {}
         # Confirmed changes the cloud may not show yet, see
         # WRITE_OVERRIDE_MAX_AGE: value, when it was written and monotonic
         self._written: Dict[str, Dict[str, tuple[Any, datetime, float]]] = {}
@@ -759,6 +770,9 @@ class Client:
                 self._remote_fresh_at.pop(vin, None)
                 self._remote_parts.pop(vin, None)
                 self._reported_before_off.pop(vin, None)
+                self._reported_at_off.pop(vin, None)
+                self._switched_on_at.pop(vin, None)
+                self._switched_off_at.pop(vin, None)
                 self._written.pop(vin, None)
 
         for x in vehicles:
@@ -879,6 +893,16 @@ class Client:
                 if not isinstance(s, dict):
                     raise ValueError("remote status is not an object")
 
+                # An older copy of the report, as a lagging cloud may serve,
+                # would bring back states the newer one replaced
+                uploaded = _ms_timestamp(sg(s, "timestamp"))
+                if (
+                    uploaded is not None
+                    and vehicle.timestamp_status is not None
+                    and uploaded < vehicle.timestamp_status
+                ):
+                    raise ValueError("remote status is older than the last one")
+
                 if "doors" in s:
                     vehicle.door_driver_locked = sg_state(
                         s, "LOCKED", "doors", "driver", "status"
@@ -911,7 +935,7 @@ class Client:
                 vehicle.ev_running = sg_state(s, "ON", "evRunning", "status")
                 vehicle.hvac_on = sg_state(s, "ON", "hvac", "status")
 
-                vehicle.timestamp_status = _ms_timestamp(sg(s, "timestamp"))
+                vehicle.timestamp_status = uploaded
                 reported = {group for group in REMOTE_STATE_GROUPS if group in s}
                 self._remote_parts[vin] = {
                     attr
@@ -932,6 +956,7 @@ class Client:
                     for attr in attrs:
                         setattr(vehicle, attr, None)
 
+            self._note_switch_off(vin, vehicle)
             self._drop_states_reported_while_on(vin, vehicle)
             self._apply_written_locks(vin, vehicle, reported)
 
@@ -994,11 +1019,15 @@ class Client:
             for vin, entries in self._written.items()
             if entries
         }
-        for vin, reported in self._reported_before_off.items():
-            states.setdefault(vin, {})[REPORTED_BEFORE_OFF] = {
-                "value": reported.isoformat(),
-                "at": reported.isoformat(),
-            }
+        for key, markers in (
+            (REPORTED_BEFORE_OFF, self._reported_before_off),
+            (REPORTED_AT_OFF, self._reported_at_off),
+        ):
+            for vin, reported in markers.items():
+                states.setdefault(vin, {})[key] = {
+                    "value": reported.isoformat(),
+                    "at": reported.isoformat(),
+                }
         return states
 
     def restore_confirmed_states(self, data: Any) -> None:
@@ -1017,10 +1046,15 @@ class Client:
                 except (KeyError, TypeError, ValueError):
                     continue
                 what = str(what)
-                if what == REPORTED_BEFORE_OFF:
+                if what in (REPORTED_BEFORE_OFF, REPORTED_AT_OFF):
                     # Applies only as long as the cloud has this report
                     if at.tzinfo is not None:
-                        self._reported_before_off[vin] = at
+                        markers = (
+                            self._reported_before_off
+                            if what == REPORTED_BEFORE_OFF
+                            else self._reported_at_off
+                        )
+                        markers[vin] = at
                     continue
                 if what.startswith("lock:"):
                     valid = isinstance(value, dict)
@@ -1034,6 +1068,10 @@ class Client:
                     continue
                 if at.tzinfo is None:
                     at = at.replace(tzinfo=timezone.utc)
+                # Saved while the clock was ahead, its age would start anew
+                # with every restart
+                if at > now + timedelta(minutes=5):
+                    continue
                 age = max((now - at).total_seconds(), 0.0)
                 if age > self._override_max_age(what):
                     continue
@@ -1124,6 +1162,31 @@ class Client:
             setattr(vehicle, attr, locked)
         self._remember(vin, f"lock:{','.join(attrs)}", {a: locked for a in known}, sent)
 
+    def _note_switch_off(self, vin: str, vehicle: "Vehicle") -> None:
+        """Keeps when the vehicle was last seen on, by its EV status or its
+        remote status, and when it was first reported off after that."""
+
+        info = self._last_status.get(vin)
+        ev = info.get("evInfo") if isinstance(info, dict) else None
+        uploaded = _ms_timestamp(sg(ev, "timestamp"))
+        ignition = (sg_str(ev, "ignitionStatus") or "").upper()
+        on_at = self._switched_on_at.get(vin)
+        for seen in (
+            uploaded if ignition == "ON" else None,
+            vehicle.timestamp_status if vehicle.ev_running else None,
+        ):
+            if seen is not None and (on_at is None or seen > on_at):
+                on_at = self._switched_on_at[vin] = seen
+        off_at = self._switched_off_at.get(vin)
+        if (
+            ignition == "OFF"
+            and uploaded is not None
+            and on_at is not None
+            and uploaded > on_at
+            and (off_at is None or off_at < on_at)
+        ):
+            self._switched_off_at[vin] = uploaded
+
     def _drop_states_reported_while_on(self, vin: str, vehicle: "Vehicle") -> None:
         """Leaves out the remote states the vehicle reported while it was on,
         once it uploaded that it was switched off since.
@@ -1133,29 +1196,61 @@ class Client:
         doors locked during the drive were then shown as the state of the
         parked car, and nothing reminded of locking it. The states are unknown
         until the vehicle reports them again or confirms a lock command.
+
+        A report made at the switch-off was taken before getting out as well.
+        Of that one, only the states locked or closed are left out.
         """
 
         reported = vehicle.timestamp_status
         if reported is None:
             return
-        if self._reported_before_off.get(vin) != reported:
+        at_off = self._reported_at_off.get(vin) == reported
+        if self._reported_before_off.get(vin) != reported and not at_off:
             self._reported_before_off.pop(vin, None)
+            self._reported_at_off.pop(vin, None)
             info = self._last_status.get(vin)
             ev = info.get("evInfo") if isinstance(info, dict) else None
+            if vehicle.ev_running and not isinstance(ev, dict):
+                # No EV status since a restart tells whether it was switched
+                # off since. Left out for now, without keeping the report.
+                for attrs in REMOTE_STATE_GROUPS.values():
+                    for attr in attrs:
+                        setattr(vehicle, attr, None)
+                return
             switched_off = _ms_timestamp(sg(ev, "timestamp"))
-            if not (
-                vehicle.ev_running
-                and switched_off is not None
-                and switched_off > reported
-                and (sg_str(ev, "ignitionStatus") or "").upper() == "OFF"
+            if (
+                switched_off is None
+                or (sg_str(ev, "ignitionStatus") or "").upper() != "OFF"
             ):
                 return
-            # Kept until a newer report: an upload after switching on again,
-            # or one without the ignition, would bring the states back
-            self._reported_before_off[vin] = reported
-        for attrs in REMOTE_STATE_GROUPS.values():
+            on_at = self._switched_on_at.get(vin)
+            off_at = self._switched_off_at.get(vin)
+            if switched_off > reported and (
+                vehicle.ev_running or (on_at is not None and on_at > reported)
+            ):
+                # Kept until a newer report: an upload after switching on
+                # again, or one without the ignition, would bring the states
+                # back
+                self._reported_before_off[vin] = reported
+                # A lock confirmed while it was on is not known either
+                for what, (_, at, _) in list(self._written.get(vin, {}).items()):
+                    if what.startswith("lock:") and at < switched_off:
+                        del self._written[vin][what]
+            elif (
+                off_at is not None
+                and abs((off_at - reported).total_seconds())
+                <= SWITCH_OFF_REPORT_WINDOW
+            ):
+                self._reported_at_off[vin] = reported
+                at_off = True
+            else:
+                return
+        for group, attrs in REMOTE_STATE_GROUPS.items():
             for attr in attrs:
-                setattr(vehicle, attr, None)
+                if not at_off or (
+                    group in SECURED_GROUPS and getattr(vehicle, attr) is True
+                ):
+                    setattr(vehicle, attr, None)
 
     def reported_parts(self, vin: str) -> set[str]:
         """The states the last remote status of a vehicle reported, also those
@@ -1194,6 +1289,10 @@ class Client:
             if written is not None:
                 for attr, value in written.items():
                     setattr(vehicle, attr, value)
+            elif group not in fetched:
+                # Not reported in this poll, the states are still the lock's
+                for attr in states:
+                    setattr(vehicle, attr, None)
 
     def get_vehicles(self):
         """Returns all vehicles data. Must execute refresh method before."""

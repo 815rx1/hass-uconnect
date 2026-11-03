@@ -766,12 +766,17 @@ async def test_lock_icons_follow_the_state(hass, config_entry, mock_client, vehi
     assert (door_state.state, door_state.attributes["icon"]) == (
         "unknown", "mdi:lock-question"
     )
+    vehicle.door_driver_locked = True
+    _, lock_state = await states()
+    assert lock_state.attributes["driver"] == "locked"
     mock_client.refresh.side_effect = Exception("status down")
     for _ in range(3):
         _, lock_state = await states()
     assert (lock_state.state, lock_state.attributes["icon"]) == (
         "unknown", "mdi:lock-question"
     )
+    # The doors are not shown as locked either
+    assert "driver" not in lock_state.attributes
 
 
 async def test_sensors_of_states_unknown_at_setup_are_created(

@@ -931,7 +931,7 @@ def test_states_of_the_drive_are_unknown_once_switched_off():
 @pytest.mark.parametrize(
     ("ignition", "uploaded", "running"),
     [
-        # Reported when switched off, as the vehicle mostly does
+        # Reported when switched off, but no drive was seen before
         ("OFF", 4, "OFF"),
         # Parked or charging: the upload is newer, but the vehicle was off
         ("OFF", 600, "OFF"),
@@ -951,6 +951,109 @@ def test_states_stay_without_a_switch_off_after_the_report(ignition, uploaded, r
     )
     client.refresh()
     assert remote_states(client.vehicles[VIN]) == [True] * 7 + [running == "ON"]
+
+
+def test_locked_states_reported_at_the_switch_off_are_unknown():
+    """30.10. 21:06: reported locked 4 s before the switch-off upload, with
+    the driver still in the seat, and nothing more until the next morning."""
+    start = datetime.now(timezone.utc) - timedelta(hours=2)
+    parked = start + timedelta(minutes=18)
+    client = make_client(
+        [ev_upload("ON", start)] + [ev_upload("OFF", parked + timedelta(seconds=4))] * 3,
+        remote=remote_report(start + timedelta(seconds=53)),
+    )
+    client.refresh()
+    v = client.vehicles[VIN]
+    assert remote_states(v) == [True] * 8
+
+    client.api.get_vehicle_status.return_value = remote_report(parked, running="OFF")
+    client.refresh()
+    assert remote_states(v) == [None] * 7 + [False]
+    saved = json.loads(json.dumps(client.confirmed_states()))
+
+    # Also after a restart
+    restarted = make_client([ev_upload("OFF", parked + timedelta(seconds=4))])
+    restarted.api.get_vehicle_status.return_value = remote_report(parked, running="OFF")
+    restarted.restore_confirmed_states(saved)
+    restarted.refresh()
+    assert remote_states(restarted.vehicles[VIN]) == [None] * 7 + [False]
+
+    # Locked by key after getting out: the vehicle reports again
+    client.api.get_vehicle_status.return_value = remote_report(
+        parked + timedelta(minutes=6), running="OFF"
+    )
+    client.refresh()
+    assert remote_states(v) == [True] * 7 + [False]
+
+
+def test_unlocked_states_reported_at_the_switch_off_are_shown():
+    start = datetime.now(timezone.utc) - timedelta(hours=2)
+    parked = start + timedelta(minutes=18)
+    client = make_client(
+        [ev_upload("ON", start)] + [ev_upload("OFF", parked)] * 2,
+        remote=remote_report(start + timedelta(seconds=53)),
+    )
+    client.refresh()
+    client.api.get_vehicle_status.return_value = remote_report(
+        parked, doors="UNLOCKED", running="OFF"
+    )
+    client.refresh()
+    client.refresh()
+    assert remote_states(client.vehicles[VIN]) == [False] * 4 + [None] * 2 + [False] * 2
+
+
+def test_states_from_before_a_drive_seen_only_in_uploads_are_unknown():
+    """Switched on and off again without a remote status in between."""
+    reported = datetime.now(timezone.utc) - timedelta(hours=12)
+    client = make_client(
+        [
+            ev_upload("OFF", reported + timedelta(seconds=4)),
+            ev_upload("ON", reported + timedelta(hours=11)),
+            ev_upload("OFF", reported + timedelta(hours=11, minutes=20)),
+        ],
+        remote=remote_report(reported, running="OFF"),
+    )
+    client.refresh()
+    v = client.vehicles[VIN]
+    assert remote_states(v) == [True] * 7 + [False]
+    client.refresh()
+    client.refresh()
+    assert v.ignition_on is False
+    assert remote_states(v) == [None] * 8
+
+
+@pytest.mark.parametrize("first", [{}, {"vehicleInfo": {"timestamp": 1}}])
+def test_states_of_a_drive_wait_for_the_ev_status_after_a_restart(first):
+    """Restarted after the switch-off, and the first status answer has no EV
+    status: the report from the drive is not shown as the parked car."""
+    start = datetime.now(timezone.utc) - timedelta(hours=3)
+    client = make_client(
+        [first, ev_upload("OFF", start + timedelta(minutes=12))],
+        remote=remote_report(start),
+    )
+    client.refresh()
+    v = client.vehicles[VIN]
+    assert remote_states(v) == [None] * 8
+    client.refresh()
+    assert remote_states(v) == [None] * 8
+
+
+def test_older_remote_status_does_not_replace_a_newer_one():
+    now = datetime.now(timezone.utc)
+    client = make_client(
+        [ev_upload("OFF", now)] * 3,
+        remote=remote_report(now - timedelta(minutes=1), doors="UNLOCKED", running="OFF"),
+    )
+    client.refresh()
+    v = client.vehicles[VIN]
+    assert remote_states(v)[:4] == [False] * 4
+
+    # A lagging copy in the cloud
+    client.api.get_vehicle_status.return_value = remote_report(
+        now - timedelta(minutes=5), running="OFF"
+    )
+    client.refresh()
+    assert remote_states(v)[:4] == [False] * 4
 
 
 def test_report_without_a_time_is_kept():
@@ -1025,6 +1128,70 @@ def test_states_stay_unknown_over_a_restart_without_a_status():
     restarted.restore_confirmed_states(saved)
     restarted.refresh()
     assert remote_states(restarted.vehicles[VIN]) == [None] * 8
+
+
+def test_lock_confirmed_while_on_is_unknown_once_switched_off():
+    """Locked from Home Assistant while driving off, switched off later
+    without a new report: the doors can unlock on getting out."""
+    start = datetime.now(timezone.utc) - timedelta(minutes=10)
+    client = make_client(
+        [ev_upload("ON", start)] * 2
+        + [ev_upload("OFF", datetime.now(timezone.utc) + timedelta(minutes=1))] * 2,
+        remote=remote_report(start + timedelta(seconds=48)),
+    )
+    client.refresh()
+    client.api.command.return_value = "corr"
+    client.api.get_remote_operation_status.return_value = {"status": "SUCCESS"}
+    with patch("custom_components.uconnect.pyuconnect.client.sleep"):
+        assert client.command_verify(VIN, COMMAND_DOORS_LOCK) is True
+    client.refresh()
+    v = client.vehicles[VIN]
+    assert remote_states(v)[:4] == [True] * 4
+
+    client.refresh()
+    assert v.ignition_on is False
+    assert remote_states(v) == [None] * 8
+    assert client.confirmed_states()[VIN].keys() == {"reported_before_switch_off"}
+    client.refresh()
+    assert remote_states(v) == [None] * 8
+
+
+def test_lock_confirmed_while_the_status_fails_is_kept_a_day_at_most():
+    from custom_components.uconnect.pyuconnect.client import LOCK_OVERRIDE_MAX_AGE
+
+    client = make_client([load_fixture("status_500e.json")] * 3)
+    client.api.get_vehicle_status.side_effect = requests.exceptions.ReadTimeout("x")
+    client.refresh()
+    client.api.command.return_value = "corr"
+    client.api.get_remote_operation_status.return_value = {"status": "SUCCESS"}
+    with patch("custom_components.uconnect.pyuconnect.client.sleep"):
+        assert client.command_verify(VIN, COMMAND_DOORS_LOCK) is True
+    client.refresh()
+    v = client.vehicles[VIN]
+    assert v.door_driver_locked is True
+
+    later = client_module.monotonic() + LOCK_OVERRIDE_MAX_AGE + 60
+    with patch.object(client_module, "monotonic", lambda: later):
+        client.refresh()
+    assert v.door_driver_locked is None
+
+
+def test_lock_saved_with_the_clock_ahead_is_not_restored():
+    client = locked_by_home_assistant()
+    saved = json.loads(json.dumps(client.confirmed_states()))
+    ahead = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat()
+    for entry in saved[VIN].values():
+        entry["at"] = ahead
+
+    restarted = make_client(
+        [ev_upload("OFF", datetime.now(timezone.utc))],
+        remote=remote_report(
+            datetime.now(timezone.utc) - timedelta(hours=1), doors="UNLOCKED", running="OFF"
+        ),
+    )
+    restarted.restore_confirmed_states(saved)
+    restarted.refresh()
+    assert remote_states(restarted.vehicles[VIN])[:4] == [False] * 4
 
 
 def test_lock_confirmed_while_unknown_outlives_a_failed_report():
