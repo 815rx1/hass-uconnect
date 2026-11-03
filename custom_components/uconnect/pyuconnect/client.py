@@ -322,6 +322,8 @@ class Vehicle:
     charging: bool | None = None
     charging_level: int | None = None
     charging_level_preference: int | None = None
+    # The upload whose LEVEL_ONE was not taken, see _update_vehicle
+    charging_level_skipped: Any = field(default=None, repr=False, compare=False)
     state_of_charge: float | None = None
     time_to_fully_charge_l3: int | None = None
     time_to_fully_charge_l2: int | None = None
@@ -434,21 +436,27 @@ def _update_vehicle(
     # LEVEL_ONE..LEVEL_FIVE; NA: LEVEL_1..LEVEL_5). Map it to the same 1..5
     # integer scale as charging_level for consistency (README shows int 5).
     _pref_raw = sg_str(ev, "chargePowerPreference")
+    _uploaded = sg(ev, "timestamp")
     if (
-        sg_state(ev, "OFF", "ignitionStatus")
+        CHARGING_LEVELS.get(_pref_raw) == 1
+        and v.charging_level_preference not in (None, 1)
+        and sg_state(ev, "OFF", "ignitionStatus")
         and sg_bool(batt, "plugInStatus") is False
         and sg_num(batt, "timeToFullyChargeL3") == 0
-        and v.charging_level_preference is not None
+        and v.charging_level_skipped in (None, _uploaded)
     ):
         # Minutes after a switch-off a 500e not plugged in now and then
         # uploads LEVEL_ONE, nobody having changed it, and the real one again
         # with its next upload. Shown, a level set by an automation would be
-        # skipped as set already, or sent again and wake the vehicle.
-        pass
-    elif _pref_raw in (None, "NOT_USED_VALUE"):
-        v.charging_level_preference = None
+        # skipped as set already, or sent again and wake the vehicle. Only
+        # this one upload is skipped: sent again, the level was really set.
+        v.charging_level_skipped = _uploaded
     else:
-        v.charging_level_preference = CHARGING_LEVELS.get(_pref_raw, None)
+        v.charging_level_skipped = None
+        if _pref_raw in (None, "NOT_USED_VALUE"):
+            v.charging_level_preference = None
+        else:
+            v.charging_level_preference = CHARGING_LEVELS.get(_pref_raw, None)
 
     v.plugged_in = sg_bool(batt, "plugInStatus")
     last_charge = (
@@ -695,8 +703,10 @@ TERMINAL_FAILURE = (
     "timeout",
     "expired",
 )
-# Failures after which the vehicle may still have carried the command out
-TERMINAL_UNKNOWN = ("timeout", "expired")
+# Failures after which the vehicle may still have carried the command out.
+# How a failed unlock is spelled is not known, only the event notifications
+# were seen to say "Fail", so an unlock reported so leaves the doors unknown.
+TERMINAL_UNKNOWN = ("fail", "cancelled", "canceled", "timeout", "expired")
 
 # States the remote status stopped reporting are kept for at most this long.
 # Shown as locked for days while the status call fails, a lock would be
@@ -1241,6 +1251,14 @@ class Client:
         if schedules is not None:
             vehicle.charge_schedules = [ChargeSchedule.from_api(x) for x in schedules]
 
+        # A level written here is taken from the upload confirming it, even
+        # one _update_vehicle skipped as uploaded after a switch-off
+        written = self._written.get(vin, {}).get("level")
+        if written is not None and written[0] == CHARGING_LEVELS.get(
+            sg_str(ev, "chargePowerPreference")
+        ):
+            vehicle.charging_level_preference = written[0]
+            vehicle.charging_level_skipped = None
         level = self._written_value(
             vin, "level", vehicle.charging_level_preference, uploaded
         )

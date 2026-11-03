@@ -1687,6 +1687,9 @@ def locked_by_home_assistant():
         {"status": "PENDING"},
         {"status": "TIMEOUT"},
         {"status": "EXPIRED"},
+        # A failed unlock is not seen spelled so, it may not be definite
+        {"status": "Fail"},
+        {"status": "CANCELLED"},
         requests.exceptions.ReadTimeout("x"),
     ],
 )
@@ -2220,6 +2223,64 @@ def test_level_uploaded_after_a_switch_off_is_not_taken():
     assert v.charging_level_preference == 1
     # Without an earlier level as well
     assert vehicle_from(spurious).charging_level_preference == 1
+
+
+def spurious_level_uploads():
+    """10-30 15:23:39 and 15:39:25: parked, unplugged, both L3 0."""
+    first = ev_upload("OFF", datetime(2026, 10, 30, 14, 23, 39, tzinfo=timezone.utc))
+    first["evInfo"]["chargePowerPreference"] = "LEVEL_ONE"
+    first["evInfo"]["battery"]["timeToFullyChargeL3"] = 0
+    second = copy.deepcopy(first)
+    second["evInfo"]["timestamp"] = _ms(datetime(2026, 10, 30, 14, 39, 25, tzinfo=timezone.utc))
+    second["evInfo"]["chargePowerPreference"] = "LEVEL_FIVE"
+    return first, second
+
+
+def test_level_after_a_restart_on_the_spurious_upload_is_taken():
+    first, second = spurious_level_uploads()
+    v = vehicle_from(first)
+    assert v.charging_level_preference == 1
+    _update_vehicle(v, second)
+    assert v.charging_level_preference == 5
+
+
+@pytest.mark.parametrize("level, expected", [("LEVEL_THREE", 3), ("LEVEL_ONE", 1)])
+def test_level_changed_while_parked_unplugged_is_taken(level, expected):
+    """Set in the app with the vehicle switched off and not plugged in."""
+    first, parked = spurious_level_uploads()
+    v = vehicle_from(parked)
+    changed = copy.deepcopy(parked)
+    changed["evInfo"]["timestamp"] += 600_000
+    changed["evInfo"]["chargePowerPreference"] = level
+    _update_vehicle(v, changed)
+    # Polled again before the vehicle uploads
+    _update_vehicle(v, changed)
+    if expected == 1:
+        # A LEVEL_ONE once is the known artefact, uploaded again it is real
+        assert v.charging_level_preference == 5
+        again = copy.deepcopy(changed)
+        again["evInfo"]["timestamp"] += 600_000
+        _update_vehicle(v, again)
+    assert v.charging_level_preference == expected
+
+
+@pytest.mark.parametrize("level", [3, 1])
+def test_own_level_write_confirmed_while_parked_unplugged_is_kept(level):
+    _, parked = spurious_level_uploads()
+    at = datetime(2026, 10, 30, 14, 45, tzinfo=timezone.utc)
+    confirmed = copy.deepcopy(parked)
+    confirmed["evInfo"]["timestamp"] = _ms(at + timedelta(minutes=1))
+    confirmed["evInfo"]["chargePowerPreference"] = {3: "LEVEL_THREE", 1: "LEVEL_ONE"}[level]
+    client = make_client([parked] + [confirmed] * 2)
+    client.refresh()
+    assert client.vehicles[VIN].charging_level_preference == 5
+
+    client._remember(VIN, "level", level, at)
+    client.refresh()
+    assert client.vehicles[VIN].charging_level_preference == level
+    # And after the written value is dropped
+    client.refresh()
+    assert client.vehicles[VIN].charging_level_preference == level
 
 
 @pytest.mark.parametrize("stamp", [None, "1760000300000", 1e20, 1760000300])
