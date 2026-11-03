@@ -119,10 +119,15 @@ def test_vehicle_gone_from_the_account_is_dropped(caplog):
     client.refresh()
     assert VIN in client.vehicles
 
-    # An empty list is a hiccup, nothing is dropped
-    client.api.list_vehicles.return_value = []
+    # An empty list is a hiccup, nothing is dropped. The poll fails though,
+    # or a stale lock state would be shown as current for as long as it lasts.
+    for listing in ([], [{"nickname": "500"}]):
+        client.api.list_vehicles.return_value = listing
+        with pytest.raises(ValueError):
+            client.refresh()
+        assert VIN in client.vehicles
+    client.api.list_vehicles.return_value = [LIST_ITEM]
     client.refresh()
-    assert VIN in client.vehicles
 
     other = dict(LIST_ITEM, vin="ZFAOTHERCAR0000001")
     client.api.list_vehicles.return_value = [other]
@@ -1289,6 +1294,7 @@ def locked_by_home_assistant():
     [
         {"status": "PENDING"},
         {"status": "TIMEOUT"},
+        {"status": "EXPIRED"},
         requests.exceptions.ReadTimeout("x"),
     ],
 )
@@ -1489,6 +1495,8 @@ def test_newer_command_variants_are_used_directly():
     # Offered like the older commands
     assert "DEEPREFRESH" in vehicle.supported_commands
     assert "CNOW" in vehicle.supported_commands
+    # The action naming the newer variant is not refused either
+    assert "START_CHARGE" in vehicle.supported_commands
 
     from custom_components.uconnect.pyuconnect.command import (
         COMMAND_CHARGE,
@@ -1642,3 +1650,205 @@ def test_confirmed_schedule_and_level_survive_a_restart():
     v = restarted.vehicles[VIN]
     assert v.charge_schedules[0].start_time == "02:30"
     assert v.charging_level_preference == 5
+
+
+# --- Malformed and stale status answers ---------------------------------
+
+
+def test_blocks_sent_as_null_keep_the_last_values():
+    status = load_fixture("status_500e.json")
+    nulls = copy.deepcopy(status)
+    nulls["evInfo"] = None
+    nulls["vehicleInfo"]["tripsInfo"] = None
+    trip = copy.deepcopy(status)
+    trip["vehicleInfo"]["tripsInfo"]["trips"][0]["totalDistance"] = None
+
+    client = make_client([status, nulls, trip])
+    client.refresh()
+    client.refresh()
+    v = client.vehicles[VIN]
+    assert v.state_of_charge == 72
+    assert v.trip_a_distance is None
+
+    client.refresh()
+    assert (v.trip_a_distance, v.trip_b_distance) == (None, 14)
+
+
+def test_list_without_services_keeps_the_commands():
+    client = make_client([load_fixture("status_500e.json")] * 4)
+    client.refresh()
+    bare = {k: v for k, v in LIST_ITEM.items() if k != "services"}
+    for item in (bare, dict(LIST_ITEM, services=None), dict(LIST_ITEM, services=[])):
+        client.api.list_vehicles.return_value = [item]
+        client.refresh()
+        v = client.vehicles[VIN]
+        assert v.supported_commands == ["RDL", "RDU"]
+        assert "CPPLUS" in v.enabled_services
+
+
+def test_service_flags_sent_as_strings():
+    item = copy.deepcopy(LIST_ITEM)
+    item["services"] = [
+        {"service": "RDL", "vehicleCapable": True, "serviceEnabled": "true"},
+        {"service": "RDU", "vehicleCapable": "false", "serviceEnabled": "false"},
+        {"service": "ROTRUNKUNLOCK", "vehicleCapable": "True", "serviceEnabled": "no"},
+        {"service": ["VF"], "vehicleCapable": True, "serviceEnabled": True},
+    ]
+    client = make_client([load_fixture("status_500e.json")], vehicles=[item])
+    client.refresh()
+    assert client.vehicles[VIN].supported_commands == ["RDL"]
+
+
+def test_empty_status_does_not_keep_the_values_forever():
+    status = load_fixture("status_500e.json")
+    client = make_client([status, {}, {}])
+    with patch.object(client_module, "monotonic", return_value=1000.0):
+        client.refresh()
+    with patch.object(
+        client_module, "monotonic", return_value=1000.0 + STATUS_BLOCK_MAX_AGE - 1
+    ):
+        client.refresh()
+    v = client.vehicles[VIN]
+    assert (v.state_of_charge, v.charging) == (72, True)
+
+    # As with a partial answer after that long
+    with patch.object(
+        client_module, "monotonic", return_value=1000.0 + STATUS_BLOCK_MAX_AGE + 1
+    ):
+        client.refresh()
+    assert (v.state_of_charge, v.charging, v.plugged_in) == (None, None, None)
+    # An odometer left out keeps its last reading
+    assert v.odometer == 12345
+
+
+def test_older_upload_does_not_replace_a_newer_one():
+    parked = ev_upload("OFF", datetime(2026, 10, 29, 4, 42, 29, tzinfo=timezone.utc))
+    parked["evInfo"]["battery"]["stateOfCharge"] = 67
+    # Served again later by a lagging cloud: the upload of the drive before
+    older = ev_upload("ON", datetime(2026, 10, 29, 4, 22, 28, tzinfo=timezone.utc))
+    older["evInfo"]["battery"]["stateOfCharge"] = 74
+    older["vehicleInfo"]["timestamp"] -= 1
+    older["vehicleInfo"]["daysToService"] = 201
+    older["timestamp"] = parked["timestamp"] + 1
+
+    client = make_client([parked, older])
+    client.refresh()
+    client.refresh()
+    v = client.vehicles[VIN]
+    assert (v.state_of_charge, v.ignition_on) == (67, False)
+    assert v.timestamp_ev_info == datetime(
+        2026, 10, 29, 4, 42, 29, tzinfo=timezone.utc
+    ).astimezone()
+    assert v.days_to_service == 200
+
+
+@pytest.mark.parametrize("value", ["NA", "", True, ["CHARGING"], {"a": 1}])
+def test_unreadable_charging_and_ignition_are_unknown(value):
+    payload = load_fixture("status_500e.json")
+    payload["evInfo"]["battery"]["chargingStatus"] = value
+    payload["evInfo"]["ignitionStatus"] = value
+    v = vehicle_from(payload)
+    assert (v.charging, v.ignition_on) == (None, None)
+
+
+def test_values_of_the_wrong_type_do_not_break_the_refresh():
+    payload = load_fixture("status_500e.json")
+    payload["evInfo"]["battery"]["chargingLevel"] = ["LEVEL_2"]
+    payload["evInfo"]["chargePowerPreference"] = {"a": 1}
+    payload["vehicleInfo"]["tyrePressure"][0]["type"] = ["FL"]
+    payload["vehicleInfo"]["tripsInfo"]["trips"][1]["name"] = {}
+    v = vehicle_from(payload)
+    assert (v.charging_level, v.charging_level_preference) == (None, None)
+    assert (v.wheel_front_left_pressure, v.wheel_front_right_pressure) == (None, 250)
+    assert (v.trip_a_distance, v.trip_b_distance) == (1013, None)
+
+
+def test_odometer_reading_without_a_unit_is_in_the_last_one():
+    payload = load_fixture("status_500e.json")
+    v = vehicle_from(payload)
+    for odometer in ({"value": "120"}, {"value": "120", "unit": "km "}):
+        lower = copy.deepcopy(payload)
+        lower["vehicleInfo"]["odometer"]["odometer"] = odometer
+        _update_vehicle(v, lower)
+        assert (v.odometer, v.odometer_unit) == (12345, "km")
+
+    higher = copy.deepcopy(payload)
+    higher["vehicleInfo"]["odometer"]["odometer"] = {"value": "12400"}
+    _update_vehicle(v, higher)
+    assert (v.odometer, v.odometer_unit) == (12400, "km")
+
+
+def test_level_uploaded_after_a_switch_off_is_not_taken():
+    """10-30 15:23 and 10-31 10:21: LEVEL_ONE without anybody changing it,
+    LEVEL_FIVE again with the next upload."""
+    parked = ev_upload("OFF", datetime(2026, 10, 30, 14, 8, tzinfo=timezone.utc))
+    parked["evInfo"]["chargePowerPreference"] = "LEVEL_FIVE"
+    parked["evInfo"]["battery"]["timeToFullyChargeL3"] = 16
+    spurious = copy.deepcopy(parked)
+    spurious["evInfo"]["chargePowerPreference"] = "LEVEL_ONE"
+    spurious["evInfo"]["battery"]["timeToFullyChargeL3"] = 0
+
+    v = vehicle_from(parked)
+    assert v.charging_level_preference == 5
+    _update_vehicle(v, spurious)
+    assert v.charging_level_preference == 5
+
+    # Plugged in, the level is taken
+    plugged = copy.deepcopy(spurious)
+    plugged["evInfo"]["battery"]["plugInStatus"] = True
+    _update_vehicle(v, plugged)
+    assert v.charging_level_preference == 1
+    # Without an earlier level as well
+    assert vehicle_from(spurious).charging_level_preference == 1
+
+
+@pytest.mark.parametrize("stamp", [None, "1760000300000", 1e20, 1760000300])
+def test_bad_location_time_keeps_the_new_position(stamp):
+    client = make_client([load_fixture("status_500e.json")] * 2)
+    client.refresh()
+    client.api.get_vehicle_location.return_value = {
+        "latitude": 48.2,
+        "longitude": 11.6,
+        "timeStamp": stamp,
+    }
+    client.refresh()
+    location = client.vehicles[VIN].location
+    assert (location.latitude, location.longitude) == (48.2, 11.6)
+    assert location.updated is None or location.updated.year == 2025
+
+
+@pytest.mark.parametrize("latitude", ["NA", "12,5", "", True, [48.2], {}])
+def test_position_that_is_not_a_number_is_ignored(latitude):
+    client = make_client([load_fixture("status_500e.json")] * 3)
+    client.refresh()
+    good = client.vehicles[VIN].location
+    client.api.get_vehicle_location.return_value = {"latitude": latitude, "longitude": 11.6}
+    client.refresh()
+    assert client.vehicles[VIN].location == good
+
+    client.api.get_vehicle_location.return_value = {
+        "latitude": "48.2",
+        "longitude": "11.6",
+        "isLocationApprox": "false",
+    }
+    client.refresh()
+    location = client.vehicles[VIN].location
+    assert (location.latitude, location.longitude) == (48.2, 11.6)
+    assert location.is_approximate is False
+
+
+@pytest.mark.parametrize("spelling", ["Fail", "FAIL", "cancelled"])
+def test_notification_spelled_fail_is_a_failure(spelling):
+    client = Client("user@example.com", "pw", "1234", FIAT_EU)
+    client.api = MagicMock()
+    client.api.get_remote_operation_status.side_effect = requests.HTTPError("404")
+    client.api.get_vehicle_notifications.return_value = {
+        "notifications": {
+            "items": [{"correlationId": "c", "notification": {"data": {"status": spelling}}}]
+        }
+    }
+    ticks = iter([0.0, 0.0])
+    with patch.object(client_module, "sleep"), patch.object(
+        client_module, "monotonic", lambda: next(ticks, 61.0)
+    ):
+        assert client._poll_correlation_id(VIN, "c") is False

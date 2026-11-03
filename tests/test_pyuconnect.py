@@ -479,6 +479,22 @@ def test_placeholder_after_a_restart_shows_the_saved_charge():
     assert v.distance_to_empty == 171
 
 
+def test_saved_charge_from_long_before_the_placeholder_is_not_shown():
+    # Saved, then weeks with upstream: the charge may be much lower by now
+    uploaded = datetime.fromtimestamp(1760000100).astimezone() - timedelta(days=21)
+    restarted = make_client([placeholder_status(0, 171)])
+    restarted.restore_last_charges(
+        {VIN: {"state_of_charge": 80, "time_to_fully_charge_l2": 90,
+               "uploaded": uploaded.isoformat()}}
+    )
+    restarted.refresh()
+    v = restarted.vehicles[VIN]
+
+    assert v.state_of_charge is None
+    assert v.time_to_fully_charge_l2 is None
+    assert v.distance_to_empty == 171
+
+
 def test_saved_charge_gives_way_to_a_real_reading():
     status = load_fixture("status_500e.json")
     status["evInfo"]["battery"]["stateOfCharge"] = 80

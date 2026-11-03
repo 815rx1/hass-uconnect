@@ -52,6 +52,9 @@ def sg(dct: Any, *keys: str) -> Any:
         return None
 
     for key in keys:
+        # A block sent as null is missing, it must not fail the whole refresh
+        if not isinstance(dct, dict):
+            return None
         try:
             dct = dct[key]
         except KeyError:
@@ -384,6 +387,10 @@ _CHARGE_TIMES = (
     "time_to_fully_charge_l3",
 )
 
+# A saved charge stands in for a placeholder uploaded at most this long after
+# it. Kept over weeks with upstream, it would be shown as current for days.
+SAVED_CHARGE_MAX_AGE = 24 * 3600
+
 
 def _is_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
@@ -419,13 +426,25 @@ def _update_vehicle(
 
     v.battery_voltage = sg_num(vi, "batteryInfo", "batteryVoltage", "value")
     v.battery_state_of_charge = sg_num(vi, "batteryInfo", "batteryStateOfCharge")
-    v.charging = sg_eq(batt, "CHARGING", "chargingStatus")
-    v.charging_level = CHARGING_LEVELS.get(sg(batt, "chargingLevel"), None)
+    # An unreadable state is unknown, not a definite "not charging"
+    v.charging = sg_state(batt, "CHARGING", "chargingStatus")
+    v.charging_level = CHARGING_LEVELS.get(sg_str(batt, "chargingLevel"), None)
     # chargePowerPreference is reported as a word-form string (EMEA:
     # LEVEL_ONE..LEVEL_FIVE; NA: LEVEL_1..LEVEL_5). Map it to the same 1..5
     # integer scale as charging_level for consistency (README shows int 5).
-    _pref_raw = sg(ev, "chargePowerPreference")
-    if _pref_raw in (None, "NOT_USED_VALUE"):
+    _pref_raw = sg_str(ev, "chargePowerPreference")
+    if (
+        sg_state(ev, "OFF", "ignitionStatus")
+        and sg_bool(batt, "plugInStatus") is False
+        and sg_num(batt, "timeToFullyChargeL3") == 0
+        and v.charging_level_preference is not None
+    ):
+        # Minutes after a switch-off a 500e not plugged in now and then
+        # uploads LEVEL_ONE, nobody having changed it, and the real one again
+        # with its next upload. Shown, a level set by an automation would be
+        # skipped as set already, or sent again and wake the vehicle.
+        pass
+    elif _pref_raw in (None, "NOT_USED_VALUE"):
         v.charging_level_preference = None
     else:
         v.charging_level_preference = CHARGING_LEVELS.get(_pref_raw, None)
@@ -461,7 +480,7 @@ def _update_vehicle(
     v.fuel_amount = sg_num(vi, "fuel", "fuelAmountLevel")
     v.oil_level = sg_num(vi, "oilLevel", "oilLevel")
 
-    v.ignition_on = sg_eq(ev, "ON", "ignitionStatus")
+    v.ignition_on = sg_state(ev, "ON", "ignitionStatus")
 
     csai = sg(ev, "chargeScheduleAdditionalInfo")
     v.ev_head_seat = sg_bool(csai, "headSeat")
@@ -507,7 +526,8 @@ def _update_vehicle(
         ) = last_charge
 
     odometer = sg_num(vi, "odometer", "odometer", "value")
-    odometer_unit = sg(vi, "odometer", "odometer", "unit")
+    # A reading without a unit is in the last one, as the sensor shows it
+    odometer_unit = sg_str(vi, "odometer", "odometer", "unit") or v.odometer_unit
     # An odometer never goes back. Home Assistant reads a lower value of a
     # total increasing sensor as a meter reset, so a single bad reading would
     # add the whole distance to the long-term statistics once it recovers.
@@ -518,7 +538,8 @@ def _update_vehicle(
         pass
     elif (
         isinstance(v.odometer, (int, float))
-        and str(odometer_unit or "").lower() == str(v.odometer_unit or "").lower()
+        and str(odometer_unit or "").strip().lower()
+        == str(v.odometer_unit or "").strip().lower()
         and odometer < v.odometer
     ):
         _LOGGER.debug(
@@ -530,7 +551,11 @@ def _update_vehicle(
 
     tyres = vi.get("tyrePressure") if isinstance(vi, dict) else None
     if isinstance(tyres, list):
-        tp = {x.get("type"): x for x in tyres if isinstance(x, dict)}
+        tp = {
+            x["type"]: x
+            for x in tyres
+            if isinstance(x, dict) and isinstance(x.get("type"), str)
+        }
 
         v.wheel_front_left_pressure = sg_num(tp, "FL", "pressure", "value")
         v.wheel_front_left_pressure_unit = sg(tp, "FL", "pressure", "unit")
@@ -549,7 +574,15 @@ def _update_vehicle(
         v.wheel_rear_right_pressure_warning = sg_bool(tp, "RR", "warning")
 
     trips = sg(vi, "tripsInfo", "trips")
-    trips = {t.get("name"): t for t in trips if isinstance(t, dict)} if isinstance(trips, list) else {}
+    trips = (
+        {
+            t["name"]: t
+            for t in trips
+            if isinstance(t, dict) and isinstance(t.get("name"), str)
+        }
+        if isinstance(trips, list)
+        else {}
+    )
     v.trip_a_distance = sg_num(trips, "TripA", "totalDistance", "value")
     v.trip_a_distance_unit = sg(trips, "TripA", "totalDistance", "unit")
     v.trip_b_distance = sg_num(trips, "TripB", "totalDistance", "value")
@@ -601,6 +634,24 @@ def _has_block(payload: Any, block: str) -> bool:
     return isinstance(value, dict) and bool(value)
 
 
+def _without_older_blocks(previous: dict | None, current: dict) -> dict:
+    """Leaves out the blocks of current uploaded before those of previous.
+
+    An older upload, as a lagging cloud may serve, would bring back the values
+    the newer one replaced: a parked vehicle as switched on and charged
+    higher. _merge_status carries the newer one over instead.
+    """
+
+    kept = dict(current)
+    for block in _STATUS_BLOCKS:
+        uploaded = sg_num(current, block, "timestamp")
+        last = sg_num(previous, block, "timestamp")
+        if uploaded is not None and last is not None and uploaded < last:
+            _LOGGER.debug("Ignoring %s uploaded before the last one", block)
+            del kept[block]
+    return kept
+
+
 def _merge_status(
     previous: dict | None,
     current: dict,
@@ -631,9 +682,20 @@ def _merge_status(
 
 
 TERMINAL_SUCCESS = ("success", "succeeded", "completed", "complete")
-TERMINAL_FAILURE = ("failure", "failed", "error", "rejected", "timeout")
+# The notifications spell a failure "Fail"
+TERMINAL_FAILURE = (
+    "failure",
+    "failed",
+    "fail",
+    "error",
+    "rejected",
+    "cancelled",
+    "canceled",
+    "timeout",
+    "expired",
+)
 # Failures after which the vehicle may still have carried the command out
-TERMINAL_UNKNOWN = ("timeout",)
+TERMINAL_UNKNOWN = ("timeout", "expired")
 
 # States the remote status stopped reporting are kept for at most this long.
 # Shown as locked for days while the status call fails, a lock would be
@@ -761,6 +823,10 @@ class Client:
         # A vehicle that left the account is dropped, its entities turn
         # unavailable. An empty list is taken as a hiccup rather than an
         # account without vehicles.
+        if not listed and self.vehicles:
+            # The vehicles are kept, but the poll fails: taken as a success,
+            # no state would expire and a lock state shown as current forever
+            raise ValueError("the vehicle list names none of the vehicles")
         if listed:
             for vin in [v for v in self.vehicles if v not in listed]:
                 _LOGGER.info("Vehicle %s is no longer in the account", _masked_vin(vin))
@@ -801,44 +867,72 @@ class Client:
             vehicle.fuel_type = sg(x, "fuelType")
 
             # Taken from the list first, so a status call failing below does
-            # not leave the vehicle without its commands
+            # not leave the vehicle without its commands. A list without any
+            # keeps the last ones, as an empty status does: the actions
+            # locking the car would be refused meanwhile.
             services = x.get("services")
-            enabled_services = [
-                v["service"]
-                for v in (services if isinstance(services, list) else [])
-                if isinstance(v, dict)
-                and v.get("service")
-                and sg(v, "vehicleCapable")
-                and sg(v, "serviceEnabled")
-            ]
-            vehicle.enabled_services = enabled_services
-            supported = [v for v in enabled_services if v in COMMANDS_BY_NAME]
-            # Vehicles listing only the newer variant of a command still
-            # offer the command, which then goes out as that variant
-            for alias, command in (("DEEPREFRESH2", "DEEPREFRESH"), ("CNOW2", "CNOW")):
-                if alias in enabled_services and command not in supported:
-                    supported.append(command)
-            vehicle.supported_commands = supported
+            if isinstance(services, list) and services:
+                enabled_services = [
+                    v["service"]
+                    for v in services
+                    if isinstance(v, dict)
+                    and isinstance(v.get("service"), str)
+                    and _bool(v.get("vehicleCapable"))
+                    and _bool(v.get("serviceEnabled"))
+                ]
+                vehicle.enabled_services = enabled_services
+                supported = [v for v in enabled_services if v in COMMANDS_BY_NAME]
+                # Vehicles listing only the newer variant of a command still
+                # offer the command, which then goes out as that variant. The
+                # action naming that variant is offered as well.
+                for alias, command in (
+                    ("DEEPREFRESH2", "DEEPREFRESH"),
+                    ("CNOW2", "CNOW"),
+                    ("CNOW2", COMMAND_CHARGE_V4.name),
+                ):
+                    if alias in enabled_services and command not in supported:
+                        supported.append(command)
+                vehicle.supported_commands = supported
+            else:
+                _LOGGER.debug("No services listed for %s, keeping the last ones", vin)
 
             try:
                 info = self.api.get_vehicle(vin)
-                if (placeholder := _placeholder_range(info)) is not None:
-                    self.placeholders[vin] = {
-                        "uploaded": _ms_timestamp(sg(info, "evInfo", "timestamp")),
-                        "range": placeholder,
-                    }
+                previous = self._last_status.get(vin)
+                fresh_at = self._block_fresh_at.setdefault(vin, {})
 
                 # An empty answer comes back when both status endpoints fail,
                 # which also happens now and then to vehicles that do support
-                # them. Keep the last good values instead of clearing them all.
+                # them. Keep the last good values instead of clearing them all,
+                # for STATUS_BLOCK_MAX_AGE at most as with a partial answer.
                 if any(_has_block(info, b) for b in _STATUS_BLOCKS):
-                    info = _merge_status(
-                        self._last_status.get(vin),
-                        info,
-                        self._block_fresh_at.setdefault(vin, {}),
-                    )
+                    info = _without_older_blocks(previous, info)
+                    if (placeholder := _placeholder_range(info)) is not None:
+                        self.placeholders[vin] = {
+                            "uploaded": _ms_timestamp(sg(info, "evInfo", "timestamp")),
+                            "range": placeholder,
+                        }
+                    info = _merge_status(previous, info, fresh_at)
+                elif previous:
+                    kept = {k: v for k, v in previous.items() if k not in _STATUS_BLOCKS}
+                    info = _merge_status(previous, kept, fresh_at)
+                    if all(
+                        _has_block(info, b) or not _has_block(previous, b)
+                        for b in _STATUS_BLOCKS
+                    ):
+                        info = None
+                else:
+                    info = None
+
+                if info is not None:
                     self._last_status[vin] = info
-                    _update_vehicle(vehicle, info, self._saved_charge(vin))
+                    _update_vehicle(
+                        vehicle,
+                        info,
+                        self._saved_charge(
+                            vin, _ms_timestamp(sg(info, "evInfo", "timestamp"))
+                        ),
+                    )
                     if (
                         _placeholder_range(info) is None
                         and vehicle.state_of_charge is not None
@@ -863,25 +957,23 @@ class Client:
             try:
                 loc = self.api.get_vehicle_location(vin)
 
-                updated = (
-                    datetime.fromtimestamp(loc["timeStamp"] / 1000).astimezone()
-                    if "timeStamp" in loc
-                    else None
-                )
+                # A bad time must not throw away a good position
+                updated = _ms_timestamp(sg(loc, "timeStamp"))
 
                 # A position without coordinates, or at 0/0, would replace a
-                # good one
-                latitude, longitude = sg(loc, "latitude"), sg(loc, "longitude")
+                # good one. So would one that is not a number, which the
+                # tracker then fails to write.
+                latitude, longitude = sg_num(loc, "latitude"), sg_num(loc, "longitude")
                 if latitude is not None and longitude is not None and (
                     latitude,
                     longitude,
                 ) != (0, 0):
                     vehicle.location = Location(
-                        longitude=sg(loc, "longitude"),
-                        latitude=sg(loc, "latitude"),
-                        altitude=sg(loc, "altitude"),
-                        bearing=sg(loc, "bearing"),
-                        is_approximate=sg(loc, "isLocationApprox"),
+                        longitude=longitude,
+                        latitude=latitude,
+                        altitude=sg_num(loc, "altitude"),
+                        bearing=sg_num(loc, "bearing"),
+                        is_approximate=sg_bool(loc, "isLocationApprox"),
                         updated=updated,
                     )
             except Exception as err:
@@ -995,10 +1087,26 @@ class Client:
             "uploaded": uploaded.isoformat() if uploaded else None,
         }
 
-    def _saved_charge(self, vin: str) -> tuple[Any, Any, Any, Any] | None:
+    def _saved_charge(
+        self, vin: str, uploaded: datetime | None = None
+    ) -> tuple[Any, Any, Any, Any] | None:
+        """The saved charge to show for a placeholder uploaded at uploaded,
+        all unknown when it is older than SAVED_CHARGE_MAX_AGE before it."""
+
         entry = self._last_charge.get(vin)
         if entry is None:
             return None
+        try:
+            saved_at = datetime.fromisoformat(entry.get("uploaded"))
+        except (TypeError, ValueError):
+            saved_at = None
+        if (
+            uploaded is not None
+            and saved_at is not None
+            and saved_at.tzinfo is not None
+            and (uploaded - saved_at).total_seconds() > SAVED_CHARGE_MAX_AGE
+        ):
+            return (None, None, None, None)
         return (entry["state_of_charge"], *(entry.get(key) for key in _CHARGE_TIMES))
 
     @staticmethod
