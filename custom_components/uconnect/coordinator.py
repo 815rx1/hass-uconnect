@@ -23,6 +23,7 @@ from .pyuconnect.api import (
     PinAuthError,
     PinRejectedError,
     forget_pin_rejection,
+    pin_rejection_fingerprint,
 )
 
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
@@ -1169,11 +1170,12 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
 
         A confirmed state the vehicle has since replaced is dropped here too,
         or a restart within its lifetime would bring it back while the status
-        call still fails.
+        call still fails. Written on every poll, see _async_save_pin_rejection:
+        a dropped state whose write failed would otherwise stay on disk.
         """
         vins = list(self.client.vehicles)
-        if self._confirmed_states.update(vins, self.client.confirmed_states()):
-            self._confirmed_states.async_delay_save(CONFIRMED_STATES_SAVE_DELAY)
+        self._confirmed_states.update(vins, self.client.confirmed_states())
+        self._confirmed_states.async_delay_save(CONFIRMED_STATES_SAVE_DELAY)
         if self._last_charge.update(vins, self.client.last_charges()):
             self._last_charge.async_delay_save(LAST_CHARGE_SAVE_DELAY)
 
@@ -1246,8 +1248,13 @@ async def async_retry_pin(hass: HomeAssistant, entry: ConfigEntry, pin: str) -> 
         return
     brand = BRANDS_BY_NAME.get(BRANDS.get(entry.data.get(CONF_BRAND_REGION)))
     if brand is not None:
-        forget_pin_rejection(brand.login_url, entry.data.get(CONF_USERNAME))
+        forget_pin_rejection(brand.login_url, entry.data.get(CONF_USERNAME), pin)
+    # Only the rejection of this PIN: one of the PIN given at setup stays, as
+    # in _async_save_pin_rejection, for a blank PIN field brings it back
     store = VehicleStore.shared(hass, PIN_REJECTION_STORAGE_KEY)
-    await store.async_load()
-    if store.update([entry.entry_id], {}):
+    stored = (await store.async_load()).get(entry.entry_id)
+    if isinstance(stored, dict) and stored.get("pin") == pin_rejection_fingerprint(
+        entry.entry_id, pin
+    ):
+        store.update([entry.entry_id], {})
         await store.async_save()

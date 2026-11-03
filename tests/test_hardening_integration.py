@@ -782,6 +782,12 @@ async def test_failed_store_writes_are_tried_again(hass, config_entry, mock_clie
                 await coordinator._async_save_confirmed_states()
         assert save.call_count == 2
 
+    # Also after a poll, which drops the states the vehicle has replaced
+    with patch.object(coordinator._confirmed_states._store, "async_delay_save") as save:
+        for _ in range(2):
+            coordinator._save_vehicle_stores()
+    assert save.call_count == 2
+
 
 async def test_cancelled_command_keeps_the_client_and_saves_the_rejection(
     hass, hass_storage, config_entry, mock_client
@@ -834,10 +840,15 @@ async def test_options_of_an_entry_not_loaded_let_the_pin_go_out(
 ):
     from custom_components.uconnect.const import BRANDS
     from custom_components.uconnect.coordinator import PIN_REJECTION_STORAGE_KEY
-    from custom_components.uconnect.pyuconnect.api import _PIN_REJECTIONS, API
+    from custom_components.uconnect.pyuconnect.api import (
+        _PIN_REJECTIONS,
+        API,
+        pin_rejection_fingerprint,
+    )
     from custom_components.uconnect.pyuconnect.brands import BRANDS as BRANDS_BY_NAME
 
-    stored = {config_entry.entry_id: {"pin": "fp", "locked": True}}
+    fingerprint = pin_rejection_fingerprint(config_entry.entry_id, "1234")
+    stored = {config_entry.entry_id: {"pin": fingerprint, "locked": True}}
     hass_storage[PIN_REJECTION_STORAGE_KEY] = {
         "version": 1, "minor_version": 1, "key": PIN_REJECTION_STORAGE_KEY, "data": stored,
     }
@@ -860,6 +871,43 @@ async def test_options_of_an_entry_not_loaded_let_the_pin_go_out(
     else:
         assert not _PIN_REJECTIONS
         assert hass_storage[PIN_REJECTION_STORAGE_KEY]["data"] == {}
+
+
+async def test_options_saved_unchanged_keep_the_rejected_setup_pin(
+    hass, hass_storage, config_entry
+):
+    """Entry not loaded, setup PIN rejected and replaced in the options: the
+    rejection must stay, a blank PIN field brings the setup PIN back."""
+    from custom_components.uconnect.const import BRANDS
+    from custom_components.uconnect.coordinator import PIN_REJECTION_STORAGE_KEY
+    from custom_components.uconnect.pyuconnect.api import (
+        _PIN_REJECTIONS,
+        API,
+        pin_rejection_fingerprint,
+    )
+    from custom_components.uconnect.pyuconnect.brands import BRANDS as BRANDS_BY_NAME
+
+    fingerprint = pin_rejection_fingerprint(config_entry.entry_id, "1234")
+    stored = {config_entry.entry_id: {"pin": fingerprint, "locked": True}}
+    hass_storage[PIN_REJECTION_STORAGE_KEY] = {
+        "version": 1, "minor_version": 1, "key": PIN_REJECTION_STORAGE_KEY, "data": stored,
+    }
+    brand = BRANDS_BY_NAME[BRANDS[config_entry.data["brand_region"]]]
+    API("user@example.com", "pw", "1234", brand)._reject_pin(True)
+
+    config_entry.add_to_hass(hass)
+    hass.config_entries.async_update_entry(
+        config_entry, options={**config_entry.options, "pin": "5678"}
+    )
+    result = await hass.config_entries.options.async_init(config_entry.entry_id)
+    with patch(SETUP, return_value=True):
+        await hass.config_entries.options.async_configure(
+            result["flow_id"], dict(config_entry.options)
+        )
+        await hass.async_block_till_done()
+
+    assert _PIN_REJECTIONS
+    assert hass_storage[PIN_REJECTION_STORAGE_KEY]["data"] == stored
 
 
 # --- Setup while the cloud is not fully there ----------------------------

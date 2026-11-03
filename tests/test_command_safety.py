@@ -187,6 +187,29 @@ async def test_trunk_is_a_lock_not_a_switch(hass, config_entry, mock_client, veh
     assert sent(mock_client)[-1] == "ROTRUNKUNLOCK"
 
 
+async def test_trunk_lock_action_follows_the_entity(
+    hass, config_entry, mock_client, vehicle
+):
+    # The real 500e lists ROTRUNKUNLOCK without ROTRUNKLOCK
+    vehicle.supported_commands += ["ROTRUNKUNLOCK"]
+    await setup(hass, config_entry)
+    trunk = entity_id(hass, "lock", "lock_trunk")
+    assert trunk is not None
+
+    await hass.services.async_call(DOMAIN, "trunk_lock", {}, blocking=True)
+    assert sent(mock_client)[-1] == "ROTRUNKLOCK"
+
+    # Only a securing command goes out unlisted
+    with pytest.raises(ServiceValidationError):
+        await hass.services.async_call(DOMAIN, "engine_off", {}, blocking=True)
+    vehicle.supported_commands.remove("ROTRUNKUNLOCK")
+    vehicle.supported_commands += ["ROTRUNKLOCK"]
+    with pytest.raises(ServiceValidationError):
+        await hass.services.async_call(
+            DOMAIN, "trunk_unlock", {"code": PIN}, blocking=True
+        )
+
+
 def test_doors_locked_looks_at_every_door(vehicle):
     vehicle.door_driver_locked = True
     vehicle.door_passenger_locked = False

@@ -42,6 +42,7 @@ from .pyuconnect.command import (
 from .charge_schedule import WEEKDAYS, format_time, supports_emea_schedules
 from .const import DOMAIN
 from .coordinator import UconnectDataUpdateCoordinator
+from .wake_guard import COMMAND_GROUPS, SECURING_COMMANDS
 
 SERVICE_UPDATE = "update"
 
@@ -172,7 +173,16 @@ def async_setup_services(hass: HomeAssistant) -> None:
             return
 
         cmd = SERVICES_COMMANDS[call.service]
-        if cmd.name not in coordinator.client.vehicles[vin].supported_commands:
+        supported = coordinator.client.vehicles[vin].supported_commands
+        # A securing command goes out as from its entity, which exists when
+        # either direction is listed: the 500e lists ROTRUNKUNLOCK alone
+        if cmd.name not in supported and not (
+            cmd.name in SECURING_COMMANDS
+            and any(
+                COMMAND_GROUPS.get(name) == COMMAND_GROUPS[cmd.name]
+                for name in supported
+            )
+        ):
             raise ServiceValidationError(
                 f"Action {call.service} is not supported by vehicle {vin}"
             )

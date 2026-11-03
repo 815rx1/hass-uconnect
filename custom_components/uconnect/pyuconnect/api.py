@@ -190,11 +190,21 @@ def _account_key(login_url: str, email: str | None) -> str:
     return hashlib.sha256(f"{login_url}\n{(email or '').casefold()}".encode()).hexdigest()
 
 
-def forget_pin_rejection(login_url: str, email: str | None) -> None:
-    """Lets the PIN of an account be sent again when no API object is at hand"""
+def forget_pin_rejection(login_url: str, email: str | None, pin: str | None = None) -> None:
+    """Lets the PIN of an account be sent again when no API object is at hand,
+    only the given one if any"""
 
-    _PIN_REJECTIONS.pop(_account_key(login_url, email), None)
-    _PIN_UNPROVEN.discard(_account_key(login_url, email))
+    key = _account_key(login_url, email)
+    rejection = _PIN_REJECTIONS.get(key)
+    if rejection is not None and (pin is None or rejection[0] == pin):
+        del _PIN_REJECTIONS[key]
+    _PIN_UNPROVEN.discard(key)
+
+
+def pin_rejection_fingerprint(salt: str, pin: str) -> str:
+    """Identifies a PIN without revealing it, to keep a rejection over a
+    restart."""
+    return hashlib.sha256(f"{salt}\n{pin}".encode()).hexdigest()[:16]
 
 
 def _login_error(r: dict) -> str:
@@ -491,7 +501,7 @@ class API:
     def pin_rejection_fingerprint(self, salt: str) -> str:
         """Identifies the PIN set now without revealing it, to keep a
         rejection over a restart."""
-        return hashlib.sha256(f"{salt}\n{self.pin}".encode()).hexdigest()[:16]
+        return pin_rejection_fingerprint(salt, self.pin)
 
     def restore_pin_rejection(self, fingerprint: Any, locked: Any, salt: str) -> None:
         """Takes back a rejection of the PIN set now from before a restart"""
