@@ -470,6 +470,23 @@ async def test_clock_behind_keeps_the_history(hass, hass_storage):
         assert guard.last_wake(VIN, at(1)) is None
 
 
+async def test_clock_ahead_does_not_hold_refreshes_back_once_corrected(hass):
+    clock = [1000.0]
+    with patch("custom_components.uconnect.wake_guard.monotonic", lambda: clock[0]):
+        guard = await new_guard(hass)
+        guard._started = clock[0] - STARTUP_GRACE.total_seconds()
+        # Refreshed while the clock was a day and a half ahead
+        guard.charging_started(VIN, at(-60))
+        guard.record_command(VIN, "DEEPREFRESH", at(36 * 60))
+        assert begin(guard, 0).decision is Decision.ALLOWED
+        guard.auto_refresh_done(VIN, 50.0, at(0))
+
+        # Half a day later the clock comes within a day of it, moving towards
+        # it rather than jumping past: it was dated wrong
+        clock[0] += 13 * 3600
+        assert begin(guard, 13 * 60).decision is Decision.ALLOWED
+
+
 async def test_damaged_storage_is_ignored(hass, hass_storage):
     hass_storage[STORAGE_KEY] = {
         "version": 1,

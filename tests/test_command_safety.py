@@ -545,6 +545,43 @@ async def test_lock_does_not_wait_for_the_refresh_after_an_unlock(
     assert calls[:3] == ["RDU", "RDL", "refresh"]
 
 
+async def test_turn_on_again_waits_for_the_refresh_after_a_late_confirmation(
+    hass, config_entry, mock_client, vehicle
+):
+    # Two automations start the engine. The vehicle carries the first one out,
+    # but its confirmation comes after the poll gave up.
+    vehicle.supported_commands += ["REON", "REOFF"]
+    vehicle.ignition_on = False
+    await setup(hass, config_entry)
+    engine = entity_id(hass, "switch", "switch_engine")
+    coordinator = config_entry.runtime_data
+    run = coordinator._async_run_locked
+    release = asyncio.Event()
+
+    async def held(func, *args, **kwargs):
+        if func is mock_client.command_verify:
+            mock_client.command_verify(*args)
+            await release.wait()
+            raise Exception("timed out")
+        if func is mock_client.refresh:
+            vehicle.ignition_on = True
+            vehicle.timestamp_ev_info = dt_util.utcnow()
+        return await run(func, *args, **kwargs)
+
+    coordinator._async_run_locked = held
+    turn_on = ("switch", "turn_on", {"entity_id": engine})
+    first = hass.async_create_task(hass.services.async_call(*turn_on, blocking=True))
+    await asyncio.sleep(0.05)
+    second = hass.async_create_task(hass.services.async_call(*turn_on, blocking=True))
+    await asyncio.sleep(0.05)
+    release.set()
+    with pytest.raises(HomeAssistantError):
+        await first
+    await second
+    # The second one found the engine on after the first one's refresh
+    assert sent(mock_client) == ["REON"]
+
+
 async def test_engine_off_after_on(hass, config_entry, mock_client, vehicle):
     vehicle.supported_commands += ["REON", "REOFF"]
     vehicle.ignition_on = False

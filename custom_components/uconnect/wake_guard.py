@@ -14,8 +14,9 @@ around it:
 - the clock jumping, e.g. a Raspberry Pi without real-time clock booting with
   an old time: a wake-up dated in the future counts as just now, and one dated
   more than a day ahead is set aside so it cannot block refreshes for good. It
-  is only discarded once the clock stayed behind it for a day: the clock of a
-  boot is corrected long before, and the history must not be lost to it
+  is only discarded once the clock stayed behind it for a day, or came within
+  a day of it without passing it: the clock of a boot is corrected long
+  before, and at once, and the history must not be lost to it
 
 Commands sent on request are recorded too. They are never held back for
 timing, only repeated and runaway ones are: a refresh right after another, or
@@ -357,7 +358,18 @@ class WakeGuard:
     def _vehicle(self, vin: str, now: datetime) -> VehicleWakes:
         entry = self._vehicles.setdefault(vin, VehicleWakes())
         limit = now + FUTURE_TOLERANCE
-        records = entry.wakes + entry.ahead
+        # One set aside that comes within a day while still ahead was dated
+        # wrong: a corrected clock jumps past them, this one moved towards it.
+        # Counted as just now, it would hold back refreshes for a day.
+        returning = [w for w in entry.ahead if now < w.at <= limit]
+        if returning:
+            _LOGGER.warning(
+                "Dropping %d wake-ups of %s dated ahead, the clock was wrong",
+                len(returning),
+                vin,
+            )
+            self._save()
+        records = entry.wakes + [w for w in entry.ahead if w not in returning]
         # Set aside rather than dropped: the clock may be the one that is
         # wrong, and once it is corrected they count again
         ahead = [w for w in records if w.at > limit]

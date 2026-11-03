@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Final, Callable
 
+import asyncio
 import logging
 
 from homeassistant.core import HomeAssistant
@@ -170,6 +171,9 @@ class UconnectSwitch(SwitchEntity, UconnectCommandEntity):
             f"{vehicle.make} {vehicle.nickname or vehicle.model} {description.name}"
         )
         self._attr_unique_id = f"{DOMAIN}_{vehicle.vin}_{description.key}"
+        # Turning on again waits for the turn-on still running, refresh
+        # included, see async_turn_on
+        self._turn_on_lock = asyncio.Lock()
 
     @property
     def icon(self):
@@ -191,18 +195,24 @@ class UconnectSwitch(SwitchEntity, UconnectCommandEntity):
                 f"{self.entity_description.name} cannot be turned on"
             )
 
-        # Already reported on: sending it again would only wake the vehicle.
-        # Not once the report is older, it would hold back a restart for good.
-        reported_at = self.entity_description.reported_at(self.vehicle)
-        if (
-            self.is_on is True
-            and reported_at is not None
-            and dt_util.utcnow() - reported_at < RECENTLY_REPORTED
-        ):
-            _LOGGER.debug("%s is already on, not sending", self.entity_description.key)
-            return
+        # A turn-on sent meanwhile, whose confirmation came too late to count
+        # as a repeat, is seen here in the state its refresh brought in
+        async with self._turn_on_lock:
+            # Already reported on: sending it again would only wake the
+            # vehicle. Not once the report is older, it would hold back a
+            # restart for good.
+            reported_at = self.entity_description.reported_at(self.vehicle)
+            if (
+                self.is_on is True
+                and reported_at is not None
+                and dt_util.utcnow() - reported_at < RECENTLY_REPORTED
+            ):
+                _LOGGER.debug(
+                    "%s is already on, not sending", self.entity_description.key
+                )
+                return
 
-        await self._async_send(self.entity_description.command_on, "turn on")
+            await self._async_send(self.entity_description.command_on, "turn on")
 
     async def async_turn_off(self, **kwargs):
         # Charging cannot be stopped remotely. Raising here would stop a
