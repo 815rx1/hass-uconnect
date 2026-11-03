@@ -908,6 +908,20 @@ async def test_location_never_read_is_not_requested(
     assert location_requests(mock_client) == 0
 
 
+async def test_location_without_a_time_is_not_requested(
+    hass, freezer, config_entry, mock_client, vehicle
+):
+    await drive(hass, freezer, config_entry, mock_client, vehicle, 16)
+    vehicle.ignition_on = False
+    mock_client.switched_off_at.return_value = dt_util.utcnow()
+    # Read, but the cloud sent no usable time with it
+    vehicle.location = Location(latitude=48.2, longitude=11.6, updated=None)
+
+    await run_for(hass, freezer, 30, every=0.5)
+    await hass.async_block_till_done(wait_background_tasks=True)
+    assert location_requests(mock_client) == 0
+
+
 async def test_location_that_came_along_is_not_requested(
     hass, freezer, config_entry, mock_client, vehicle
 ):

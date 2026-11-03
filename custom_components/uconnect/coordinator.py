@@ -716,6 +716,9 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
             location.updated >= off_at - SWITCH_OFF_LOCATION_MARGIN
         ):
             return "the location came along"
+        if location is not None and location.updated is None:
+            # Whether it came along cannot be told, and it may well have
+            return "the time of the location is not known"
         if dt_util.utcnow() - off_at > SWITCH_OFF_LOCATION_WINDOW:
             return "the switch-off was too long ago"
         if not self.client.location_read(vin):

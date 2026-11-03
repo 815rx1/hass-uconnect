@@ -456,6 +456,34 @@ async def test_action_goes_to_an_account_that_can_send(
     other.runtime_data.async_command.assert_not_called()
 
 
+async def test_securing_action_goes_out_while_an_unload_waits(
+    hass, config_entry, mock_client
+):
+    await setup(hass, config_entry)
+    coordinator = config_entry.runtime_data
+
+    # A reload waits for a vehicle action still running
+    async with coordinator._action_running():
+        reload = hass.async_create_task(
+            hass.config_entries.async_reload(config_entry.entry_id)
+        )
+        for _ in range(10):
+            await asyncio.sleep(0)
+        assert config_entry.state is ConfigEntryState.UNLOAD_IN_PROGRESS
+
+        # Locking still goes out, anything else waits for the reload
+        await hass.services.async_call(DOMAIN, "doors_lock", {}, blocking=True)
+        assert sent(mock_client) == ["RDL"]
+        with pytest.raises(ServiceValidationError, match="not loaded"):
+            await hass.services.async_call(
+                DOMAIN, "doors_unlock", {"code": "1234"}, blocking=True
+            )
+        assert sent(mock_client) == ["RDL"]
+
+    assert await reload
+    assert config_entry.state is ConfigEntryState.LOADED
+
+
 async def test_rejected_login_is_reported_by_the_entities(
     hass, config_entry, mock_client
 ):

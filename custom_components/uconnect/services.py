@@ -166,7 +166,12 @@ def async_setup_services(hass: HomeAssistant) -> None:
     """
 
     async def async_call_command(call: ServiceCall) -> None:
-        coordinator, vin = _resolve_target(hass, call)
+        coordinator, vin = _resolve_target(
+            hass,
+            call,
+            securing=call.service in SERVICES_COMMANDS
+            and SERVICES_COMMANDS[call.service].name in SECURING_COMMANDS,
+        )
 
         if call.service == SERVICE_UPDATE:
             await coordinator.async_refresh()
@@ -247,7 +252,7 @@ def async_setup_services(hass: HomeAssistant) -> None:
 
 
 def _resolve_target(
-    hass: HomeAssistant, call: ServiceCall
+    hass: HomeAssistant, call: ServiceCall, securing: bool = False
 ) -> tuple[UconnectDataUpdateCoordinator, str]:
     """Return the coordinator and VIN an action call is meant for.
 
@@ -256,12 +261,21 @@ def _resolve_target(
     are loaded or not, and also one missing from the last update: otherwise a
     car that is briefly not reported, or an account that failed to load,
     would make the remaining car the target of an unlock meant for another.
+
+    A securing command also goes to an entry being unloaded: the unload
+    waits for the actions still running, which can take minutes, and the
+    command queues behind them as one sent from its entity does.
     """
 
     loaded = [
         entry
         for entry in hass.config_entries.async_entries(DOMAIN)
         if entry.state is ConfigEntryState.LOADED
+        or (
+            securing
+            and entry.state is ConfigEntryState.UNLOAD_IN_PROGRESS
+            and getattr(entry, "runtime_data", None) is not None
+        )
     ]
     if not loaded:
         raise ServiceValidationError("Uconnect is not loaded")
