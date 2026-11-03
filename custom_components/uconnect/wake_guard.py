@@ -291,7 +291,9 @@ class WakeGuard:
             for item in wakes if isinstance(wakes, list) else []:
                 if not isinstance(item, dict) or (at := _parse(item.get("at"))) is None:
                     continue
-                entry.wakes.append(
+                # Set aside stays so: one the clock has come within a day of
+                # would count as a wake-up yet to come
+                (entry.ahead if item.get("ahead") is True else entry.wakes).append(
                     WakeRecord(
                         at=at,
                         command=str(item.get("command") or ""),
@@ -300,6 +302,10 @@ class WakeGuard:
                         confirmed_at=_parse(item.get("confirmed_at")),
                     )
                 )
+            ahead_for = _number(raw.get("ahead_for"))
+            if entry.ahead and ahead_for is not None:
+                # The day they may stay aside runs on from where it was
+                entry.ahead_since = monotonic() - max(ahead_for, 0.0)
             session = raw.get("session")
             if isinstance(session, dict):
                 entry.session = ChargeSession(
@@ -328,9 +334,15 @@ class WakeGuard:
                             "automatic": w.automatic,
                             "confirmed": w.confirmed,
                             "confirmed_at": _iso(w.confirmed_at),
+                            **({"ahead": True} if w in entry.ahead else {}),
                         }
                         for w in sorted(entry.wakes + entry.ahead, key=lambda w: w.at)
                     ],
+                    **(
+                        {"ahead_for": monotonic() - entry.ahead_since}
+                        if entry.ahead and entry.ahead_since is not None
+                        else {}
+                    ),
                     "session": {
                         "started": _iso(entry.session.started),
                         "ended": _iso(entry.session.ended),
@@ -408,6 +420,9 @@ class WakeGuard:
             ahead = []
             entry.ahead_since = entry.ahead_offset = None
             self._save()
+        elif entry.ahead_offset is None:
+            # Loaded set aside, a jump counts from the first look on
+            entry.ahead_offset = offset
         entry.ahead = sorted(ahead, key=lambda w: w.at)
         kept = [w for w in valid if _age(now, w.at) < HISTORY_WINDOW]
         # The latest one is kept beyond the window, it still dates the last

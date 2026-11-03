@@ -1714,6 +1714,63 @@ def test_unlock_is_not_shown_locked_once_a_day_old(status):
     assert remote_states(v)[:4] == [True] * 4
 
 
+def test_unlock_saved_fresh_is_not_shown_locked_when_restored_a_day_on():
+    """No poll saw the day pass, Home Assistant was down: the report from
+    before the unlock must not come back as the state after the restart."""
+    from custom_components.uconnect.pyuconnect.command import COMMAND_DOORS_UNLOCK
+
+    client = locked_by_home_assistant()
+    with patch("custom_components.uconnect.pyuconnect.client.sleep"):
+        assert client.command_verify(VIN, COMMAND_DOORS_UNLOCK) is True
+    client.refresh()
+    assert remote_states(client.vehicles[VIN])[:4] == [False] * 4
+
+    saved = json.loads(json.dumps(client.confirmed_states()))
+    unlocked = datetime.now(timezone.utc) - timedelta(hours=26)
+    for what, entry in saved[VIN].items():
+        if what.startswith("lock:"):
+            entry["at"] = unlocked.isoformat()
+    before = unlocked - timedelta(minutes=30)
+    restarted = make_client(
+        [ev_upload("OFF", before)] * 2, remote=remote_report(before, running="OFF")
+    )
+    restarted.restore_confirmed_states(saved)
+    restarted.refresh()
+    assert remote_states(restarted.vehicles[VIN])[:4] == [None] * 4
+
+    # Until the vehicle reports again
+    restarted.api.get_vehicle_status.return_value = remote_report(
+        datetime.now(timezone.utc), running="OFF"
+    )
+    restarted.refresh()
+    assert remote_states(restarted.vehicles[VIN])[:4] == [True] * 4
+
+
+def test_report_made_while_an_unlock_was_pending_does_not_show_it_locked():
+    """The vehicle uploaded the doors locked while it carried out the unlock
+    whose outcome never came."""
+    from custom_components.uconnect.pyuconnect.command import COMMAND_DOORS_UNLOCK
+
+    client = locked_by_home_assistant()
+    pending = []
+
+    def status(*_):
+        time.sleep(0.01)
+        pending.append(datetime.now(timezone.utc))
+        time.sleep(0.01)
+        return {"status": "TIMEOUT"}
+
+    client.api.get_remote_operation_status.side_effect = status
+    client.api.get_vehicle_notifications.return_value = {}
+    with patch("custom_components.uconnect.pyuconnect.client.sleep"):
+        assert client.command_verify(VIN, COMMAND_DOORS_UNLOCK) is False
+    assert remote_states(client.vehicles[VIN])[:4] == [None] * 4
+
+    client.api.get_vehicle_status.return_value = remote_report(pending[0], running="OFF")
+    client.refresh()
+    assert remote_states(client.vehicles[VIN])[:4] == [None] * 4
+
+
 def test_lock_saved_with_the_clock_ahead_is_not_restored():
     client = locked_by_home_assistant()
     saved = json.loads(json.dumps(client.confirmed_states()))

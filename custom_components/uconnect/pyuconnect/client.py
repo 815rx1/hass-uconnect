@@ -1225,14 +1225,12 @@ class Client:
                 if at > now + timedelta(minutes=5):
                     continue
                 age = max((now - at).total_seconds(), 0.0)
-                # Locks left unknown stay so until a newer report, see
-                # _apply_written_locks
-                if age > self._override_max_age(what) and not (
-                    what.startswith("lock:")
-                    and value
-                    and all(v is None for v in value.values())
-                ):
-                    continue
+                if age > self._override_max_age(what):
+                    if not (what.startswith("lock:") and value):
+                        continue
+                    # A day on, a lock is unknown until a newer report, as in
+                    # _apply_written_locks, also when no poll saw the day pass
+                    value = {a: None for a in value}
                 self._written.setdefault(vin, {})[what] = (value, at, monotonic() - age)
 
     def _remember(
@@ -1636,7 +1634,9 @@ class Client:
             status = self._poll_command_status(vin, id)
         except Exception:
             if unlock:
-                self._remember_lock(vin, cmd.name, sent, confirmed=False)
+                # From now, as a confirmed unlock: a report made while it was
+                # pending may still show the doors locked
+                self._remember_lock(vin, cmd.name, confirmed=False)
             raise
 
         result = status in TERMINAL_SUCCESS
@@ -1646,7 +1646,7 @@ class Client:
             # the doors locked.
             self._remember_lock(vin, cmd.name, None if unlock else sent)
         elif unlock and status in TERMINAL_UNKNOWN:
-            self._remember_lock(vin, cmd.name, sent, confirmed=False)
+            self._remember_lock(vin, cmd.name, confirmed=False)
         return result
 
     def get_stolen_vehicle_status(self, vin: str) -> dict:
