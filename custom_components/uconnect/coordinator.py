@@ -64,6 +64,7 @@ from .const import (
     MAX_CONSECUTIVE_FAILURES,
     MIN_CHARGING_REFRESH_INTERVAL,
     SLOW_EXTRA_DATA_INTERVAL,
+    SWITCH_OFF_LOCATION_MARGIN,
     SWITCH_OFF_LOCATION_WINDOW,
     SWITCH_OFF_POLL_DELAYS,
     UNLOCK_COMMANDS,
@@ -695,7 +696,7 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
             return "the time of the switch-off is not known"
         location = vehicle.location
         if location is not None and location.updated is not None and (
-            location.updated >= off_at
+            location.updated >= off_at - SWITCH_OFF_LOCATION_MARGIN
         ):
             return "the location came along"
         if dt_util.utcnow() - off_at > SWITCH_OFF_LOCATION_WINDOW:

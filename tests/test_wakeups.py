@@ -860,7 +860,10 @@ async def test_location_that_came_along_is_not_requested(
     off_at = dt_util.utcnow()
     mock_client.switched_off_at.return_value = off_at
     await run_for(hass, freezer, 1.5, every=0.5)
-    vehicle.location = Location(latitude=48.2, longitude=11.6, updated=off_at)
+    # Stamped before the switch-off, as the vehicle does it
+    vehicle.location = Location(
+        latitude=48.2, longitude=11.6, updated=off_at - timedelta(seconds=85)
+    )
 
     await run_for(hass, freezer, 30, every=0.5)
     await hass.async_block_till_done(wait_background_tasks=True)

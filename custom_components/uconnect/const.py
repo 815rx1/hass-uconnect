@@ -84,5 +84,8 @@ SWITCH_OFF_POLL_DELAYS: tuple[timedelta, ...] = (
 # A position still older than the switch-off after the last of those polls is
 # asked for once, which wakes the vehicle, but only this soon after it
 SWITCH_OFF_LOCATION_WINDOW: timedelta = timedelta(minutes=10)
+# The position that comes with the switch-off is stamped up to a minute and a
+# half before it, so one this much older still counts as having come along
+SWITCH_OFF_LOCATION_MARGIN: timedelta = timedelta(minutes=2)
 
 UNIT_DYNAMIC: str = "dynamic"
