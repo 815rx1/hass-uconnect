@@ -713,6 +713,24 @@ def test_failed_command_drops_pin_token():
     assert api._pin_token is None
 
 
+def test_cached_pin_token_refused_as_not_plugged_in_is_kept():
+    # The vehicle, not the token, was refused: no PIN and no command again
+    api = logged_in_api()
+    api._pin_token = ("pin-1", float("inf"))
+    answers = [
+        response(
+            403, {"message": "Deep refresh not allowed if the vehicle is not plugged-in"}
+        ),
+        response(200, {"responseStatus": "pending", "correlationId": "a"}),
+    ]
+    with patch.object(api.sess, "request", side_effect=answers) as req:
+        with pytest.raises(requests.HTTPError):
+            api.command(VIN, COMMAND_DEEP_REFRESH)
+        assert req.call_count == 1
+        assert api.command(VIN, COMMAND_DOORS_LOCK) == "a"
+    assert req.call_args_list[1].kwargs["json"]["pinAuth"] == "pin-1"
+
+
 def test_changed_pin_drops_pin_token():
     api = logged_in_api()
     api._pin_token = ("pin-1", float("inf"))

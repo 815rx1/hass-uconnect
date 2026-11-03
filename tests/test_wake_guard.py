@@ -496,10 +496,12 @@ async def test_wakes_set_aside_stay_so_over_a_restart(hass, hass_storage):
         guard.record_command(VIN, "DEEPREFRESH", at(36 * 60))
         assert guard.auto_refreshes_last_day(VIN, at(0)) == 0
 
-        # Restarted once the clock came within a day of it
+        # Restarted once the clock came within a day of it, with nothing
+        # saved after it was set aside but the delayed save of that
         clock[0] += 13 * 3600
         assert guard.auto_refreshes_last_day(VIN, at(13 * 60)) == 0
-        await guard.async_flush()
+        async_fire_time_changed(hass)
+        await hass.async_block_till_done()
         restarted = await new_guard(hass)
         restarted._started = clock[0] - STARTUP_GRACE.total_seconds()
         assert restarted.auto_refreshes_last_day(VIN, at(13 * 60)) == 0
@@ -511,6 +513,58 @@ async def test_wakes_set_aside_stay_so_over_a_restart(hass, hass_storage):
         assert not restarted._vehicle(VIN, at(24 * 60)).ahead
         # Only the refresh made after the restart counts
         assert restarted.auto_refreshes_last_day(VIN, at(30 * 60)) == 1
+
+
+async def test_wakes_set_aside_count_the_downtime_of_a_restart(hass, hass_storage):
+    clock = [1000.0]
+    with patch("custom_components.uconnect.wake_guard.monotonic", lambda: clock[0]):
+        guard = await new_guard(hass)
+        guard.charging_started(VIN, at(-60))
+        # Refreshed while the clock was a day and a half ahead
+        guard.record_command(VIN, "DEEPREFRESH", at(36 * 60))
+        assert guard.auto_refreshes_last_day(VIN, at(0)) == 0
+        clock[0] += 13 * 3600
+        assert guard.auto_refreshes_last_day(VIN, at(13 * 60)) == 0
+        await guard.async_flush()
+
+        # Down for 20 hours, and the host rebooted: the monotonic clock
+        # started anew
+        clock[0] = 100.0
+        with patch(
+            "custom_components.uconnect.wake_guard._utcnow", lambda: at(33 * 60)
+        ):
+            restarted = await new_guard(hass)
+        restarted._started = clock[0] - STARTUP_GRACE.total_seconds()
+        assert restarted.auto_refreshes_last_day(VIN, at(33 * 60)) == 0
+
+        # The clock reaching it does not make it a wake-up of just now
+        clock[0] += 4 * 3600
+        assert restarted.last_wake(VIN, at(37 * 60)) is None
+        assert restarted.auto_refreshes_last_day(VIN, at(37 * 60)) == 0
+
+
+async def test_wakes_set_aside_by_a_corrected_clock_stay_so_over_a_restart(
+    hass, hass_storage
+):
+    clock = [1000.0]
+    with patch("custom_components.uconnect.wake_guard.monotonic", lambda: clock[0]):
+        guard = await new_guard(hass)
+        # Refreshed while the clock was a day and a half ahead, and saved
+        guard.charging_started(VIN, at(-60))
+        guard.record_command(VIN, "DEEPREFRESH", at(0))
+        async_fire_time_changed(hass)
+        await hass.async_block_till_done()
+
+        # The clock is corrected, nothing else is saved before a restart
+        clock[0] += 60
+        assert guard.last_wake(VIN, at(-36 * 60)) is None
+        clock[0] += 13 * 3600
+        assert guard.last_wake(VIN, at(-23 * 60)) is None
+        async_fire_time_changed(hass)
+        await hass.async_block_till_done()
+
+        restarted = await new_guard(hass)
+        assert restarted.last_wake(VIN, at(-23 * 60)) is None
 
 
 async def test_clock_running_wrong_keeps_the_wakes_set_aside(hass):

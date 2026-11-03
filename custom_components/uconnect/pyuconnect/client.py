@@ -1628,7 +1628,10 @@ class Client:
             id = self.command(vin, cmd)
         except Exception as err:
             if unlock and not _refused_before_sent(err):
-                self._remember_lock(vin, cmd.name, sent, confirmed=False)
+                # From now, as one still pending: the vehicle may have taken
+                # it, and a report made while the request was open may still
+                # show the doors locked
+                self._remember_lock(vin, cmd.name, confirmed=False)
             raise
         try:
             status = self._poll_command_status(vin, id)

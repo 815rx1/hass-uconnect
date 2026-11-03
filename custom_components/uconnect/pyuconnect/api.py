@@ -818,10 +818,12 @@ class API:
                 ) from None
 
             # A request carrying the PIN token that fails may have failed over
-            # the token, so the next one asks for a fresh token
-            if (r.status_code >= 400 or _is_token_rejected(r)) and "pinAuth" in (
-                kwargs.get("json") or {}
-            ):
+            # the token, so the next one asks for a fresh token. Refused as the
+            # vehicle is not plugged in, the token was taken.
+            if (
+                (r.status_code >= 400 and not _needs_plug(r))
+                or _is_token_rejected(r)
+            ) and "pinAuth" in (kwargs.get("json") or {}):
                 self._pin_token = None
 
             if (
@@ -1419,7 +1421,13 @@ class API:
             try:
                 return self._send_command(vin, cmd, cached[0], "marked")
             except requests.exceptions.HTTPError as err:
-                if err.response is None or err.response.status_code not in (401, 403):
+                if (
+                    err.response is None
+                    or err.response.status_code not in (401, 403)
+                    # Refused over the vehicle, not the token: a fresh token
+                    # gets the same answer
+                    or _needs_plug(err.response)
+                ):
                     raise
                 _LOGGER.info(
                     "PIN token refused (HTTP %s), authenticating again",

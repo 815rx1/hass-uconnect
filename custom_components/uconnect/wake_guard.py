@@ -209,6 +209,9 @@ class VehicleWakes:
     # clock they are, see _vehicle
     ahead: list[WakeRecord] = field(default_factory=list)
     ahead_since: float | None = None
+    # and since when on the clock: the monotonic one restarts with the host,
+    # and the time Home Assistant was down counts towards the day too
+    ahead_at: datetime | None = None
     # The clock less the monotonic one when they were set aside
     ahead_offset: float | None = None
 
@@ -304,7 +307,13 @@ class WakeGuard:
                 )
             ahead_for = _number(raw.get("ahead_for"))
             if entry.ahead and ahead_for is not None:
-                # The day they may stay aside runs on from where it was
+                # The day they may stay aside runs on from where it was, or
+                # from when they were set aside, which counts the downtime
+                entry.ahead_at = _parse(raw.get("ahead_at"))
+                if entry.ahead_at is not None:
+                    ahead_for = max(
+                        ahead_for, (_utcnow() - entry.ahead_at).total_seconds()
+                    )
                 entry.ahead_since = monotonic() - max(ahead_for, 0.0)
             session = raw.get("session")
             if isinstance(session, dict):
@@ -339,7 +348,10 @@ class WakeGuard:
                         for w in sorted(entry.wakes + entry.ahead, key=lambda w: w.at)
                     ],
                     **(
-                        {"ahead_for": monotonic() - entry.ahead_since}
+                        {
+                            "ahead_for": monotonic() - entry.ahead_since,
+                            "ahead_at": _iso(entry.ahead_at),
+                        }
                         if entry.ahead and entry.ahead_since is not None
                         else {}
                     ),
@@ -393,17 +405,17 @@ class WakeGuard:
                 len(returning),
                 vin,
             )
-            self._save()
         records = entry.wakes + [w for w in entry.ahead if w not in returning]
         # Set aside rather than dropped: the clock may be the one that is
         # wrong, and once it is corrected they count again
         ahead = [w for w in records if w.at > limit or w in nearing]
         valid = [w for w in records if w not in ahead]
         if not ahead:
-            entry.ahead_since = entry.ahead_offset = None
+            entry.ahead_since = entry.ahead_offset = entry.ahead_at = None
         elif entry.ahead_since is None:
             entry.ahead_since = monotonic()
             entry.ahead_offset = offset
+            entry.ahead_at = now
             _LOGGER.warning(
                 "Ignoring %d wake-ups of %s dated more than a day ahead, "
                 "the clock was probably wrong",
@@ -418,12 +430,16 @@ class WakeGuard:
                 vin,
             )
             ahead = []
-            entry.ahead_since = entry.ahead_offset = None
-            self._save()
+            entry.ahead_since = entry.ahead_offset = entry.ahead_at = None
         elif entry.ahead_offset is None:
             # Loaded set aside, a jump counts from the first look on
             entry.ahead_offset = offset
-        entry.ahead = sorted(ahead, key=lambda w: w.at)
+        ahead = sorted(ahead, key=lambda w: w.at)
+        if ahead != entry.ahead:
+            # Which ones are set aside has to survive a restart, also when
+            # nothing else is saved before it
+            self._save()
+        entry.ahead = ahead
         kept = [w for w in valid if _age(now, w.at) < HISTORY_WINDOW]
         # The latest one is kept beyond the window, it still dates the last
         # wake-up

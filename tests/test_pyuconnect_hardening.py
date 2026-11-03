@@ -1771,6 +1771,32 @@ def test_report_made_while_an_unlock_was_pending_does_not_show_it_locked():
     assert remote_states(client.vehicles[VIN])[:4] == [None] * 4
 
 
+def test_report_made_while_an_unlock_request_failed_does_not_show_it_locked():
+    """The request of the unlock timed out, the vehicle may have taken it and
+    uploaded the doors still locked while the request was open."""
+    from custom_components.uconnect.pyuconnect.command import COMMAND_DOORS_UNLOCK
+
+    client = locked_by_home_assistant()
+    open_request = []
+
+    def command(*_):
+        time.sleep(0.01)
+        open_request.append(datetime.now(timezone.utc))
+        time.sleep(0.01)
+        raise requests.exceptions.ReadTimeout("ReadTimeout on POST /x")
+
+    client.api.command.side_effect = command
+    with pytest.raises(requests.exceptions.ReadTimeout):
+        client.command_verify(VIN, COMMAND_DOORS_UNLOCK)
+    assert remote_states(client.vehicles[VIN])[:4] == [None] * 4
+
+    client.api.get_vehicle_status.return_value = remote_report(
+        open_request[0], running="OFF"
+    )
+    client.refresh()
+    assert remote_states(client.vehicles[VIN])[:4] == [None] * 4
+
+
 def test_lock_saved_with_the_clock_ahead_is_not_restored():
     client = locked_by_home_assistant()
     saved = json.loads(json.dumps(client.confirmed_states()))
