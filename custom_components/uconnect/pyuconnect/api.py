@@ -1218,7 +1218,9 @@ class API:
         try:
             self._refresh_token_if_needed()
             if self._account in _PIN_UNPROVEN:
-                if not _lists_vehicles(self._read_vehicle_list()):
+                # Credentials the list read refuses are renewed first, as any
+                # request would: the PIN only waits for the service itself
+                if not _lists_vehicles(self._read_vehicle_list(relogin="any")):
                     raise PinAuthError(
                         "PIN authentication failed: not sent while the service fails"
                     )
@@ -1334,15 +1336,15 @@ class API:
             _raise_for_status(r, PinAuthError)
         return r
 
-    def _read_vehicle_list(self) -> requests.Response:
-        """Reads the vehicle list once, as it is, to see whether the backend
-        takes the credentials"""
+    def _read_vehicle_list(self, relogin: str = "never") -> requests.Response:
+        """Reads the vehicle list to see whether the backend takes the
+        credentials, once as it is unless relogin says otherwise"""
 
         return self._aws_request(
             method="GET",
             url=self.brand.api.url + f"/v4/accounts/{self.uid}/vehicles",
             params={"stage": "ALL", "sdp": "ALL", "brand": self.brand.brand_code},
-            relogin="never",
+            relogin=relogin,
         )
 
     def _command_with_pin_auth(

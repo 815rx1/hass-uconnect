@@ -16,6 +16,7 @@ import requests
 from custom_components.uconnect.pyuconnect import client as client_module
 from custom_components.uconnect.pyuconnect.api import (
     _PIN_REJECTIONS,
+    _PIN_UNPROVEN,
     API,
     LOGIN_BACKOFF_SETUP_MAX,
     LOGIN_BACKOFF_START,
@@ -943,6 +944,38 @@ def test_pin_is_not_sent_again_while_a_bare_401_is_unproven():
             api.command(VIN, COMMAND_DOORS_LOCK)
         assert len(pin_requests(req)) == 2
         assert api.pin_rejected
+
+
+def test_unproven_pin_logs_in_again_for_refused_credentials_on_request():
+    api = logged_in_api()
+
+    def login():
+        logins.append(1)
+        api.aws_auth = object()
+        api.expire_time = datetime.now(timezone.utc) + timedelta(hours=1)
+
+    logins = []
+    api.login = login
+    _PIN_UNPROVEN.add(api._account)
+    api._last_rejected_relogin = time.monotonic()
+    api.bypass_login_backoff = True
+
+    # The backend stopped taking the credentials, fresh ones and the PIN work
+    def answer(method, url, **kwargs):
+        if not logins:
+            return response(401, UNAUTHORIZED)
+        if url.endswith("/vehicles"):
+            return response(200, {"vehicles": []})
+        if url.endswith("/pin/authenticate"):
+            return response(200, {"token": "pin-1"})
+        return response(200, PENDING)
+
+    with patch.object(api.sess, "request", side_effect=answer) as req:
+        assert api.command(VIN, COMMAND_DOORS_LOCK) == "a"
+    # Logged in again for the list read, the PIN then went out once
+    assert logins == [1]
+    assert len(pin_requests(req)) == 1
+    assert api._account not in _PIN_UNPROVEN
 
 
 def test_bare_401_checked_with_renewed_credentials_is_not_taken_as_wrong():
