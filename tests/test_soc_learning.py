@@ -12,7 +12,12 @@ from datetime import timedelta
 
 import pytest
 from homeassistant.const import STATE_UNAVAILABLE
+from homeassistant.core import State
 from homeassistant.helpers import entity_registry as er
+from homeassistant.util import dt as dt_util
+from pytest_homeassistant_custom_component.common import (
+    mock_restore_cache_with_extra_data,
+)
 
 from custom_components.uconnect.const import DOMAIN
 from custom_components.uconnect.extrapolated_soc import (
@@ -21,6 +26,7 @@ from custom_components.uconnect.extrapolated_soc import (
     MAX_IDLE_DRAIN_RATE,
     SocEstimationState,
 )
+from custom_components.uconnect.wake_guard import async_get_wake_guard
 
 from .conftest import VIN
 
@@ -207,3 +213,147 @@ def test_charged_since_reading_is_kept():
 
     assert SocEstimationState.from_dict(state.to_dict()).charged_since_reading
     assert not SocEstimationState.from_dict({}).charged_since_reading
+
+
+async def test_higher_parked_reading_uploaded_later_is_taken(
+    hass, freezer, setup_integration, vehicle, parked
+):
+    # Charged overnight while Home Assistant was down: no charge was seen,
+    # but the vehicle uploaded the reading after the last one
+    await report(
+        hass, freezer, setup_integration, vehicle, 10,
+        state_of_charge=90,
+        timestamp_ev_info=vehicle.timestamp_ev_info + timedelta(hours=9),
+    )
+
+    assert parked._state.last_vehicle_soc == 90
+    assert parked.native_value == pytest.approx(90, abs=0.1)
+
+
+async def test_lower_charging_reading_after_a_drive_is_a_new_charge(
+    hass, freezer, setup_integration, vehicle, sensor
+):
+    await report(
+        hass, freezer, setup_integration, vehicle, 0,
+        charging=True, ignition_on=False, state_of_charge=80, odometer=1000,
+    )
+    guard = async_get_wake_guard(hass)
+    session = guard.session(VIN)
+    session.without_progress = 3
+    session.soc_at_last_refresh = 80
+
+    # The end of that charge and the drive after it went unseen
+    await report(
+        hass, freezer, setup_integration, vehicle, 8,
+        state_of_charge=40, odometer=1050,
+    )
+
+    assert sensor._state.last_vehicle_soc == 40
+    assert sensor._state.is_charging
+    assert sensor.native_value == pytest.approx(40, abs=0.1)
+    session = guard.session(VIN)
+    assert session.without_progress == 0
+    assert session.soc_at_last_refresh is None
+
+
+async def test_lower_charging_reading_without_a_drive_is_stale(
+    hass, freezer, setup_integration, vehicle, sensor
+):
+    await report(
+        hass, freezer, setup_integration, vehicle, 0,
+        charging=True, ignition_on=False, state_of_charge=80, odometer=1000,
+    )
+    await report(hass, freezer, setup_integration, vehicle, 1, state_of_charge=40)
+
+    assert sensor._state.last_vehicle_soc == 80
+
+
+async def test_charge_seen_ending_full_teaches_no_correction(
+    hass, freezer, setup_integration, vehicle, parked
+):
+    # 5 percent an hour estimated, so full after 8 hours, seen 4 hours late
+    await report(
+        hass, freezer, setup_integration, vehicle, 1,
+        charging=True, time_to_fully_charge_l1=480,
+        time_to_fully_charge_l2=480, time_to_fully_charge_l3=480,
+    )
+    await report(
+        hass, freezer, setup_integration, vehicle, 12,
+        charging=False, state_of_charge=100,
+    )
+
+    assert parked._state.last_vehicle_soc == 100
+    assert parked._state.learned_correction_factor == pytest.approx(1.0)
+
+
+async def test_same_reading_uploaded_again_holds_the_charge_estimate(
+    hass, freezer, setup_integration, vehicle, parked
+):
+    def uploaded(hours: float):
+        return dt_util.utcnow() + timedelta(hours=hours)
+
+    await report(
+        hass, freezer, setup_integration, vehicle, 1,
+        charging=True, timestamp_ev_info=uploaded(1),
+    )
+    await report(
+        hass, freezer, setup_integration, vehicle, 0.5,
+        state_of_charge=65, timestamp_ev_info=uploaded(0.5),
+    )
+    await report(
+        hass, freezer, setup_integration, vehicle, 0.1,
+        state_of_charge=67, timestamp_ev_info=uploaded(0.1),
+    )
+    assert parked._state.has_measured_rate
+    assert parked._state.charging_rate_pct_per_hour == pytest.approx(20)
+
+    # The charge stalls, the vehicle keeps uploading 67
+    await report(
+        hass, freezer, setup_integration, vehicle, 0.5, timestamp_ev_info=uploaded(0.5)
+    )
+    assert parked.native_value == pytest.approx(67, abs=0.1)
+
+    # Without a new upload it is extrapolated on from there
+    await report(hass, freezer, setup_integration, vehicle, 0.1)
+    assert parked.native_value == pytest.approx(69, abs=0.1)
+    assert parked._state.charging_rate_pct_per_hour == pytest.approx(20)
+
+
+async def test_state_is_restored_although_stored_unavailable(
+    hass, config_entry, mock_client
+):
+    state = SocEstimationState(
+        last_actual_soc=72,
+        last_actual_soc_time=dt_util.utcnow(),
+        last_vehicle_soc=72,
+        idle_drain_rate_pct_per_hour=0.02,
+        learned_correction_factor=1.3,
+    )
+    mock_restore_cache_with_extra_data(
+        hass,
+        [
+            (
+                State("sensor.fiat_500e_extrapolated_battery", STATE_UNAVAILABLE),
+                {"estimation_state": state.to_dict()},
+            )
+        ],
+    )
+    config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    sensor = config_entry.runtime_data.extrapolated_soc_sensors[VIN]
+    assert sensor._state.learned_correction_factor == pytest.approx(1.3)
+    assert sensor._state.idle_drain_rate_pct_per_hour == pytest.approx(0.02)
+    assert sensor.extra_restore_state_data.as_dict() == {
+        "estimation_state": sensor._state.to_dict()
+    }
+
+
+def test_upload_times_are_kept():
+    at = dt_util.utcnow()
+    state = SocEstimationState(last_vehicle_soc_uploaded=at, soc_confirmed_time=at)
+
+    restored = SocEstimationState.from_dict(state.to_dict())
+    assert restored.last_vehicle_soc_uploaded == at
+    assert restored.soc_confirmed_time == at

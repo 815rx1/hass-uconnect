@@ -24,7 +24,7 @@ from homeassistant.helpers.event import (
     async_call_later,
     async_track_time_interval,
 )
-from homeassistant.helpers.restore_state import RestoreEntity
+from homeassistant.helpers.restore_state import RestoredExtraData, RestoreEntity
 
 from .pyuconnect.client import Vehicle
 from .pyuconnect.command import COMMAND_DEEP_REFRESH
@@ -85,7 +85,7 @@ EV_DATA_MAX_AGE = timedelta(hours=12)
 # uploads when a charge begins, so a charge that really began has it; one
 # reported long ago may have ended without the end reaching the cloud, and
 # waking the vehicle for it would be for nothing. Later refreshes renew the
-# data themselves.
+# data themselves, as long as they keep coming.
 FIRST_REFRESH_MAX_DATA_AGE = timedelta(minutes=60)
 
 
@@ -99,6 +99,10 @@ class SocEstimationState:
         None  # Raw SOC from vehicle (not adjusted by lock-in)
     )
     last_odometer: float | None = None  # Odometer at the baseline reading
+    # When the vehicle last uploaded the baseline reading, by its own clock
+    last_vehicle_soc_uploaded: datetime | None = None
+    # When a newer upload confirmed the baseline reading during a charge
+    soc_confirmed_time: datetime | None = None
     is_charging: bool = False
     is_idle: bool = False  # Not charging and ignition off
     charging_rate_pct_per_hour: float = 0.0
@@ -116,6 +120,16 @@ class SocEstimationState:
             "last_actual_soc": self.last_actual_soc,
             "last_vehicle_soc": self.last_vehicle_soc,
             "last_odometer": self.last_odometer,
+            "last_vehicle_soc_uploaded": (
+                self.last_vehicle_soc_uploaded.isoformat()
+                if self.last_vehicle_soc_uploaded
+                else None
+            ),
+            "soc_confirmed_time": (
+                self.soc_confirmed_time.isoformat()
+                if self.soc_confirmed_time
+                else None
+            ),
             "last_actual_soc_time": (
                 self.last_actual_soc_time.isoformat()
                 if self.last_actual_soc_time
@@ -212,6 +226,10 @@ class SocEstimationState:
                 float(last_vehicle_soc) if last_vehicle_soc is not None else None
             ),
             last_odometer=(float(last_odometer) if last_odometer is not None else None),
+            last_vehicle_soc_uploaded=_parse_aware_datetime(
+                data.get("last_vehicle_soc_uploaded")
+            ),
+            soc_confirmed_time=_parse_aware_datetime(data.get("soc_confirmed_time")),
             is_charging=bool(data.get("is_charging", False)),
             is_idle=bool(data.get("is_idle", False)),
             charging_rate_pct_per_hour=float(charging_rate),
@@ -363,20 +381,27 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
         # the options listener
         self.coordinator.extrapolated_soc_sensors[self._vin] = self
 
-        # Restore previous state
-        if (last_state := await self.async_get_last_state()) is not None:
+        # Restore previous state. The extra data is stored whether or not the
+        # sensor is available, the attribute only while it is; the attribute
+        # is still read for states written by upstream and earlier versions
+        last_state = await self.async_get_last_state()
+        stored = None
+        if (extra := await self.async_get_last_extra_data()) is not None:
+            stored = extra.as_dict().get("estimation_state")
+        if not stored and last_state is not None:
+            stored = last_state.attributes.get("estimation_state")
+        if stored:
+            try:
+                self._state = SocEstimationState.from_dict(stored)
+                _LOGGER.debug(
+                    "Restored SOC estimation state for %s: %s",
+                    self.vehicle.vin,
+                    self._state,
+                )
+            except (KeyError, TypeError, ValueError) as err:
+                _LOGGER.warning("Failed to restore SOC estimation state: %s", err)
+        if last_state is not None:
             if last_state.attributes.get("estimation_state"):
-                try:
-                    self._state = SocEstimationState.from_dict(
-                        last_state.attributes["estimation_state"]
-                    )
-                    _LOGGER.debug(
-                        "Restored SOC estimation state for %s: %s",
-                        self.vehicle.vin,
-                        self._state,
-                    )
-                except (KeyError, TypeError, ValueError) as err:
-                    _LOGGER.warning("Failed to restore SOC estimation state: %s", err)
                 async_get_wake_guard(self.hass).import_legacy(
                     self._vin,
                     legacy_wake_times(last_state.attributes["estimation_state"]),
@@ -452,7 +477,10 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
         _LOGGER.info("Triggering deep refresh for %s", self._vin)
         try:
             await self.coordinator.async_command(
-                self._vin, COMMAND_DEEP_REFRESH, automatic=True
+                self._vin,
+                COMMAND_DEEP_REFRESH,
+                automatic=True,
+                blocker=self._refresh_blocker,
             )
         except ServiceValidationError as err:
             # Refused before anything reached the vehicle, so it does not
@@ -550,13 +578,27 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
         uploaded = getattr(vehicle, "timestamp_ev_info", None)
         if uploaded is None:
             return "the vehicle reports no time for its charge data"
-        age = datetime.now(timezone.utc) - uploaded
+        now = datetime.now(timezone.utc)
+        age = now - uploaded
         if age > EV_DATA_MAX_AGE:
             return "the last charge data from the vehicle is too old"
-        if (
-            age > FIRST_REFRESH_MAX_DATA_AGE
-            and async_get_wake_guard(self.hass).session(self._vin).auto_refreshes == 0
-        ):
+
+        # Refreshes renew the data only while they keep coming. After a gap,
+        # Home Assistant or the cloud having been down, the next one is a
+        # first refresh again
+        guard = async_get_wake_guard(self.hass)
+        session = guard.session(self._vin)
+        last = guard.last_auto_refresh(self._vin)
+        interval = timedelta(minutes=coordinator.charging_refresh_interval)
+        following = (
+            session.auto_refreshes > 0
+            and session.started is not None
+            and last is not None
+            and last >= session.started
+            and now - last
+            <= max(interval, FIRST_REFRESH_MAX_DATA_AGE) + FIRST_REFRESH_MAX_DATA_AGE
+        )
+        if age > FIRST_REFRESH_MAX_DATA_AGE and not following:
             return "the charge was reported too long ago to be sure it still goes on"
 
         return None
@@ -682,6 +724,8 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
         # Track if we're skipping due to stale charging data
         skip_stale_charging_data = False
         soc_changed = False
+        new_charge = False
+        uploaded = getattr(self.vehicle, "timestamp_ev_info", None)
 
         if current_soc is not None:
             # Only update baseline if SOC actually changed
@@ -698,7 +742,30 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
             # idle→charging transitions with lower SOC from idle drain are
             # accepted, and the reported state (still charging) so that a drop
             # after the charger was unplugged is not rejected forever
+            # A vehicle driven since the baseline reading is on a charge of
+            # its own: the one that reading was taken in ended unseen, while
+            # Home Assistant or the cloud was down, and the odometer does not
+            # move during a charge
+            odometer = getattr(self.vehicle, "odometer", None)
             if (
+                soc_changed
+                and self._state.is_charging  # Was already charging
+                and is_charging  # And still is
+                and self._state.last_actual_soc is not None
+                and current_soc < self._state.last_actual_soc
+                and odometer is not None
+                and self._state.last_odometer is not None
+                and odometer != self._state.last_odometer
+            ):
+                _LOGGER.debug(
+                    "New charge for %s at %.1f%%, driven since the last one",
+                    self.vehicle.vin,
+                    current_soc,
+                )
+                self._state.is_charging = False
+                self._state.measured_this_session = False
+                new_charge = True
+            elif (
                 soc_changed
                 and self._state.is_charging  # Was already charging
                 and is_charging  # And still is
@@ -724,12 +791,19 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
             # one, the gain it brought having to arrive somehow. A last report
             # of 0 does not hold the next one back either: a vehicle that is
             # really empty is not parked somewhere it could report more, and
-            # the cloud's placeholder 0 would otherwise stick for good
+            # the cloud's placeholder 0 would otherwise stick for good. Nor
+            # does one the vehicle uploaded after the last reading: that is
+            # no stale one, whatever happened in between went unseen
             if soc_changed and self._state.is_idle and is_idle:
                 if (
                     not self._state.last_vehicle_soc
                     or current_soc <= self._state.last_vehicle_soc
                     or self._state.charged_since_reading
+                    or (
+                        uploaded is not None
+                        and self._state.last_vehicle_soc_uploaded is not None
+                        and uploaded > self._state.last_vehicle_soc_uploaded
+                    )
                 ):
                     _LOGGER.debug(
                         "Accepting idle SOC update for %s: %.1f%% (last reported %s%%)",
@@ -782,9 +856,32 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
             self._state.last_actual_soc_time = now
             self._state.last_vehicle_soc = current_soc
             self._state.last_odometer = getattr(self.vehicle, "odometer", None)
+            self._state.last_vehicle_soc_uploaded = uploaded
+            self._state.soc_confirmed_time = None
             self._state.charged_since_reading = False
         elif was_charging and not self._state.is_charging:
             self._state.charged_since_reading = True
+        elif (
+            current_soc is not None
+            and current_soc == self._state.last_vehicle_soc
+            and uploaded is not None
+        ):
+            # Uploaded again with the same value: during a charge the vehicle
+            # was still below the next percent then, which the extrapolation
+            # must not run past. Only the display starts from there, the rate
+            # and the correction are measured from the reading that changed
+            if (
+                was_charging
+                and self._state.is_charging
+                and self._state.last_vehicle_soc_uploaded is not None
+                and uploaded > self._state.last_vehicle_soc_uploaded
+            ):
+                self._state.soc_confirmed_time = now
+            if (
+                self._state.last_vehicle_soc_uploaded is None
+                or uploaded > self._state.last_vehicle_soc_uploaded
+            ):
+                self._state.last_vehicle_soc_uploaded = uploaded
 
         # When transitioning from idle to non-idle (car powers on) without
         # fresh SOC data, lock in the accumulated idle drain so native_value
@@ -831,6 +928,7 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
             # while charging before measuring
             self._state.rate_baseline_stale = not soc_changed
             self._state.last_actual_soc_time = now
+            self._state.soc_confirmed_time = None
 
         # Calculate charging rate if charging with valid data
         # Don't recalculate if we detected stale charging data
@@ -893,7 +991,7 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
         if self.hass is not None:
             guard = async_get_wake_guard(self.hass)
             if self._state.is_charging and not was_charging:
-                guard.charging_started(self._vin)
+                guard.charging_started(self._vin, resume=not new_charge)
                 self._schedule_deep_refresh(CHARGE_START_REFRESH_DELAY)
             elif was_charging and not self._state.is_charging:
                 guard.charging_stopped(self._vin)
@@ -939,6 +1037,11 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
 
         # Only learn from meaningful positive changes (charging)
         if actual_change < MIN_SOC_CHANGE_FOR_LEARNING:
+            return
+
+        # A charge that reached its target may have done so any time before
+        # this reading, so the window says nothing about how fast it went
+        if current_soc >= self._state.target_soc:
             return
 
         # Calculate what we expected based on the rate
@@ -1118,11 +1221,25 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
 
         extrapolated = base_soc + (rate * correction * elapsed_hours)
 
+        # A later upload of the same reading puts the vehicle back there
+        confirmed = self._state.soc_confirmed_time
+        if confirmed is not None and self._state.last_vehicle_soc is not None:
+            since = max((now - confirmed).total_seconds() / 3600.0, 0.0)
+            extrapolated = min(
+                extrapolated,
+                self._state.last_vehicle_soc + rate * correction * since,
+            )
+
         # Clamp to target SOC and valid range
         extrapolated = min(extrapolated, self._state.target_soc)
         extrapolated = max(0.0, min(100.0, extrapolated))
 
         return round(extrapolated, 1)
+
+    @property
+    def extra_restore_state_data(self) -> RestoredExtraData:
+        """Return the state to restore, kept also while unavailable."""
+        return RestoredExtraData({"estimation_state": self._state.to_dict()})
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:

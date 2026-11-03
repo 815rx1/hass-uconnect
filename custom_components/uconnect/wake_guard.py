@@ -753,18 +753,25 @@ class WakeGuard:
             self._save()
 
     @callback
-    def charging_started(self, vin: str, now: datetime | None = None) -> bool:
+    def charging_started(
+        self, vin: str, now: datetime | None = None, resume: bool = True
+    ) -> bool:
         """Note that the vehicle is charging, return whether a new session began.
 
         A session that is still running, or that ended less than
-        SESSION_MERGE_WINDOW ago, carries on with its counters.
+        SESSION_MERGE_WINDOW ago, carries on with its counters, unless resume
+        is False: the vehicle was driven since, so this is another charge.
         """
         now = now or _utcnow()
         entry = self._vehicle(vin, now)
         session = entry.session
-        if session.active:
+        if resume and session.active:
             return False
-        if session.ended is not None and _age(now, session.ended) < SESSION_MERGE_WINDOW:
+        if (
+            resume
+            and session.ended is not None
+            and _age(now, session.ended) < SESSION_MERGE_WINDOW
+        ):
             session.ended = None
             self._save()
             return False

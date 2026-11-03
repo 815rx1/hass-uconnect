@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 from homeassistant import config_entries
 from homeassistant.data_entry_flow import FlowResultType
 
@@ -18,6 +21,9 @@ USER_INPUT = {
     "disable_tls_verification": False,
 }
 
+TRANSLATIONS = (
+    Path(__file__).parent.parent / "custom_components" / "uconnect" / "translations"
+)
 LOGIN = "custom_components.uconnect.config_flow.API.login"
 SETUP = "custom_components.uconnect.async_setup_entry"
 
@@ -188,3 +194,17 @@ async def test_reconfigure_invalid_auth_keeps_data(hass, config_entry):
 
     assert result["errors"] == {"base": "invalid_auth"}
     assert config_entry.data["password"] == "secret"
+
+
+@pytest.mark.parametrize(("language", "longest"), [("en", "longest"), ("de", "längster")])
+def test_refresh_interval_label_names_the_longest_gap(language, longest):
+    # The step starts at 5 minutes, the option only bounds it from above
+    translations = json.loads(
+        (TRANSLATIONS / f"{language}.json").read_text(encoding="utf-8")
+    )
+    label = translations["options"]["step"]["init"]["data"][
+        "charging_refresh_interval"
+    ]
+
+    assert longest in label
+    assert "5 min" in label.lower()

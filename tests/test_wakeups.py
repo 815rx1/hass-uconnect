@@ -707,3 +707,57 @@ async def test_refused_automatic_refresh_holds_nothing_back(
     charging_car(mock_client, vehicle)
     await hass.services.async_call(DOMAIN, "deep_refresh", {}, blocking=True)
     assert mock_client.command_verify.call_count == tried + 1
+
+
+async def test_charge_reported_before_a_gap_does_not_wake(
+    hass, freezer, hass_storage, config_entry, mock_client, vehicle
+):
+    # Followed every 30 minutes until Home Assistant went down five hours
+    # ago; the cloud still says charging, from then
+    now = dt_util.utcnow()
+    hass_storage[STORAGE_KEY] = {
+        "version": 1,
+        "minor_version": 1,
+        "key": STORAGE_KEY,
+        "data": {
+            "vehicles": {
+                VIN: {
+                    "wakes": [
+                        {
+                            "at": (now - timedelta(hours=5)).isoformat(),
+                            "command": "DEEPREFRESH",
+                            "automatic": True,
+                        }
+                    ],
+                    "session": {
+                        "started": (now - timedelta(hours=9)).isoformat(),
+                        "auto_refreshes": 8,
+                    },
+                }
+            }
+        },
+    }
+    charging_car(mock_client, vehicle)
+    vehicle.timestamp_ev_info = now - timedelta(hours=5)
+    await setup(hass, config_entry, 30)
+
+    await run_for(hass, freezer, 90, every=3)
+    assert deep_refreshes(mock_client) == 0
+
+
+async def test_refresh_decided_during_a_poll_is_checked_again(
+    hass, freezer, config_entry, mock_client, vehicle
+):
+    charging_car(mock_client, vehicle)
+    await setup(hass, config_entry, 0)
+    coordinator = config_entry.runtime_data
+
+    # A poll holds the client when the refresh is due, and finds the charge
+    # ended
+    await coordinator._client_lock.acquire()
+    await run_for(hass, freezer, 20)
+    vehicle.charging = False
+    coordinator._client_lock.release()
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert deep_refreshes(mock_client) == 0

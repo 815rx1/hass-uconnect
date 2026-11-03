@@ -312,10 +312,12 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
     def _read_charging_refresh_interval(config_entry: ConfigEntry) -> int:
         """Return the deep refresh interval while charging, in minutes.
 
-        Zero leaves only the refresh at the start of a charge. Shorter
-        intervals are raised to the floor because each deep refresh wakes the
-        vehicle and holds an executor thread for as long as the command status
-        poll takes.
+        Zero leaves only the refresh at the start of a charge. This is the
+        longest time between two refreshes, faster charges are refreshed more
+        often, see wake_guard. Shorter intervals are raised to the floor, where
+        a charge that brings no new percent settles: each of those refreshes
+        wakes the vehicle and holds an executor thread for as long as the
+        command status poll takes.
         """
 
         minutes = config_entry.options.get(
@@ -696,12 +698,14 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
         *,
         automatic: bool = False,
         code: str | None = None,
+        blocker: Callable[[], str | None] | None = None,
     ) -> None:
         """Execute the given command.
 
         automatic is set by the deep refresh while charging, which the wake
         guard has already allowed and recorded. code is what came with an
-        unlock, see check_unlock_code.
+        unlock, see check_unlock_code. blocker returns why the command must
+        not go out after all, and is asked once the client is free.
         """
 
         if cmd.name in UNLOCK_COMMANDS:
@@ -715,6 +719,7 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
             vin,
             cmd,
             automatic=automatic,
+            blocker=blocker,
         )
 
     async def async_set_charging_level(self, vin: str, level: str) -> None:
@@ -797,6 +802,7 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
         func: Callable[..., Any],
         *args: Any,
         automatic: bool = False,
+        blocker: Callable[[], str | None] | None = None,
     ) -> None:
         """Run a vehicle action, refresh afterwards and report the outcome.
 
@@ -817,6 +823,10 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
                         record = await self._async_record_manual(vin, command)
                         if record is None:
                             return
+                    # A poll that held the client meanwhile may have changed
+                    # what the action was decided on, e.g. the charge ended
+                    if blocker is not None and (reason := blocker()) is not None:
+                        raise ServiceValidationError(f"{what} not sent: {reason}")
                     result = await self._async_run_locked(
                         func, *args, on_request=not automatic
                     )
