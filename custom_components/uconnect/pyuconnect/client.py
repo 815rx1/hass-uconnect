@@ -748,8 +748,9 @@ REPORTED_AT_OFF = "reported_at_switch_off"
 SWITCHED_ON_AT = "switched_on_at"
 SWITCHED_OFF_AT = "switched_off_at"
 # A report this close to the switch-off was made with the driver still in
-# the seat
-SWITCH_OFF_REPORT_WINDOW = 60
+# the seat. The 500e uploads one 7 s before to 16 s after the switch-off;
+# locking by key after getting out came 33 s after it at the earliest.
+SWITCH_OFF_REPORT_WINDOW = 25
 # The groups whose locked or closed states such a report leaves out
 SECURED_GROUPS = ("doors", "windows", "trunk", "liftGate")
 LOCK_COMMAND_STATES: dict[str, tuple[tuple[str, ...], bool]] = {

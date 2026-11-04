@@ -1392,6 +1392,37 @@ def test_locked_states_reported_at_the_switch_off_are_unknown():
     assert remote_states(v) == [True] * 7 + [False]
 
 
+def test_lock_by_key_soon_after_the_switch_off_is_shown():
+    """04.11. 06:15: switched off at 06:14:47, locked by key on getting out,
+    reported at 06:15:20, and nothing more for hours."""
+    start = datetime.now(timezone.utc) - timedelta(hours=2)
+    parked = start + timedelta(minutes=14)
+    client = make_client(
+        [ev_upload("ON", start)] + [ev_upload("OFF", parked)] * 3,
+        remote=remote_report(start + timedelta(minutes=1)),
+    )
+    client.refresh()
+    v = client.vehicles[VIN]
+
+    client.api.get_vehicle_status.return_value = remote_report(
+        parked + timedelta(seconds=33), running="OFF"
+    )
+    client.refresh()
+    assert remote_states(v) == [True] * 7 + [False]
+
+    # One of the switch-off itself, 16 s after it, is still left out
+    client = make_client(
+        [ev_upload("ON", start)] + [ev_upload("OFF", parked)] * 3,
+        remote=remote_report(start + timedelta(minutes=1)),
+    )
+    client.refresh()
+    client.api.get_vehicle_status.return_value = remote_report(
+        parked + timedelta(seconds=16), running="OFF"
+    )
+    client.refresh()
+    assert remote_states(client.vehicles[VIN]) == [None] * 7 + [False]
+
+
 def test_locked_states_reported_at_the_switch_off_are_unknown_after_a_restart():
     """29.10. 16:26: restarted after the switch-off, before a poll saw it.
     The last poll before saw the vehicle on."""
