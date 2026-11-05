@@ -33,6 +33,8 @@ async def test_user_flow_creates_entry(hass):
         DOMAIN, context={"source": config_entries.SOURCE_USER}
     )
     assert result["type"] is FlowResultType.FORM
+    # Without one Home Assistant warns from 2026.11 and fails from 2027.5
+    assert result["step_id"] == "user"
 
     with patch(LOGIN) as login, patch(SETUP, return_value=True):
         result = await hass.config_entries.flow.async_configure(
