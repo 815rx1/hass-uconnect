@@ -1950,6 +1950,54 @@ def test_confirmed_lock_outlives_a_newer_report_without_door_states():
     assert client.vehicles[VIN].door_driver_locked is False
 
 
+def test_report_without_door_states_long_after_a_lock_is_taken():
+    """Made long after the lock, an NA report may follow an opening by key:
+    the doors are unknown, not locked."""
+    client = make_client(
+        [ev_upload("OFF", datetime.now(timezone.utc) - timedelta(minutes=30))] * 4,
+        remote=remote_report(
+            datetime.now(timezone.utc) - timedelta(minutes=20), doors="UNLOCKED", running="OFF"
+        ),
+    )
+    client.refresh()
+    client.api.command.return_value = "corr"
+    client.api.get_remote_operation_status.return_value = {"status": "SUCCESS"}
+    with patch("custom_components.uconnect.pyuconnect.client.sleep"):
+        assert client.command_verify(VIN, COMMAND_DOORS_LOCK) is True
+
+    client.api.get_vehicle_status.return_value = remote_report(
+        datetime.now(timezone.utc) + timedelta(minutes=10), doors="NA", running="OFF"
+    )
+    client.refresh()
+    assert client.vehicles[VIN].door_driver_locked is None
+
+
+def test_states_left_out_after_a_restart_do_not_bring_a_lock_back():
+    """Locked and saved, restarted, opened by key and driven: the first poll
+    has no EV status and leaves the drive's report out. That is no NA report
+    and must not bring the saved lock back."""
+    earlier = datetime.now(timezone.utc) - timedelta(minutes=30)
+    client = make_client(
+        [ev_upload("OFF", earlier)] * 4, remote=remote_report(earlier, running="OFF")
+    )
+    client.refresh()
+    client.api.command.return_value = "corr"
+    client.api.get_remote_operation_status.return_value = {"status": "SUCCESS"}
+    with patch("custom_components.uconnect.pyuconnect.client.sleep"):
+        assert client.command_verify(VIN, COMMAND_DOORS_LOCK) is True
+    saved = client.confirmed_states()
+
+    restarted = make_client(
+        [{}] * 4,
+        remote=remote_report(
+            datetime.now(timezone.utc) + timedelta(seconds=30), doors="UNLOCKED", running="ON"
+        ),
+    )
+    restarted.restore_confirmed_states(saved)
+    restarted.refresh()
+    assert restarted.vehicles[VIN].door_driver_locked is not True
+
+
 def locked_by_home_assistant():
     """Locked from Home Assistant, and the cloud still reports the doors
     locked from before."""

@@ -751,6 +751,9 @@ SWITCHED_OFF_AT = "switched_off_at"
 # the seat. The 500e uploads one 7 s before to 16 s after the switch-off;
 # locking by key after getting out came 33 s after it at the earliest.
 SWITCH_OFF_REPORT_WINDOW = 25
+# A report with every state NA made this long after a lock command at most
+# is not taken as a newer state, see _apply_written_locks
+NA_REPORT_WINDOW = 120
 # The groups whose locked or closed states such a report leaves out
 SECURED_GROUPS = ("doors", "windows", "trunk", "liftGate")
 LOCK_COMMAND_STATES: dict[str, tuple[tuple[str, ...], bool]] = {
@@ -764,6 +767,23 @@ LOCK_COMMAND_STATES: dict[str, tuple[tuple[str, ...], bool]] = {
 
 # How long the final status of a command is polled for
 COMMAND_STATUS_TIMEOUT = timedelta(seconds=60)
+
+
+def _all_na(block: Any) -> bool:
+    """Whether every state reported in a remote status group reads NA."""
+
+    states: list[str] = []
+
+    def walk(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key == "status" and isinstance(item, str):
+                    states.append(item.strip().upper())
+                else:
+                    walk(item)
+
+    walk(block)
+    return bool(states) and all(state == "NA" for state in states)
 
 
 def _refused_before_sent(err: BaseException) -> bool:
@@ -1059,6 +1079,7 @@ class Client:
 
                 vehicle.timestamp_status = uploaded
                 reported = {group for group in REMOTE_STATE_GROUPS if group in s}
+                not_available = {group for group in reported if _all_na(s[group])}
                 self._remote_parts[vin] = {
                     attr
                     for attrs in REMOTE_STATE_GROUPS.values()
@@ -1068,6 +1089,7 @@ class Client:
             except Exception as err:
                 _LOGGER.debug("Remote status not available for %s: %s", vin, err)
                 reported = set()
+                not_available = set()
 
             now = monotonic()
             fresh = self._remote_fresh_at.setdefault(vin, {})
@@ -1080,7 +1102,7 @@ class Client:
 
             self._note_switch_off(vin, vehicle)
             self._drop_states_reported_while_on(vin, vehicle)
-            self._apply_written_locks(vin, vehicle, reported)
+            self._apply_written_locks(vin, vehicle, reported, not_available)
 
     def last_charges(self) -> dict[str, dict[str, Any]]:
         """The last state of charge each vehicle really reported, with its times
@@ -1444,11 +1466,16 @@ class Client:
         return self._location_read.get(vin, False)
 
     def _apply_written_locks(
-        self, vin: str, vehicle: "Vehicle", fetched: set[str]
+        self,
+        vin: str,
+        vehicle: "Vehicle",
+        fetched: set[str],
+        not_available: set[str] = frozenset(),
     ) -> None:
         """Shows the confirmed locks, see _remember_lock.
 
-        fetched are the groups the remote status reported in this poll.
+        fetched are the groups the remote status reported in this poll,
+        not_available those it reported with every state NA.
         """
 
         uploaded = getattr(vehicle, "timestamp_status", None)
@@ -1469,11 +1496,17 @@ class Client:
                 else None
             )
             _, at, since = self._written[vin][what]
-            # A report with the states not available, all NA, tells nothing:
-            # on 09.11. one came a second after a lock was sent and dropped the
-            # lock the vehicle confirmed moments later
+            # A report with the states not available, all NA, made right after
+            # the command tells nothing: on 09.11. one came a second after a
+            # lock was sent and dropped the lock the vehicle confirmed moments
+            # later. One made later may follow an opening by key, so it is
+            # taken as before.
             newer = uploaded
-            if group in fetched and all(getattr(vehicle, a, None) is None for a in attrs):
+            if (
+                group in not_available
+                and uploaded is not None
+                and (uploaded - at).total_seconds() <= NA_REPORT_WINDOW
+            ):
                 newer = None
             if (
                 monotonic() - since > LOCK_OVERRIDE_MAX_AGE
