@@ -1921,6 +1921,35 @@ def test_doors_opened_while_the_lock_was_confirmed_are_shown():
     assert client.vehicles[VIN].door_driver_locked is False
 
 
+def test_confirmed_lock_outlives_a_newer_report_without_door_states():
+    """09.11. 17:03: locked from Home Assistant, confirmed, and a report made a
+    second after the lock was sent with all doors NA."""
+    client = make_client(
+        [ev_upload("OFF", datetime.now(timezone.utc) - timedelta(minutes=30))] * 4,
+        remote=remote_report(
+            datetime.now(timezone.utc) - timedelta(minutes=20), doors="UNLOCKED", running="OFF"
+        ),
+    )
+    client.refresh()
+    client.api.command.return_value = "corr"
+    client.api.get_remote_operation_status.return_value = {"status": "SUCCESS"}
+    with patch("custom_components.uconnect.pyuconnect.client.sleep"):
+        assert client.command_verify(VIN, COMMAND_DOORS_LOCK) is True
+
+    client.api.get_vehicle_status.return_value = remote_report(
+        datetime.now(timezone.utc) + timedelta(seconds=1), doors="NA", running="OFF"
+    )
+    client.refresh()
+    assert client.vehicles[VIN].door_driver_locked is True
+
+    # A later report with the doors is taken as before
+    client.api.get_vehicle_status.return_value = remote_report(
+        datetime.now(timezone.utc) + timedelta(seconds=2), doors="UNLOCKED", running="OFF"
+    )
+    client.refresh()
+    assert client.vehicles[VIN].door_driver_locked is False
+
+
 def locked_by_home_assistant():
     """Locked from Home Assistant, and the cloud still reports the doors
     locked from before."""

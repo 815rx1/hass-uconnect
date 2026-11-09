@@ -1469,9 +1469,15 @@ class Client:
                 else None
             )
             _, at, since = self._written[vin][what]
+            # A report with the states not available, all NA, tells nothing:
+            # on 09.11. one came a second after a lock was sent and dropped the
+            # lock the vehicle confirmed moments later
+            newer = uploaded
+            if group in fetched and all(getattr(vehicle, a, None) is None for a in attrs):
+                newer = None
             if (
                 monotonic() - since > LOCK_OVERRIDE_MAX_AGE
-                and (uploaded is None or uploaded <= at)
+                and (newer is None or newer <= at)
                 and reported != states
             ):
                 # A day on, the report from before the lock still is not the
@@ -1482,7 +1488,7 @@ class Client:
                     setattr(vehicle, attr, None)
                 continue
             written = self._written_value(
-                vin, what, reported, uploaded, LOCK_OVERRIDE_MAX_AGE
+                vin, what, reported, newer, LOCK_OVERRIDE_MAX_AGE
             )
             if written is not None:
                 for attr, value in written.items():
