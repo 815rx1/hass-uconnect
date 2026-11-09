@@ -205,11 +205,15 @@ async def test_a_week(
     for at in times:
         assert sum(1 for t in times if at <= t < at + timedelta(days=1)) <= 72
 
-    # Only while really charging. The one exception follows the interval:
-    # the refresh that finds out about the charge whose end was never uploaded
+    # Only while really charging. Two exceptions follow the interval: the
+    # refresh that finds out about the charge whose end was never uploaded,
+    # and the one after the solar charging first stopped with the cable in,
+    # once for that charge
     idle = [at for at, _, charging in commands if not charging]
-    assert len(idle) == (1 if interval else 0), idle
-    assert all((at - START.replace(hour=0)).days == 6 for at in idle)
+    assert len(idle) == (2 if interval else 0), idle
+    assert sorted((at - START.replace(hour=0)).days for at in idle) == (
+        [5, 6] if interval else []
+    ), idle
 
     # Every charge got its refresh at the start, a few minutes in, the solar
     # charging with its short breaks counting as one. The restart and the
