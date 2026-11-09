@@ -40,6 +40,7 @@ from .wake_guard import (
     AUTO_REFRESH_FIRST_STEP,
     AUTO_REFRESH_MAX_FAILURES,
     AUTO_REFRESH_MAX_WITHOUT_PROGRESS,
+    Blocked,
     Decision,
     WakeRecord,
     async_get_wake_guard,
@@ -91,6 +92,11 @@ EV_DATA_MAX_AGE = timedelta(hours=12)
 # waking the vehicle for it would be for nothing. Later refreshes renew the
 # data themselves, as long as they keep coming.
 FIRST_REFRESH_MAX_DATA_AGE = timedelta(minutes=60)
+# A charge reported as stopped while the cable is still in is refreshed once
+# this long after: a public charger can drop a charge for a moment, on 06.11.
+# right after the charging level changed, and the vehicle charged on without
+# uploading for 45 minutes while it was shown as not charging
+AFTER_STOP_REFRESH_DELAY = timedelta(minutes=5)
 
 
 @dataclass
@@ -380,6 +386,10 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
         self._state = SocEstimationState()
         self._unsub_timer: Callable[[], None] | None = None
         self._unsub_deep_refresh: Callable[[], None] | None = None
+        self._unsub_after_stop: Callable[[], None] | None = None
+        # The charge session the refresh after a stop went out for: a wallbox
+        # that follows solar surplus stops and starts all day in one session
+        self._after_stop_session: datetime | None = None
 
     async def async_added_to_hass(self) -> None:
         """Restore state when added to hass."""
@@ -443,6 +453,7 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
             self._unsub_timer()
             self._unsub_timer = None
         self._cancel_deep_refresh()
+        self._cancel_refresh_after_stop()
         # Disabling the entity leaves the config entry loaded, so drop the
         # registration too or the coordinator keeps handing work to an entity
         # that is no longer part of Home Assistant
@@ -692,6 +703,104 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
 
         self._cancel_deep_refresh()
         self._unsub_deep_refresh = async_call_later(self.hass, delay, _fire)
+
+    @callback
+    def _cancel_refresh_after_stop(self) -> None:
+        if self._unsub_after_stop:
+            self._unsub_after_stop()
+            self._unsub_after_stop = None
+
+    @callback
+    def _schedule_refresh_after_stop(self, stopped_upload: datetime | None) -> None:
+        """Refresh once after a charge stopped with the cable still in.
+
+        Only once per stop and never retried: whether the vehicle charges on
+        is what the refresh shows, and if it does the refreshes of the charge
+        take over again.
+        """
+
+        @callback
+        def _fire(_now: datetime) -> None:
+            self._unsub_after_stop = None
+            self.coordinator.config_entry.async_create_background_task(
+                self.hass,
+                self._async_refresh_after_stop(stopped_upload),
+                f"uconnect refresh after stop {self._vin}",
+            )
+
+        self._cancel_refresh_after_stop()
+        self._unsub_after_stop = async_call_later(
+            self.hass, AFTER_STOP_REFRESH_DELAY, _fire
+        )
+
+    def _after_stop_blocker(self, stopped_upload: datetime | None) -> str | None:
+        """Why the refresh after a stop must not go out now, None if it may."""
+
+        coordinator = self.coordinator
+        if coordinator.auth_failed:
+            return "the login was rejected"
+        if not coordinator.last_update_success or coordinator.consecutive_failures:
+            return "the last update failed"
+        if not coordinator.charging_refresh_interval:
+            return "automatic refreshes are set to the start of a charge only"
+        if not self._can_deep_refresh():
+            return "no PIN, or the vehicle does not offer it"
+        vehicle = coordinator.client.get_vehicles().get(self._vin)
+        if vehicle is None:
+            return "the vehicle is not in the account"
+        if getattr(vehicle, "charging", None) is not False:
+            return "the vehicle is not reported as stopped"
+        if getattr(vehicle, "plugged_in", None) is not True:
+            return "the cable is no longer reported in"
+        soc = getattr(vehicle, "state_of_charge", None)
+        if soc is None or soc >= 100:
+            return "the state of charge is full or unknown"
+        uploaded = getattr(vehicle, "timestamp_ev_info", None)
+        if uploaded is None or (
+            stopped_upload is not None and uploaded > stopped_upload
+        ):
+            return "the vehicle uploaded again since"
+        return None
+
+    async def _async_refresh_after_stop(self, stopped_upload: datetime | None) -> None:
+        if (reason := self._after_stop_blocker(stopped_upload)) is not None:
+            _LOGGER.info("No refresh of %s after the charge stopped: %s", self._vin, reason)
+            return
+        guard = async_get_wake_guard(self.hass)
+        session = guard.session(self._vin).started
+        if session is not None and session == self._after_stop_session:
+            _LOGGER.info(
+                "No refresh of %s after the charge stopped: done once for this charge",
+                self._vin,
+            )
+            return
+        try:
+            guard.check_automatic_command(self._vin, COMMAND_DEEP_REFRESH.name)
+        except Blocked as err:
+            _LOGGER.info("No refresh of %s after the charge stopped: %s", self._vin, err)
+            return
+        self._after_stop_session = session
+        record = guard.record_command(self._vin, COMMAND_DEEP_REFRESH.name)
+        await guard.async_flush()
+        _LOGGER.info(
+            "Refreshing %s once, the charge stopped with the cable still in", self._vin
+        )
+        try:
+            await self.coordinator.async_command(
+                self._vin,
+                COMMAND_DEEP_REFRESH,
+                automatic=True,
+                blocker=lambda: self._after_stop_blocker(stopped_upload),
+            )
+        except ServiceValidationError as err:
+            guard.forget(self._vin, record)
+            _LOGGER.info("Refresh of %s after the charge stopped not sent: %s", self._vin, err)
+        except Exception as err:
+            if _refused_before_queued(err.__cause__ or err):
+                guard.forget(self._vin, record)
+            _LOGGER.info("Refresh of %s after the charge stopped failed: %s", self._vin, err)
+        else:
+            guard.command_confirmed(record)
 
     @callback
     def resume_deep_refresh(self, pin_changed: bool = False) -> None:
@@ -1043,11 +1152,16 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
         if self.hass is not None:
             guard = async_get_wake_guard(self.hass)
             if self._state.is_charging and not was_charging:
+                self._cancel_refresh_after_stop()
                 guard.charging_started(self._vin, resume=not new_charge)
                 self._schedule_deep_refresh(CHARGE_START_REFRESH_DELAY)
             elif was_charging and not self._state.is_charging:
                 guard.charging_stopped(self._vin)
                 self._cancel_deep_refresh()
+                if getattr(self.vehicle, "plugged_in", None) is True:
+                    self._schedule_refresh_after_stop(
+                        getattr(self.vehicle, "timestamp_ev_info", None)
+                    )
 
     def _learn_correction_factor(
         self,

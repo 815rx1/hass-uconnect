@@ -989,3 +989,47 @@ async def test_first_refresh_waiting_for_the_client_needs_fresh_data(
     await hass.async_block_till_done(wait_background_tasks=True)
 
     assert deep_refreshes(mock_client) == 0
+
+
+async def stop_charging(hass, freezer, vehicle, plugged_in: bool = True) -> None:
+    """The cloud reports the charge stopped, the cable in or out."""
+    vehicle.charging = False
+    vehicle.plugged_in = plugged_in
+    vehicle.timestamp_ev_info = dt_util.utcnow()
+    await step(hass, freezer, 5.01)
+
+
+async def test_charge_stopped_with_the_cable_in_is_refreshed_once(
+    hass, freezer, config_entry, mock_client, vehicle
+):
+    """06.11.: reported as stopped right after a level change, while the
+    vehicle charged on for 45 minutes without uploading."""
+    charging_car(mock_client, vehicle)
+    await setup(hass, config_entry, 30)
+    await run_for(hass, freezer, 10)
+    before = deep_refreshes(mock_client)
+
+    await stop_charging(hass, freezer, vehicle)
+    await run_for(hass, freezer, 6)
+    assert deep_refreshes(mock_client) == before + 1
+
+    # Only once, also when it stays stopped
+    await run_for(hass, freezer, 120, every=5.01)
+    assert deep_refreshes(mock_client) == before + 1
+
+
+@pytest.mark.parametrize("why", ["unplugged", "uploaded", "interval_zero"])
+async def test_charge_stopped_is_not_refreshed_when_it_is_clear(
+    hass, freezer, config_entry, mock_client, vehicle, why
+):
+    charging_car(mock_client, vehicle)
+    await setup(hass, config_entry, 0 if why == "interval_zero" else 30)
+    await run_for(hass, freezer, 10)
+    before = deep_refreshes(mock_client)
+
+    await stop_charging(hass, freezer, vehicle, plugged_in=why != "unplugged")
+    if why == "uploaded":
+        # The vehicle reported again by itself after the stop
+        vehicle.timestamp_ev_info = dt_util.utcnow()
+    await run_for(hass, freezer, 30)
+    assert deep_refreshes(mock_client) == before
