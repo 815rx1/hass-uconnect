@@ -762,7 +762,10 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
             return "the vehicle uploaded again since"
         return None
 
-    async def _async_refresh_after_stop(self, stopped_upload: datetime | None) -> None:
+    async def _async_refresh_after_stop(
+        self, stopped_upload: datetime | None, retry: bool = False
+    ) -> None:
+        self._unsub_after_stop = None
         if (reason := self._after_stop_blocker(stopped_upload)) is not None:
             _LOGGER.info("No refresh of %s after the charge stopped: %s", self._vin, reason)
             return
@@ -777,6 +780,27 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
         try:
             guard.check_automatic_command(self._vin, COMMAND_DEEP_REFRESH.name)
         except Blocked as err:
+            # Held back by a refresh moments ago, often the one that showed the
+            # stop: looked at once more when it may go out, all checks again
+            if err.wait is not None and not retry:
+                _LOGGER.debug(
+                    "Refresh of %s after the charge stopped in %s: %s",
+                    self._vin,
+                    err.wait,
+                    err,
+                )
+
+                @callback
+                def _retry(_now: datetime) -> None:
+                    self._unsub_after_stop = None
+                    self.coordinator.config_entry.async_create_background_task(
+                        self.hass,
+                        self._async_refresh_after_stop(stopped_upload, retry=True),
+                        f"uconnect refresh after stop {self._vin}",
+                    )
+
+                self._unsub_after_stop = async_call_later(self.hass, err.wait, _retry)
+                return
             _LOGGER.info("No refresh of %s after the charge stopped: %s", self._vin, err)
             return
         self._after_stop_session = session

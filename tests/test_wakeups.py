@@ -24,6 +24,7 @@ from custom_components.uconnect.const import DOMAIN
 from custom_components.uconnect.coordinator import LOCATION_REQUEST_STORAGE_KEY
 from custom_components.uconnect.extrapolated_soc import SocEstimationState
 from custom_components.uconnect.pyuconnect.client import Location
+from custom_components.uconnect.pyuconnect.command import COMMAND_DEEP_REFRESH
 from custom_components.uconnect.wake_guard import (
     AUTO_REFRESH_MAX_PER_DAY,
     AUTO_REFRESH_MAX_WITHOUT_PROGRESS,
@@ -1033,3 +1034,27 @@ async def test_charge_stopped_is_not_refreshed_when_it_is_clear(
         vehicle.timestamp_ev_info = dt_util.utcnow()
     await run_for(hass, freezer, 30)
     assert deep_refreshes(mock_client) == before
+
+
+async def test_refresh_after_a_stop_waits_for_the_one_that_showed_it(
+    hass, freezer, config_entry, mock_client, vehicle
+):
+    """The automatic refresh that brought the stop holds the next one back
+    for a while: the refresh after the stop goes out once it may."""
+    charging_car(mock_client, vehicle)
+    await setup(hass, config_entry, 30)
+    await run_for(hass, freezer, 10)
+    before = deep_refreshes(mock_client)
+
+    # The stop comes with a refresh sent by hand moments before
+    coordinator = config_entry.runtime_data
+    vehicle.charging = False
+    vehicle.timestamp_ev_info = dt_util.utcnow()
+    await coordinator.async_command(VIN, COMMAND_DEEP_REFRESH)
+    vehicle.timestamp_ev_info = dt_util.utcnow() - timedelta(seconds=1)
+    sent = deep_refreshes(mock_client)
+    assert sent == before + 1
+    await step(hass, freezer, 5.01)
+
+    await run_for(hass, freezer, 30)
+    assert deep_refreshes(mock_client) == sent + 1
