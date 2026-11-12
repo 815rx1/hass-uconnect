@@ -3,6 +3,7 @@
 from __future__ import annotations
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Callable, Final
 
 from homeassistant.core import HomeAssistant
@@ -11,7 +12,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .pyuconnect.client import Vehicle
+from .pyuconnect.client import REMOTE_STATE_GROUPS, Vehicle
 from .pyuconnect.command import (
     COMMAND_DOORS_LOCK,
     COMMAND_DOORS_UNLOCK,
@@ -178,11 +179,21 @@ class UconnectLock(LockEntity, UconnectCommandEntity):
                 return None
             return "locked" if value else "unlocked"
 
-        return {
+        attributes: dict[str, Any] = {
             name: state(getattr(self.vehicle, attr, None))
             for name, attr in DOORS
             if getattr(self.vehicle, attr, None) is not None
         }
+        # A lock confirmed from here is shown without a new report from the
+        # vehicle, so the time of the last report says nothing about it
+        origin = self.coordinator.client.lock_state_origin(
+            self.vehicle.vin, REMOTE_STATE_GROUPS["doors"]
+        )
+        if isinstance(origin, tuple) and len(origin) == 2:
+            source, at = origin
+            attributes["state_source"] = source
+            attributes["state_time"] = at.isoformat() if isinstance(at, datetime) else None
+        return attributes
 
     async def async_lock(self, **kwargs):
         try:

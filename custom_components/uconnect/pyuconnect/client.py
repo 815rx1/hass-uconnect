@@ -1453,6 +1453,23 @@ class Client:
 
         return set(self._remote_parts.get(vin, ()))
 
+    def lock_state_origin(
+        self, vin: str, attrs: tuple[str, ...]
+    ) -> tuple[str, datetime | None]:
+        """Where the states of a lock group shown now come from, and when.
+
+        "command" with the time of a lock or unlock the vehicle confirmed, or
+        one whose outcome is unknown, that no report has replaced yet, see
+        _remember_lock. Otherwise "report" with the vehicle's time of the
+        remote status.
+        """
+
+        written = self._written.get(vin, {}).get(f"lock:{','.join(attrs)}")
+        if written is not None:
+            return "command", written[1]
+        vehicle = self.vehicles.get(vin)
+        return "report", getattr(vehicle, "timestamp_status", None)
+
     def switched_off_at(self, vin: str) -> datetime | None:
         """When the vehicle uploaded that it was switched off, if it was seen
         on before that, see _note_switch_off."""

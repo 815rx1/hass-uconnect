@@ -1064,6 +1064,16 @@ async def test_lock_icons_follow_the_state(hass, config_entry, mock_client, vehi
     vehicle.door_driver_locked = True
     _, lock_state = await states()
     assert lock_state.attributes["driver"] == "locked"
+    assert lock_state.attributes["state_source"] == "report"
+
+    # Confirmed from Home Assistant without a new report: says so, with when
+    from datetime import datetime, timezone
+
+    sent = datetime(2026, 11, 12, 10, 1, 14, tzinfo=timezone.utc)
+    mock_client.lock_state_origin.return_value = ("command", sent)
+    _, lock_state = await states()
+    assert lock_state.attributes["state_source"] == "command"
+    assert lock_state.attributes["state_time"] == sent.isoformat()
     mock_client.refresh.side_effect = Exception("status down")
     for _ in range(3):
         _, lock_state = await states()

@@ -113,6 +113,7 @@ def mock_client(vehicle, cloud_status):
     client.api.pin_rejection_fingerprint.return_value = "fp"
     client.confirmed_states.return_value = {}
     client.reported_parts.return_value = set()
+    client.lock_state_origin.return_value = ("report", None)
     client.location_read.return_value = True
     client.placeholders = {}
     client.last_charges.return_value = {}

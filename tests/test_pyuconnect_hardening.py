@@ -1998,6 +1998,37 @@ def test_states_left_out_after_a_restart_do_not_bring_a_lock_back():
     assert restarted.vehicles[VIN].door_driver_locked is not True
 
 
+def test_lock_state_origin_tells_a_confirmed_lock_from_a_report():
+    """12.11. 11:01: locked from Home Assistant, shown locked without a new
+    report; Home Assistant needs the time of the lock, not of the report."""
+    report_time = datetime.now(timezone.utc) - timedelta(minutes=20)
+    client = make_client(
+        [ev_upload("OFF", report_time)] * 4,
+        remote=remote_report(report_time, doors="UNLOCKED", running="OFF"),
+    )
+    client.refresh()
+    doors = ("door_driver_locked", "door_passenger_locked",
+             "door_rear_left_locked", "door_rear_right_locked")
+    source, at = client.lock_state_origin(VIN, doors)
+    assert source == "report" and abs((at - report_time).total_seconds()) < 1
+
+    client.api.command.return_value = "corr"
+    client.api.get_remote_operation_status.return_value = {"status": "SUCCESS"}
+    before = datetime.now(timezone.utc)
+    with patch("custom_components.uconnect.pyuconnect.client.sleep"):
+        assert client.command_verify(VIN, COMMAND_DOORS_LOCK) is True
+    client.refresh()
+    source, at = client.lock_state_origin(VIN, doors)
+    assert source == "command" and at >= before - timedelta(seconds=1)
+
+    # A newer report from the vehicle takes over again
+    newer = datetime.now(timezone.utc) + timedelta(seconds=5)
+    client.api.get_vehicle_status.return_value = remote_report(newer, running="OFF")
+    client.refresh()
+    source, at = client.lock_state_origin(VIN, doors)
+    assert source == "report" and abs((at - newer).total_seconds()) < 1
+
+
 def locked_by_home_assistant():
     """Locked from Home Assistant, and the cloud still reports the doors
     locked from before."""
