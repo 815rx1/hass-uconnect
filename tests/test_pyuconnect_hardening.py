@@ -1324,7 +1324,7 @@ def test_states_of_the_drive_are_unknown_once_switched_off():
 
     client.refresh()
     assert v.ignition_on is False
-    assert remote_states(v) == [None] * 8
+    assert remote_states(v) == [None] * 7 + [False]
 
     # Back at the car: it reports again
     client.api.get_vehicle_status.return_value = remote_report(
@@ -1499,7 +1499,7 @@ def test_states_from_before_a_drive_seen_only_in_uploads_are_unknown():
     client.refresh()
     client.refresh()
     assert v.ignition_on is False
-    assert remote_states(v) == [None] * 8
+    assert remote_states(v) == [None] * 7 + [False]
 
 
 @pytest.mark.parametrize("first", [{}, {"vehicleInfo": {"timestamp": 1}}])
@@ -1515,7 +1515,7 @@ def test_states_of_a_drive_wait_for_the_ev_status_after_a_restart(first):
     v = client.vehicles[VIN]
     assert remote_states(v) == [None] * 8
     client.refresh()
-    assert remote_states(v) == [None] * 8
+    assert remote_states(v) == [None] * 7 + [False]
 
 
 def test_older_remote_status_does_not_replace_a_newer_one():
@@ -1565,7 +1565,7 @@ def test_lock_confirmed_after_the_switch_off_is_shown_for_every_door():
     client.refresh()
     assert remote_states(v)[:4] == [True] * 4
     # Locking the doors says nothing about the rest
-    assert remote_states(v)[4:] == [None] * 4
+    assert remote_states(v)[4:] == [None] * 3 + [False]
 
 
 @pytest.mark.parametrize("upload", ["ON", "NA"])
@@ -1583,8 +1583,9 @@ def test_states_stay_unknown_until_the_next_report(upload):
     )
     client.refresh()
     v = client.vehicles[VIN]
-    assert remote_states(v) == [None] * 8
+    assert remote_states(v) == [None] * 7 + [False]
 
+    # Switched on again, or not known: running is not known either
     client.refresh()
     assert remote_states(v) == [None] * 8
 
@@ -1607,6 +1608,7 @@ def test_states_stay_unknown_over_a_restart_without_a_status():
     restarted = make_client([{}], remote=remote_report(start))
     restarted.restore_confirmed_states(saved)
     restarted.refresh()
+    # Without the EV status, whether it is still off is not known either
     assert remote_states(restarted.vehicles[VIN]) == [None] * 8
 
 
@@ -1630,14 +1632,14 @@ def test_lock_confirmed_while_on_is_unknown_once_switched_off():
 
     client.refresh()
     assert v.ignition_on is False
-    assert remote_states(v) == [None] * 8
+    assert remote_states(v) == [None] * 7 + [False]
     assert client.confirmed_states()[VIN].keys() == {
         "reported_before_switch_off",
         "switched_on_at",
         "switched_off_at",
     }
     client.refresh()
-    assert remote_states(v) == [None] * 8
+    assert remote_states(v) == [None] * 7 + [False]
 
 
 def test_lock_confirmed_while_on_in_a_drive_without_report_is_unknown():
@@ -1660,7 +1662,7 @@ def test_lock_confirmed_while_on_in_a_drive_without_report_is_unknown():
     client.refresh()
     client.refresh()
     v = client.vehicles[VIN]
-    assert remote_states(v) == [None] * 8
+    assert remote_states(v) == [None] * 7 + [False]
     client.refresh()
     client.api.command.return_value = "corr"
     client.api.get_remote_operation_status.return_value = {"status": "SUCCESS"}
@@ -1671,7 +1673,7 @@ def test_lock_confirmed_while_on_in_a_drive_without_report_is_unknown():
 
     client.refresh()
     assert v.ignition_on is False
-    assert remote_states(v) == [None] * 8
+    assert remote_states(v) == [None] * 7 + [False]
 
 
 def test_lock_confirmed_while_the_status_fails_is_kept_a_day_at_most():

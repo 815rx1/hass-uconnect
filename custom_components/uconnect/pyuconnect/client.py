@@ -1440,9 +1440,16 @@ class Client:
                 at_off = True
             else:
                 return
+        # Uploaded as switched off since, and still so, it is not running:
+        # unknown, automations waiting for it to be off never ran
+        last = self._last_status.get(vin)
+        last_ev = last.get("evInfo") if isinstance(last, dict) else None
+        off_now = (sg_str(last_ev, "ignitionStatus") or "").upper() == "OFF"
         for group, attrs in REMOTE_STATE_GROUPS.items():
             for attr in attrs:
-                if not at_off or (
+                if not at_off and group == "evRunning":
+                    setattr(vehicle, attr, False if off_now else None)
+                elif not at_off or (
                     group in SECURED_GROUPS and getattr(vehicle, attr) is True
                 ):
                     setattr(vehicle, attr, None)
