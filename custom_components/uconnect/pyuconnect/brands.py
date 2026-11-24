@@ -22,7 +22,7 @@ class API:
 
 API_EU = API(
     url="https://channels.sdpr-01.fcagcv.com",
-    key="2wGyL6PHec9o1UeLPYpoYa1SkEWqeBur9bLsi24i",
+    key="qLYupk65UU1tw2Ih1cJhs4izijgRDbir2UFHA3Je",
 )
 
 API_US = API(

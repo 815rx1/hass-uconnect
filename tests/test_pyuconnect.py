@@ -94,6 +94,22 @@ def test_login_uses_cognito_json_api_and_timeouts():
     assert all(req.call_args_list[i].kwargs["timeout"] == DEFAULT_TIMEOUT for i in range(len(calls)))
 
 
+def test_login_sends_the_current_eu_gateway_key():
+    """Stellantis rotated the sdpr-01 gateway key on 2026-11-20 (upstream #144)."""
+    new_key = "qLYupk65UU1tw2Ih1cJhs4izijgRDbir2UFHA3Je"
+    assert FIAT_EU.api.key == new_key
+
+    api = API("user@example.com", "pw", "1234", FIAT_EU)
+    handler, calls = fake_login_responses()
+
+    with patch.object(requests.Session, "request", autospec=True) as req:
+        req.side_effect = lambda self, method, url, **kw: handler(method, url, **kw)
+        api.login()
+
+    exchange = next(c for c in calls if c[1] == FIAT_EU.token_url)
+    assert exchange[2]["headers"]["x-api-key"] == new_key
+
+
 def test_login_rejected_credentials_raise_authentication_error():
     api = API("user@example.com", "wrong", "", FIAT_EU)
 
